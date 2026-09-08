@@ -50,6 +50,13 @@ pub(crate) fn parse_cell_from_postgres_text(typ: &Type, str: &str) -> EtlResult<
             parse_cell_from_postgres_text_array(str, |str| Ok(Some(str.parse()?)), ArrayCell::I64)
         }
         Type::FLOAT4 => Ok(Cell::F32(str.parse()?)),
+        // pgvector's text representation is `[1,2,3]`, while a native
+        // PostgreSQL float4[] is `{1,2,3}`. Schema discovery maps a pgvector
+        // column to ETL's float4-array value model, so distinguish the wire
+        // syntax here and keep both paths strongly typed.
+        Type::FLOAT4_ARRAY if str.starts_with('[') && str.ends_with(']') => {
+            parse_pgvector_text(str)
+        }
         Type::FLOAT4_ARRAY => {
             parse_cell_from_postgres_text_array(str, |str| Ok(Some(str.parse()?)), ArrayCell::F32)
         }
@@ -150,6 +157,23 @@ pub(crate) fn parse_cell_from_postgres_text(typ: &Type, str: &str) -> EtlResult<
         ),
         _ => Ok(Cell::String(str.to_owned())),
     }
+}
+
+/// Parses pgvector's canonical text representation into a typed float array.
+fn parse_pgvector_text(input: &str) -> EtlResult<Cell> {
+    let Some(elements) = input.strip_prefix('[').and_then(|input| input.strip_suffix(']')) else {
+        bail!(ErrorKind::ConversionError, "pgvector input must be enclosed in brackets");
+    };
+
+    if elements.is_empty() {
+        return Ok(Cell::Array(ArrayCell::F32(Vec::new())));
+    }
+
+    let values = elements
+        .split(',')
+        .map(|element| Ok(Some(element.trim().parse()?)))
+        .collect::<EtlResult<Vec<Option<f32>>>>()?;
+    Ok(Cell::Array(ArrayCell::F32(values)))
 }
 
 /// Strips the explicit dimensions prefix from an array literal, if present.
@@ -363,6 +387,9 @@ mod tests {
 
         let cell = parse_cell_from_postgres_text(&Type::TEXT_ARRAY, "[3:3]={\"a b\"}").unwrap();
         assert_eq!(cell, Cell::Array(ArrayCell::String(vec![Some("a b".to_owned())])));
+
+        let cell = parse_cell_from_postgres_text(&Type::FLOAT4_ARRAY, "[0:2]={1,2.5,-3}").unwrap();
+        assert_eq!(cell, Cell::Array(ArrayCell::F32(vec![Some(1.0), Some(2.5), Some(-3.0)])));
     }
 
     #[test]
@@ -1000,5 +1027,18 @@ mod tests {
 
         let cell = parse_cell_from_postgres_text(&custom_type, "test").unwrap();
         assert_eq!(cell, Cell::String("test".to_owned()));
+    }
+
+    #[test]
+    fn text_backed_search_vector_and_typed_pgvector_values_are_preserved() {
+        assert_eq!(
+            parse_cell_from_postgres_text(&Type::TS_VECTOR, "'alpha':1 'beta':2").unwrap(),
+            Cell::String("'alpha':1 'beta':2".to_owned())
+        );
+
+        assert_eq!(
+            parse_cell_from_postgres_text(&Type::FLOAT4_ARRAY, "[0.1,-2,3.5]").unwrap(),
+            Cell::Array(ArrayCell::F32(vec![Some(0.1), Some(-2.0), Some(3.5)]))
+        );
     }
 }

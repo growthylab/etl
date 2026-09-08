@@ -10,6 +10,7 @@ use crate::{
     error::{ErrorKind, EtlResult},
     etl_error,
     postgres::client::SlotState,
+    schema::TableId,
 };
 
 /// Maximum number of connections in the out-of-band pool.
@@ -58,6 +59,50 @@ impl OutOfBandSourcePool {
         &self.pool
     }
 
+    /// Verifies the configured publication still covers every table and every
+    /// supported change kind. This is intentionally a live assertion: an
+    /// administrator can transactionally replace a publication under the same
+    /// name while a replication stream is running.
+    pub(crate) async fn assert_all_tables_publication(
+        &self,
+        publication_name: &str,
+    ) -> EtlResult<()> {
+        let publication: Option<(bool, bool, bool, bool, bool)> = sqlx::query_as(
+            "select puballtables, pubinsert, pubupdate, pubdelete, pubtruncate \
+             from pg_catalog.pg_publication where pubname = $1",
+        )
+        .bind(publication_name)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|error| {
+            etl_error!(
+                ErrorKind::SourceConnectionFailed,
+                "Publication invariant query failed",
+                format!("publication_name={publication_name}"),
+                source: error
+            )
+        })?;
+
+        let Some((all_tables, inserts, updates, deletes, truncates)) = publication else {
+            return Err(etl_error!(
+                ErrorKind::ConfigError,
+                "Required all-tables publication is missing",
+                format!("publication_name={publication_name}")
+            ));
+        };
+        if !(all_tables && inserts && updates && deletes && truncates) {
+            return Err(etl_error!(
+                ErrorKind::ConfigError,
+                "Publication must remain FOR ALL TABLES with INSERT, UPDATE, DELETE, and TRUNCATE enabled",
+                format!(
+                    "publication_name={publication_name}, all_tables={all_tables}, insert={inserts}, update={updates}, delete={deletes}, truncate={truncates}"
+                )
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Queries the source database's current WAL LSN.
     pub(crate) async fn get_current_wal_lsn(&self) -> EtlResult<PgLsn> {
         let current_wal_lsn: String = sqlx::query_scalar("select pg_current_wal_lsn()::text")
@@ -78,6 +123,47 @@ impl OutOfBandSourcePool {
                 current_wal_lsn
             )
         })
+    }
+
+    /// Returns the current effective table OIDs for `publication_name`.
+    ///
+    /// `pg_get_publication_tables` expands `FOR ALL TABLES`,
+    /// `FOR TABLES IN SCHEMA`, and partition publication rules in the same way
+    /// as logical decoding. Keeping this query in the shared out-of-band pool
+    /// lets a running pipeline discover tables added after startup without
+    /// issuing SQL on its replication-protocol connection.
+    pub(crate) async fn get_publication_table_ids(
+        &self,
+        publication_name: &str,
+    ) -> EtlResult<Vec<TableId>> {
+        let table_ids: Vec<i64> = sqlx::query_scalar(
+            "select distinct relid::bigint from pg_get_publication_tables($1) order by 1",
+        )
+        .bind(publication_name)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|error| {
+            etl_error!(
+                ErrorKind::SourceConnectionFailed,
+                "Publication table discovery query failed",
+                format!("publication_name={publication_name}"),
+                source: error
+            )
+        })?;
+
+        table_ids
+            .into_iter()
+            .map(|table_id| {
+                u32::try_from(table_id).map(TableId::new).map_err(|error| {
+                    etl_error!(
+                        ErrorKind::InvalidState,
+                        "Invalid table OID returned by Postgres",
+                        format!("table_id={table_id}"),
+                        source: error
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Queries the current state of the replication slot named `slot_name`.

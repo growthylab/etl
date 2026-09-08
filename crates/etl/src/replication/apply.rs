@@ -452,6 +452,8 @@ struct ApplyLoopTasks {
     schema_cleanup_worker_task: JoinHandle<()>,
     /// Background replication lag sampler task owned by this apply loop.
     replication_lag_sampler_task: JoinHandle<()>,
+    /// Required publication discovery task owned by the main apply loop.
+    publication_discovery_task: Option<JoinHandle<EtlResult<()>>>,
 }
 
 impl ApplyLoopTasks {
@@ -462,26 +464,38 @@ impl ApplyLoopTasks {
         replication_lag_metrics: ReplicationLagMetrics,
         worker_type: WorkerType,
         table_sync_monitor_refresh_interval: Duration,
+        publication_name: String,
+        require_all_tables_publication: bool,
     ) -> Self
     where
-        S: SchemaStore + Send + Sync + 'static,
+        S: PipelineStore + Send + Sync + 'static,
     {
         let (schema_cleanup_tx, schema_cleanup_rx) =
             mpsc::channel(SCHEMA_CLEANUP_QUEUE_TABLE_CAPACITY);
         let schema_cleanup_worker_task =
-            Self::spawn_schema_cleanup_worker(schema_store, schema_cleanup_rx, worker_type);
+            Self::spawn_schema_cleanup_worker(schema_store.clone(), schema_cleanup_rx, worker_type);
 
         let replication_lag_sampler_task = Self::spawn_replication_lag_sampler(
-            out_of_band_source_pool,
+            out_of_band_source_pool.clone(),
             replication_lag_metrics,
             worker_type,
             table_sync_monitor_refresh_interval,
         );
+        let publication_discovery_task = matches!(worker_type, WorkerType::Apply).then(|| {
+            Self::spawn_publication_discovery(
+                schema_store,
+                out_of_band_source_pool,
+                publication_name,
+                table_sync_monitor_refresh_interval,
+                require_all_tables_publication,
+            )
+        });
 
         Self {
             schema_cleanup_tx: Some(schema_cleanup_tx),
             schema_cleanup_worker_task,
             replication_lag_sampler_task,
+            publication_discovery_task,
         }
     }
 
@@ -604,6 +618,58 @@ impl ApplyLoopTasks {
         }
     }
 
+    /// Aborts and joins the publication discovery task during loop teardown.
+    async fn handle_publication_discovery_task_result(&mut self) {
+        let Some(mut task) = self.publication_discovery_task.take() else {
+            return;
+        };
+
+        task.abort();
+        match (&mut task).await {
+            Ok(Ok(())) => {
+                warn!("publication discovery task stopped before apply-loop teardown");
+            }
+            Ok(Err(err)) => {
+                error!(
+                    error = %err,
+                    "publication discovery failed while the apply loop was stopping"
+                );
+            }
+            Err(err) if !err.is_cancelled() => {
+                warn!(
+                    error = %err,
+                    "publication discovery task failed before completing"
+                );
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Waits for the required discovery task and converts every terminal
+    /// outcome into an apply-loop result. A healthy task runs until teardown;
+    /// returning successfully is therefore also an invariant violation.
+    async fn wait_for_publication_discovery_task(
+        task: Option<&mut JoinHandle<EtlResult<()>>>,
+    ) -> EtlResult<()> {
+        match task.expect("publication discovery task must exist for apply workers").await {
+            Ok(Ok(())) => Err(etl_error!(
+                ErrorKind::InvalidState,
+                "Publication discovery task stopped unexpectedly"
+            )),
+            Ok(Err(err)) => Err(err),
+            Err(err) if err.is_cancelled() => Err(etl_error!(
+                ErrorKind::ApplyWorkerCancelled,
+                "Publication discovery task was cancelled",
+                source: err
+            )),
+            Err(err) => Err(etl_error!(
+                ErrorKind::ApplyWorkerPanic,
+                "Publication discovery task panicked",
+                source: err
+            )),
+        }
+    }
+
     async fn handle_schema_cleanup_task_result(&mut self, worker_type: WorkerType) {
         // Closing the sender lets the cleanup worker finish every accepted
         // request before the apply loop returns.
@@ -632,7 +698,132 @@ impl ApplyLoopTasks {
     /// Stops and joins all owned background tasks.
     async fn teardown(&mut self, worker_type: WorkerType) {
         self.handle_replication_lag_sampler_task_result().await;
+        self.handle_publication_discovery_task_result().await;
         self.handle_schema_cleanup_task_result(worker_type).await;
+    }
+
+    /// Starts periodic discovery for tables added to an expanded publication.
+    fn spawn_publication_discovery<S>(
+        store: S,
+        out_of_band_source_pool: OutOfBandSourcePool,
+        publication_name: String,
+        refresh_interval: Duration,
+        require_all_tables_publication: bool,
+    ) -> JoinHandle<EtlResult<()>>
+    where
+        S: StateStore + Send + Sync + 'static,
+    {
+        tokio::spawn(async move {
+            Self::run_publication_discovery(
+                store,
+                out_of_band_source_pool,
+                publication_name,
+                refresh_interval,
+                require_all_tables_publication,
+            )
+            .await
+        })
+    }
+
+    /// Adds `Init` state for effective publication tables first seen at run
+    /// time. The apply loop's existing quiescent and post-commit paths observe
+    /// those states and start their initial-copy workers.
+    async fn run_publication_discovery<S>(
+        store: S,
+        out_of_band_source_pool: OutOfBandSourcePool,
+        publication_name: String,
+        refresh_interval: Duration,
+        require_all_tables_publication: bool,
+    ) -> EtlResult<()>
+    where
+        S: StateStore,
+    {
+        let mut interval = tokio::time::interval(refresh_interval);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut warned_removed_tables = HashSet::new();
+
+        loop {
+            interval.tick().await;
+
+            if require_all_tables_publication
+                && let Err(err) =
+                    out_of_band_source_pool.assert_all_tables_publication(&publication_name).await
+            {
+                error!(
+                    error = %err,
+                    publication_name,
+                    "publication scope invariant failed; stopping apply worker"
+                );
+                return Err(err);
+            }
+
+            let table_ids = match out_of_band_source_pool
+                .get_publication_table_ids(&publication_name)
+                .await
+            {
+                Ok(table_ids) => table_ids,
+                Err(err) => {
+                    error!(
+                        error = %err,
+                        publication_name,
+                        "publication table discovery failed; stopping apply worker to avoid a silently incomplete destination"
+                    );
+                    return Err(err);
+                }
+            };
+            let table_states = match store.get_table_states().await {
+                Ok(table_states) => table_states,
+                Err(err) => {
+                    error!(
+                        error = %err,
+                        publication_name,
+                        "failed to load table states during publication discovery; stopping apply worker"
+                    );
+                    return Err(err);
+                }
+            };
+            let publication_table_ids = table_ids.iter().copied().collect::<HashSet<_>>();
+            warned_removed_tables.retain(|table_id| {
+                table_states.contains_key(table_id) && !publication_table_ids.contains(table_id)
+            });
+            for table_id in
+                table_states.keys().filter(|table_id| !publication_table_ids.contains(table_id))
+            {
+                if warned_removed_tables.insert(*table_id) {
+                    warn!(
+                        publication_name,
+                        table_id = table_id.0,
+                        "table left the publication while the pipeline was running; destination \
+                         data is preserved and startup reconciliation or explicit cleanup is \
+                         required"
+                    );
+                }
+            }
+
+            let new_tables = table_ids
+                .into_iter()
+                .filter(|table_id| !table_states.contains_key(table_id))
+                .map(|table_id| (table_id, TableState::Init))
+                .collect::<Vec<_>>();
+
+            if !new_tables.is_empty() {
+                let new_table_count = new_tables.len();
+                if let Err(err) = store.update_table_states(new_tables).await {
+                    error!(
+                        error = %err,
+                        publication_name,
+                        new_table_count,
+                        "failed to initialize newly discovered publication tables; stopping apply worker"
+                    );
+                    return Err(err);
+                }
+
+                info!(
+                    publication_name,
+                    new_table_count, "initialized newly discovered publication tables"
+                );
+            }
+        }
     }
 
     /// Starts the replication lag sampler for an apply loop.
@@ -1209,6 +1400,8 @@ where
             replication_lag_metrics.clone(),
             worker_type,
             table_sync_monitor_refresh_interval,
+            config.publication_name.clone(),
+            config.require_all_tables_publication,
         );
 
         let state = ApplyLoopState::new(
@@ -1317,10 +1510,11 @@ where
     /// After that preflight, this keeps the priority order explicit:
     /// 1. Shutdown requests.
     /// 2. PostgreSQL connection lifecycle updates.
-    /// 3. Pending destination flush results.
-    /// 4. Batch flush deadline expiry.
-    /// 5. Incoming replication messages.
-    /// 6. Periodic heartbeats once the computed keep alive deadline expires.
+    /// 3. Publication discovery task failure.
+    /// 4. Pending destination flush results.
+    /// 5. Batch flush deadline expiry.
+    /// 6. Incoming replication messages.
+    /// 7. Periodic heartbeats once the computed keep alive deadline expires.
     ///
     /// PostgreSQL normally sends keep alives at roughly half of
     /// `wal_sender_timeout`. We wait a little longer than that before
@@ -1369,20 +1563,30 @@ where
                 Self::handle_connection_update(changed, connection_updates_rx)?;
             }
 
-            // PRIORITY 3: Handle the pending destination write result.
+            // PRIORITY 3: A discovery task must never terminate while apply is active.
+            // Propagating its source/store error makes the service unhealthy instead of
+            // silently omitting tables added after startup.
+            discovery_result = ApplyLoopTasks::wait_for_publication_discovery_task(
+                self.tasks.publication_discovery_task.as_mut()
+            ), if self.tasks.publication_discovery_task.is_some() => {
+                self.tasks.publication_discovery_task.take();
+                discovery_result?;
+            }
+
+            // PRIORITY 4: Handle the pending destination write result.
             // Finishing an in-flight flush may advance progress and unblock a queued batch.
             apply_result = Self::wait_for_flush_result(self.state.pending_flush_result.as_mut()), if self.state.pending_flush_result.is_some() => {
                 self.handle_flush_result(apply_result)
                     .await?;
             }
 
-            // PRIORITY 4: Handle batch flush timer expiry.
+            // PRIORITY 5: Handle batch flush timer expiry.
             // This prevents buffered work from waiting forever when traffic is low.
             _ = Self::wait_for_batch_deadline(self.state.flush_deadline), if self.state.can_wait_for_deadline() => {
                 self.flush_batch("flush deadline reached").await?;
             }
 
-            // PRIORITY 5: Process incoming replication messages from PostgreSQL.
+            // PRIORITY 6: Process incoming replication messages from PostgreSQL.
             // New WAL messages are only accepted while the loop is still actively ingesting.
             maybe_message = replication_message_stream.next(), if self.state.can_process_messages() => {
                 self.handle_stream_message(
@@ -1393,7 +1597,7 @@ where
                 .await?;
             }
 
-            // PRIORITY 6: Emit a periodic status update once the computed keep alive deadline
+            // PRIORITY 7: Emit a periodic status update once the computed keep alive deadline
             // expires. This intentionally resends the same checkpoint LSN so PostgreSQL keeps
             // the standby connection open during long stalls, including cases where the loop is
             // paused behind an in-flight flush and therefore not making visible progress yet. This
@@ -4542,6 +4746,33 @@ mod tests {
             schema_cleanup_retention_snapshot_id(PgLsn::from(u64::MAX), SnapshotId::max()),
             SnapshotId::max()
         );
+    }
+
+    #[tokio::test]
+    async fn publication_discovery_error_stops_the_apply_loop() {
+        let mut task = tokio::spawn(async {
+            Err(etl_error!(
+                ErrorKind::SourceConnectionFailed,
+                "Publication table discovery query failed"
+            ))
+        });
+
+        let error =
+            ApplyLoopTasks::wait_for_publication_discovery_task(Some(&mut task)).await.unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::SourceConnectionFailed);
+        assert_eq!(error.description(), Some("Publication table discovery query failed"));
+    }
+
+    #[tokio::test]
+    async fn publication_discovery_cannot_stop_successfully_while_apply_is_active() {
+        let mut task = tokio::spawn(async { Ok(()) });
+
+        let error =
+            ApplyLoopTasks::wait_for_publication_discovery_task(Some(&mut task)).await.unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidState);
+        assert_eq!(error.description(), Some("Publication discovery task stopped unexpectedly"));
     }
 
     #[test]

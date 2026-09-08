@@ -22,6 +22,31 @@ pub const DEFAULT_DUCKLAKE_TARGET_FILE_SIZE: &str = "256MiB";
 pub const DEFAULT_DUCKLAKE_PARQUET_ROW_GROUP_SIZE_BYTES: &str = "128MiB";
 /// Default DuckLake Parquet row-group row limit.
 pub const DEFAULT_DUCKLAKE_PARQUET_ROW_GROUP_SIZE: &str = "2500000";
+/// Default memory budget for one in-memory DuckDB instance.
+pub const DEFAULT_DUCKDB_MEMORY_LIMIT: &str = "1GiB";
+/// Default execution threads for one in-memory DuckDB instance.
+pub const DEFAULT_DUCKDB_THREADS: u32 = 1;
+/// Default root directory each in-memory DuckDB instance spills to when one
+/// operation does not fit in `duckdb_memory_limit`.
+///
+/// DuckDB's own default is the relative path `.tmp`, resolved against the
+/// process working directory and identical for every instance in the process.
+/// That is not usable here: DuckDB names its spill files
+/// `duckdb_temp_storage_<block size>-<n>.tmp` and `duckdb_temp_block-<id>.block`
+/// with no instance identity in the name, so two instances pointed at one
+/// directory delete and overwrite each other's blocks. The path below is a root:
+/// each connection gets its own subdirectory under it.
+///
+/// `/tmp` is mode 1777 in the distroless runtime image, so it is writable by
+/// the image's `nonroot` user without the image having to create anything.
+pub const DEFAULT_DUCKDB_TEMP_DIRECTORY: &str = "/tmp/etl-duckdb-spill";
+/// Default on-disk spill budget for one in-memory DuckDB instance.
+///
+/// DuckDB's default is 90% of free disk space. On Fargate the ephemeral volume
+/// is shared with the image layers and the log-router sidecar, so an unbounded
+/// spill trades a killed query for a killed task. `2 * pool_size` instances
+/// share the volume, each with this budget.
+pub const DEFAULT_DUCKDB_MAX_TEMP_DIRECTORY_SIZE: &str = "2GiB";
 
 /// DuckLake writer options shared by replication and external maintenance.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -29,6 +54,11 @@ pub struct DuckLakeWriterConfig {
     target_file_size: Option<String>,
     parquet_row_group_size_bytes: Option<String>,
     parquet_row_group_size: Option<String>,
+    duckdb_memory_limit: Option<String>,
+    duckdb_threads: Option<u32>,
+    duckdb_temp_directory: Option<String>,
+    duckdb_max_temp_directory_size: Option<String>,
+    destination_schema: Option<String>,
 }
 
 impl DuckLakeWriterConfig {
@@ -38,7 +68,63 @@ impl DuckLakeWriterConfig {
         parquet_row_group_size_bytes: Option<String>,
         parquet_row_group_size: Option<String>,
     ) -> Self {
-        Self { target_file_size, parquet_row_group_size_bytes, parquet_row_group_size }
+        Self {
+            target_file_size,
+            parquet_row_group_size_bytes,
+            parquet_row_group_size,
+            duckdb_memory_limit: None,
+            duckdb_threads: None,
+            duckdb_temp_directory: None,
+            duckdb_max_temp_directory_size: None,
+            destination_schema: None,
+        }
+    }
+
+    /// Adds per-instance DuckDB resource limits.
+    pub fn with_duckdb_resource_limits(
+        mut self,
+        duckdb_memory_limit: Option<String>,
+        duckdb_threads: Option<u32>,
+    ) -> Self {
+        self.duckdb_memory_limit = duckdb_memory_limit;
+        self.duckdb_threads = duckdb_threads;
+        self
+    }
+
+    /// Adds the per-instance on-disk spill location and its budget.
+    ///
+    /// `duckdb_memory_limit` bounds what one instance may hold in memory; this
+    /// pair decides what happens to the operation that does not fit. Without a
+    /// usable spill target the oversized operation is a hard error, and the
+    /// pinned DuckLake extension turns some of those errors into an
+    /// unrecoverable database invalidation.
+    pub fn with_duckdb_temp_spill(
+        mut self,
+        duckdb_temp_directory: Option<String>,
+        duckdb_max_temp_directory_size: Option<String>,
+    ) -> Self {
+        self.duckdb_temp_directory =
+            duckdb_temp_directory.filter(|directory| !directory.trim().is_empty());
+        self.duckdb_max_temp_directory_size =
+            duckdb_max_temp_directory_size.filter(|size| !size.trim().is_empty());
+        self
+    }
+
+    /// Names the destination schema every DuckLake option this writer sets is
+    /// confined to.
+    ///
+    /// The Bayes lake is shared: an option set without a scope is a catalog
+    /// row that reconfigures every other writer's Parquet output. Without a
+    /// destination schema there is nothing to confine the options to, and the
+    /// writer sets none.
+    pub fn with_destination_schema(mut self, destination_schema: Option<String>) -> Self {
+        self.destination_schema = destination_schema.filter(|schema| !schema.trim().is_empty());
+        self
+    }
+
+    /// Returns the destination schema DuckLake options are scoped to.
+    pub fn destination_schema(&self) -> Option<&str> {
+        self.destination_schema.as_deref()
     }
 
     /// Returns the configured target data-file size or its default.
@@ -56,6 +142,28 @@ impl DuckLakeWriterConfig {
     /// Returns the configured Parquet row-group row limit or its default.
     pub fn parquet_row_group_size(&self) -> &str {
         self.parquet_row_group_size.as_deref().unwrap_or(DEFAULT_DUCKLAKE_PARQUET_ROW_GROUP_SIZE)
+    }
+
+    /// Returns the memory budget for one DuckDB instance.
+    pub fn duckdb_memory_limit(&self) -> &str {
+        self.duckdb_memory_limit.as_deref().unwrap_or(DEFAULT_DUCKDB_MEMORY_LIMIT)
+    }
+
+    /// Returns the execution threads for one DuckDB instance.
+    pub fn duckdb_threads(&self) -> u32 {
+        self.duckdb_threads.unwrap_or(DEFAULT_DUCKDB_THREADS)
+    }
+
+    /// Returns the root directory DuckDB instances spill into.
+    pub fn duckdb_temp_directory(&self) -> &str {
+        self.duckdb_temp_directory.as_deref().unwrap_or(DEFAULT_DUCKDB_TEMP_DIRECTORY)
+    }
+
+    /// Returns the on-disk spill budget for one DuckDB instance.
+    pub fn duckdb_max_temp_directory_size(&self) -> &str {
+        self.duckdb_max_temp_directory_size
+            .as_deref()
+            .unwrap_or(DEFAULT_DUCKDB_MAX_TEMP_DIRECTORY_SIZE)
     }
 }
 
@@ -489,6 +597,14 @@ pub enum DestinationConfig {
         /// Size of the DuckDB connection pool.
         #[serde(default = "default_ducklake_pool_size")]
         pool_size: u32,
+        /// Optional memory budget for each DuckDB instance.
+        duckdb_memory_limit: Option<String>,
+        /// Optional execution threads for each DuckDB instance.
+        duckdb_threads: Option<u32>,
+        /// Optional root directory each DuckDB instance spills into.
+        duckdb_temp_directory: Option<String>,
+        /// Optional on-disk spill budget for each DuckDB instance.
+        duckdb_max_temp_directory_size: Option<String>,
         /// Optional S3-compatible storage access key ID.
         s3_access_key_id: Option<SecretString>,
         /// Optional S3-compatible storage secret access key.
@@ -503,6 +619,8 @@ pub enum DestinationConfig {
         s3_use_ssl: Option<bool>,
         /// Optional metadata schema for DuckLake metadata tables.
         metadata_schema: Option<String>,
+        /// Optional schema receiving every replicated source table.
+        destination_schema: Option<String>,
         /// Optional DuckLake maintenance target file size.
         maintenance_target_file_size: Option<String>,
         /// Optional Parquet row-group byte limit.
@@ -559,10 +677,62 @@ impl Validate for DestinationConfig {
         match self {
             DestinationConfig::BigQuery { table_options, .. } => table_options.validate(),
             DestinationConfig::Iceberg { config } => config.validate(),
-            DestinationConfig::Ducklake { table_sorting, .. } => table_sorting.validate(),
+            DestinationConfig::Ducklake {
+                table_sorting,
+                duckdb_memory_limit,
+                duckdb_threads,
+                duckdb_temp_directory,
+                duckdb_max_temp_directory_size,
+                ..
+            } => {
+                table_sorting.validate()?;
+                validate_duckdb_resource_limits(
+                    duckdb_memory_limit.as_deref(),
+                    *duckdb_threads,
+                    duckdb_temp_directory.as_deref(),
+                    duckdb_max_temp_directory_size.as_deref(),
+                )
+            }
             DestinationConfig::ClickHouse { .. } | DestinationConfig::Snowflake { .. } => Ok(()),
         }
     }
+}
+
+fn validate_duckdb_resource_limits(
+    duckdb_memory_limit: Option<&str>,
+    duckdb_threads: Option<u32>,
+    duckdb_temp_directory: Option<&str>,
+    duckdb_max_temp_directory_size: Option<&str>,
+) -> Result<(), ValidationError> {
+    if duckdb_memory_limit.is_some_and(|limit| limit.trim().is_empty()) {
+        return Err(ValidationError::InvalidFieldValue {
+            field: "destination.ducklake.duckdb_memory_limit".to_owned(),
+            constraint: "must not be empty".to_owned(),
+        });
+    }
+    if duckdb_threads == Some(0) {
+        return Err(ValidationError::InvalidFieldValue {
+            field: "destination.ducklake.duckdb_threads".to_owned(),
+            constraint: "must be greater than zero".to_owned(),
+        });
+    }
+    // An empty string is the one value DuckDB accepts and reads as "never
+    // spill". Configuring the knob that way is always a mistake here, so it is
+    // rejected rather than silently restoring the failure mode it exists to
+    // remove. Omitting the field entirely still selects the default.
+    if duckdb_temp_directory.is_some_and(|directory| directory.trim().is_empty()) {
+        return Err(ValidationError::InvalidFieldValue {
+            field: "destination.ducklake.duckdb_temp_directory".to_owned(),
+            constraint: "must not be empty; omit the field to use the default".to_owned(),
+        });
+    }
+    if duckdb_max_temp_directory_size.is_some_and(|size| size.trim().is_empty()) {
+        return Err(ValidationError::InvalidFieldValue {
+            field: "destination.ducklake.duckdb_max_temp_directory_size".to_owned(),
+            constraint: "must not be empty; omit the field to use the default".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Configuration for the iceberg destination with two variants
@@ -744,6 +914,14 @@ pub enum DestinationConfigWithoutSecrets {
         /// Size of the DuckDB connection pool.
         #[serde(default = "default_ducklake_pool_size")]
         pool_size: u32,
+        /// Optional memory budget for each DuckDB instance.
+        duckdb_memory_limit: Option<String>,
+        /// Optional execution threads for each DuckDB instance.
+        duckdb_threads: Option<u32>,
+        /// Optional root directory each DuckDB instance spills into.
+        duckdb_temp_directory: Option<String>,
+        /// Optional on-disk spill budget for each DuckDB instance.
+        duckdb_max_temp_directory_size: Option<String>,
         /// Optional S3-compatible storage region.
         s3_region: Option<String>,
         /// Optional S3-compatible storage endpoint.
@@ -754,6 +932,8 @@ pub enum DestinationConfigWithoutSecrets {
         s3_use_ssl: Option<bool>,
         /// Optional metadata schema for DuckLake metadata tables.
         metadata_schema: Option<String>,
+        /// Optional schema receiving every replicated source table.
+        destination_schema: Option<String>,
         /// Optional DuckLake maintenance target file size.
         maintenance_target_file_size: Option<String>,
         /// Optional Parquet row-group byte limit.
@@ -791,8 +971,21 @@ impl Validate for DestinationConfigWithoutSecrets {
                 table_options.validate()
             }
             DestinationConfigWithoutSecrets::Iceberg { config } => config.validate(),
-            DestinationConfigWithoutSecrets::Ducklake { table_sorting, .. } => {
-                table_sorting.validate()
+            DestinationConfigWithoutSecrets::Ducklake {
+                table_sorting,
+                duckdb_memory_limit,
+                duckdb_threads,
+                duckdb_temp_directory,
+                duckdb_max_temp_directory_size,
+                ..
+            } => {
+                table_sorting.validate()?;
+                validate_duckdb_resource_limits(
+                    duckdb_memory_limit.as_deref(),
+                    *duckdb_threads,
+                    duckdb_temp_directory.as_deref(),
+                    duckdb_max_temp_directory_size.as_deref(),
+                )
             }
             DestinationConfigWithoutSecrets::ClickHouse { .. }
             | DestinationConfigWithoutSecrets::Snowflake { .. } => Ok(()),
@@ -827,6 +1020,10 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
                 catalog_url: _,
                 data_path,
                 pool_size,
+                duckdb_memory_limit,
+                duckdb_threads,
+                duckdb_temp_directory,
+                duckdb_max_temp_directory_size,
                 s3_access_key_id: _,
                 s3_secret_access_key: _,
                 s3_region,
@@ -834,6 +1031,7 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
                 s3_url_style,
                 s3_use_ssl,
                 metadata_schema,
+                destination_schema,
                 maintenance_target_file_size,
                 parquet_row_group_size_bytes,
                 parquet_row_group_size,
@@ -843,11 +1041,16 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
             } => DestinationConfigWithoutSecrets::Ducklake {
                 data_path,
                 pool_size,
+                duckdb_memory_limit,
+                duckdb_threads,
+                duckdb_temp_directory,
+                duckdb_max_temp_directory_size,
                 s3_region,
                 s3_endpoint,
                 s3_url_style,
                 s3_use_ssl,
                 metadata_schema,
+                destination_schema,
                 maintenance_target_file_size,
                 parquet_row_group_size_bytes,
                 parquet_row_group_size,
@@ -884,6 +1087,10 @@ mod tests {
         assert_eq!(defaults.target_file_size(), "256MiB");
         assert_eq!(defaults.parquet_row_group_size_bytes(), "128MiB");
         assert_eq!(defaults.parquet_row_group_size(), "2500000");
+        assert_eq!(defaults.duckdb_memory_limit(), "1GiB");
+        assert_eq!(defaults.duckdb_threads(), 1);
+        assert_eq!(defaults.duckdb_temp_directory(), "/tmp/etl-duckdb-spill");
+        assert_eq!(defaults.duckdb_max_temp_directory_size(), "2GiB");
 
         let configured = DuckLakeWriterConfig::new(
             Some("64MB".to_owned()),
@@ -893,6 +1100,19 @@ mod tests {
         assert_eq!(configured.target_file_size(), "64MB");
         assert_eq!(configured.parquet_row_group_size_bytes(), "32MB");
         assert_eq!(configured.parquet_row_group_size(), "500000");
+        let configured = configured.with_duckdb_resource_limits(Some("2GiB".to_owned()), Some(2));
+        assert_eq!(configured.duckdb_memory_limit(), "2GiB");
+        assert_eq!(configured.duckdb_threads(), 2);
+        let configured = configured
+            .with_duckdb_temp_spill(Some("/var/spill".to_owned()), Some("8GiB".to_owned()));
+        assert_eq!(configured.duckdb_temp_directory(), "/var/spill");
+        assert_eq!(configured.duckdb_max_temp_directory_size(), "8GiB");
+        // A blank override is not a way to turn spilling off: it falls back to
+        // the default the same way an omitted field does.
+        let blank =
+            configured.clone().with_duckdb_temp_spill(Some("   ".to_owned()), Some(String::new()));
+        assert_eq!(blank.duckdb_temp_directory(), "/tmp/etl-duckdb-spill");
+        assert_eq!(blank.duckdb_max_temp_directory_size(), "2GiB");
     }
 
     #[test]
@@ -901,6 +1121,10 @@ mod tests {
             catalog_url: "postgres://user:pass@localhost:5432/ducklake_catalog".to_owned().into(),
             data_path: "s3://bucket/path".to_owned(),
             pool_size: 4,
+            duckdb_memory_limit: None,
+            duckdb_threads: None,
+            duckdb_temp_directory: None,
+            duckdb_max_temp_directory_size: None,
             s3_access_key_id: None,
             s3_secret_access_key: None,
             s3_region: None,
@@ -908,6 +1132,7 @@ mod tests {
             s3_url_style: None,
             s3_use_ssl: None,
             metadata_schema: None,
+            destination_schema: Some("raw_source".to_owned()),
             maintenance_target_file_size: None,
             parquet_row_group_size_bytes: None,
             parquet_row_group_size: None,
@@ -928,10 +1153,99 @@ mod tests {
 
         assert!(!serialized.contains("catalog_url"));
         assert!(!serialized.contains("user:pass"));
+        assert_eq!(json["ducklake"]["destination_schema"], "raw_source");
         assert_eq!(
             json["ducklake"]["table_sorting"]["tables"][0]["sort_by"]["kind"],
             "primary_key"
         );
+    }
+
+    /// DuckLake options are catalog rows, not session settings, and the Bayes
+    /// lake is shared with writers that keep DuckDB's default
+    /// `preserve_insertion_order`. The writer only ever sets options it can
+    /// confine to its own destination schema.
+    #[test]
+    fn ducklake_writer_config_scopes_options_to_destination_schema() {
+        assert_eq!(DuckLakeWriterConfig::default().destination_schema(), None);
+        assert_eq!(
+            DuckLakeWriterConfig::default()
+                .with_destination_schema(Some("raw_laplace".to_owned()))
+                .destination_schema(),
+            Some("raw_laplace")
+        );
+        assert_eq!(
+            DuckLakeWriterConfig::default()
+                .with_destination_schema(Some("   ".to_owned()))
+                .destination_schema(),
+            None,
+            "a blank schema names nothing and must not become a catalog-wide option"
+        );
+    }
+
+    /// An empty `temp_directory` is the one value DuckDB reads as "never
+    /// spill", so it must not be settable through configuration.
+    #[test]
+    fn ducklake_resource_limits_reject_a_blank_temp_spill_target() {
+        for (temp_directory, max_size) in
+            [(Some("   ".to_owned()), None), (None, Some(String::new()))]
+        {
+            let config = DestinationConfig::Ducklake {
+                catalog_url: "postgres://user:pass@localhost:5432/ducklake_catalog"
+                    .to_owned()
+                    .into(),
+                data_path: "s3://bucket/path".to_owned(),
+                pool_size: 1,
+                duckdb_memory_limit: None,
+                duckdb_threads: None,
+                duckdb_temp_directory: temp_directory,
+                duckdb_max_temp_directory_size: max_size,
+                s3_access_key_id: None,
+                s3_secret_access_key: None,
+                s3_region: None,
+                s3_endpoint: None,
+                s3_url_style: None,
+                s3_use_ssl: None,
+                metadata_schema: None,
+                destination_schema: None,
+                maintenance_target_file_size: None,
+                parquet_row_group_size_bytes: None,
+                parquet_row_group_size: None,
+                expire_snapshots_older_than: None,
+                maintenance_mode: DuckLakeMaintenanceMode::Disabled,
+                table_sorting: DuckLakeTableSortingConfig::default(),
+            };
+
+            assert!(matches!(config.validate(), Err(ValidationError::InvalidFieldValue { .. })));
+        }
+    }
+
+    #[test]
+    fn ducklake_resource_limits_reject_zero_threads() {
+        let config = DestinationConfig::Ducklake {
+            catalog_url: "postgres://user:pass@localhost:5432/ducklake_catalog".to_owned().into(),
+            data_path: "s3://bucket/path".to_owned(),
+            pool_size: 1,
+            duckdb_memory_limit: Some("1GiB".to_owned()),
+            duckdb_threads: Some(0),
+            duckdb_temp_directory: None,
+            duckdb_max_temp_directory_size: None,
+            s3_access_key_id: None,
+            s3_secret_access_key: None,
+            s3_region: None,
+            s3_endpoint: None,
+            s3_url_style: None,
+            s3_use_ssl: None,
+            metadata_schema: None,
+            destination_schema: None,
+            maintenance_target_file_size: None,
+            parquet_row_group_size_bytes: None,
+            parquet_row_group_size: None,
+            expire_snapshots_older_than: None,
+            maintenance_mode: DuckLakeMaintenanceMode::Disabled,
+            table_sorting: DuckLakeTableSortingConfig::default(),
+        };
+
+        assert!(matches!(config.validate(), Err(ValidationError::InvalidFieldValue { .. })));
     }
 
     #[test]

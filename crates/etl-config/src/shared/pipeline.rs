@@ -300,6 +300,10 @@ pub struct PipelineConfig {
     pub id: u64,
     /// Name of the Postgres publication to use for logical replication.
     pub publication_name: String,
+    /// Whether the publication must continuously remain `FOR ALL TABLES` and
+    /// publish every supported change kind.
+    #[serde(default)]
+    pub require_all_tables_publication: bool,
     /// The connection configuration for the Postgres instance to which the
     /// pipeline connects for replication.
     pub pg_connection: PgConnectionConfig,
@@ -515,6 +519,10 @@ pub struct PipelineConfigWithoutSecrets {
     pub id: u64,
     /// Name of the Postgres publication to use for logical replication.
     pub publication_name: String,
+    /// Whether the publication must continuously remain `FOR ALL TABLES` and
+    /// publish every supported change kind.
+    #[serde(default)]
+    pub require_all_tables_publication: bool,
     /// The connection configuration for the Postgres instance to which the
     /// pipeline connects for replication.
     pub pg_connection: PgConnectionConfigWithoutSecrets,
@@ -597,6 +605,7 @@ impl From<PipelineConfig> for PipelineConfigWithoutSecrets {
         PipelineConfigWithoutSecrets {
             id: value.id,
             publication_name: value.publication_name,
+            require_all_tables_publication: value.require_all_tables_publication,
             pg_connection: value.pg_connection.into(),
             store_pg_connection: value.store_pg_connection.map(Into::into),
             replication_slot: value.replication_slot,
@@ -747,6 +756,7 @@ mod tests {
         let config = PipelineConfig {
             id: 1,
             publication_name: "publication".to_owned(),
+            require_all_tables_publication: false,
             pg_connection,
             store_pg_connection: None,
             replication_slot: ReplicationSlotConfig::default(),
@@ -773,6 +783,7 @@ mod tests {
         let config = PipelineConfig {
             id: 1,
             publication_name: "publication".to_owned(),
+            require_all_tables_publication: false,
             pg_connection: pg_connection("replica.local", 5432),
             store_pg_connection: Some(pg_connection("primary.local", 6432)),
             replication_slot: ReplicationSlotConfig::default(),

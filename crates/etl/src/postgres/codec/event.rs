@@ -4,10 +4,10 @@ use std::{
     str::FromStr,
 };
 
-use etl_postgres::type_utils::convert_type_oid_to_type;
 use postgres_replication::protocol;
 use serde::Deserialize;
 use tokio_postgres::types::PgLsn;
+use tracing::warn;
 
 use crate::{
     bail,
@@ -18,7 +18,7 @@ use crate::{
     postgres::codec::text::parse_cell_from_postgres_text,
     schema::{
         ColumnSchema, IdentityMask, ReplicatedTableSchema, ReplicationMask, SnapshotId, TableId,
-        TableName, TableSchema,
+        TableName, TableSchema, Type,
     },
 };
 
@@ -212,6 +212,26 @@ pub(crate) struct ColumnSchemaMessage {
     pub(crate) attname: String,
     /// The type OID from `pg_attribute.atttypid`.
     pub(crate) atttypid: u32,
+    /// The source type name from `pg_type.typname`, when supplied by the
+    /// schema helper.
+    ///
+    /// Older logical messages did not include this field, so it remains
+    /// optional for backwards compatibility.
+    #[serde(default)]
+    pub(crate) typname: Option<String>,
+    /// The source type rendered by `format_type`, including array and typmod
+    /// syntax (for example `order_status[]` or `vector(1536)`).
+    ///
+    /// This lets unknown extension and user-defined array types retain their
+    /// array shape instead of silently degrading into one scalar string.
+    #[serde(default)]
+    pub(crate) formatted_type: Option<String>,
+    /// The owning extension from `pg_extension.extname`, when this is an
+    /// extension-defined type. This prevents a user-defined type that merely
+    /// shares an extension type's name from being decoded with the wrong wire
+    /// format.
+    #[serde(default)]
+    pub(crate) type_extension_name: Option<String>,
     /// The type modifier from `pg_attribute.atttypmod`.
     pub(crate) atttypmod: i32,
     /// The physical column number from `pg_attribute.attnum`.
@@ -222,6 +242,60 @@ pub(crate) struct ColumnSchemaMessage {
     pub(crate) default_expression: Option<String>,
 }
 
+/// Resolves a source column type into ETL's durable value model.
+///
+/// `tokio-postgres` knows PostgreSQL built-ins by OID. Extension and
+/// user-defined OIDs are database-local, so they cannot be recovered through
+/// that static registry. Their logical replication and COPY values are still
+/// emitted in PostgreSQL text format. We therefore support unknown scalar
+/// types as canonical text and unknown one-dimensional array types as arrays
+/// of canonical text. The latter distinction is critical for enum arrays.
+///
+/// The conversion is deliberately observable rather than a silent fallback:
+/// operators get the original type name, formatted type, and OID in the log.
+fn source_column_type(table_name: &TableName, column: &ColumnSchemaMessage) -> Type {
+    if let Some(typ) = Type::from_oid(column.atttypid) {
+        return typ;
+    }
+
+    // pgvector stores `vector` elements as float32 and emits values as a
+    // bracketed list. Reuse ETL's durable float4-array representation so
+    // DuckLake receives a typed FLOAT[] instead of an opaque VARCHAR.
+    if column.typname.as_deref() == Some("vector")
+        && column.type_extension_name.as_deref() == Some("vector")
+    {
+        warn!(
+            source_schema = %table_name.schema,
+            source_table = %table_name.name,
+            source_column = %column.attname,
+            postgres_type_oid = column.atttypid,
+            postgres_type_name = "vector",
+            postgres_formatted_type = column.formatted_type.as_deref().unwrap_or("vector"),
+            postgres_extension_name = "vector",
+            etl_type = Type::FLOAT4_ARRAY.name(),
+            "mapping pgvector column to a typed float4 array"
+        );
+        return Type::FLOAT4_ARRAY;
+    }
+
+    let is_array = column.formatted_type.as_deref().is_some_and(|typ| typ.ends_with("[]"));
+    let mapped_type = if is_array { Type::TEXT_ARRAY } else { Type::TEXT };
+
+    warn!(
+        source_schema = %table_name.schema,
+        source_table = %table_name.name,
+        source_column = %column.attname,
+        postgres_type_oid = column.atttypid,
+        postgres_type_name = column.typname.as_deref().unwrap_or("<unknown>"),
+        postgres_formatted_type = column.formatted_type.as_deref().unwrap_or("<unknown>"),
+        postgres_extension_name = column.type_extension_name.as_deref().unwrap_or("<none>"),
+        etl_type = mapped_type.name(),
+        "mapping user-defined or extension PostgreSQL type to its canonical text representation"
+    );
+
+    mapped_type
+}
+
 /// Builds [`ColumnSchema`] values from PostgreSQL-native schema and identity
 /// snapshots.
 ///
@@ -229,6 +303,7 @@ pub(crate) struct ColumnSchemaMessage {
 /// table order, while `primary_key_ordinal_position` stays tied to the order of
 /// `primary_key_attnums`.
 pub(crate) fn build_column_schemas(
+    table_name: &TableName,
     mut columns: Vec<ColumnSchemaMessage>,
     primary_key_attnums: Vec<i32>,
 ) -> Vec<ColumnSchema> {
@@ -245,7 +320,7 @@ pub(crate) fn build_column_schemas(
     columns
         .into_iter()
         .map(|column| {
-            let typ = convert_type_oid_to_type(column.atttypid);
+            let typ = source_column_type(table_name, &column);
             ColumnSchema::new(
                 column.attname,
                 typ,
@@ -271,12 +346,8 @@ pub(crate) fn build_table_schema(
     primary_key_attnums: Vec<i32>,
     snapshot_id: SnapshotId,
 ) -> TableSchema {
-    TableSchema::with_snapshot_id(
-        table_id,
-        table_name,
-        build_column_schemas(columns, primary_key_attnums),
-        snapshot_id,
-    )
+    let column_schemas = build_column_schemas(&table_name, columns, primary_key_attnums);
+    TableSchema::with_snapshot_id(table_id, table_name, column_schemas, snapshot_id)
 }
 
 /// Calculates the uncompressed value bytes in a pgoutput tuple.
@@ -1000,11 +1071,11 @@ mod tests {
     use tokio_postgres::types::{PgLsn, Type};
 
     use super::{
-        DDL_MESSAGE_PREFIX, IdentityMessage, SchemaChangeMessage, calculate_tuple_bytes,
-        convert_tuple_to_row, convert_update_tuple_to_updated_table_row,
+        ColumnSchemaMessage, DDL_MESSAGE_PREFIX, IdentityMessage, SchemaChangeMessage,
+        calculate_tuple_bytes, convert_tuple_to_row, convert_update_tuple_to_updated_table_row,
         delete_message_payload_bytes, insert_message_payload_bytes, normalize_key_tuple_to_row,
         parse_event_from_delete_message, parse_event_from_update_message,
-        schema_snapshot_id_from_message, update_message_payload_bytes,
+        schema_snapshot_id_from_message, source_column_type, update_message_payload_bytes,
     };
     use crate::{
         data::{Cell, OldTableRow, PartialTableRow, TableRow, UpdatedTableRow},
@@ -1021,6 +1092,63 @@ mod tests {
         Null,
         UnchangedToast,
         Text(&'a str),
+    }
+
+    fn source_column_message(
+        atttypid: u32,
+        typname: Option<&str>,
+        formatted_type: Option<&str>,
+        type_extension_name: Option<&str>,
+    ) -> ColumnSchemaMessage {
+        ColumnSchemaMessage {
+            attname: "value".to_owned(),
+            atttypid,
+            typname: typname.map(str::to_owned),
+            formatted_type: formatted_type.map(str::to_owned),
+            type_extension_name: type_extension_name.map(str::to_owned),
+            atttypmod: -1,
+            attnum: 1,
+            attnotnull: false,
+            default_expression: None,
+        }
+    }
+
+    #[test]
+    fn source_column_type_preserves_known_and_custom_array_shapes() {
+        let table_name = TableName::new("public".to_owned(), "typed_values".to_owned());
+        assert_eq!(
+            source_column_type(
+                &table_name,
+                &source_column_message(Type::UUID_ARRAY.oid(), Some("_uuid"), Some("uuid[]"), None,)
+            ),
+            Type::UUID_ARRAY
+        );
+        assert_eq!(
+            source_column_type(
+                &table_name,
+                &source_column_message(
+                    90_001,
+                    Some("vector"),
+                    Some("vector(1536)"),
+                    Some("vector"),
+                )
+            ),
+            Type::FLOAT4_ARRAY
+        );
+        assert_eq!(
+            source_column_type(
+                &table_name,
+                &source_column_message(90_002, Some("vector"), Some("vector"), None)
+            ),
+            Type::TEXT
+        );
+        assert_eq!(
+            source_column_type(
+                &table_name,
+                &source_column_message(90_003, Some("_order_status"), Some("order_status[]"), None,)
+            ),
+            Type::TEXT_ARRAY
+        );
     }
 
     #[test]

@@ -7,7 +7,11 @@
 
 use std::future::Future;
 
-use crate::{error::EtlResult, schema::TableId};
+use crate::{error::EtlResult, replication::state::TableState, schema::TableId};
+
+pub(crate) fn table_state_can_reset_for_resync(state: &TableState) -> bool {
+    matches!(state, TableState::Ready | TableState::SyncDone { .. } | TableState::Errored { .. })
+}
 
 /// Lifecycle operation for ETL table state.
 ///
@@ -31,6 +35,16 @@ pub enum TableStateOperation {
     /// destination locate that object.
     PrepareForCopy {
         /// The table whose copy state should be prepared.
+        table_id: TableId,
+    },
+    /// Resets one completed or errored table to `Init` for a fresh copy.
+    ///
+    /// Preserves its schemas, destination metadata, copy checkpoint, and the
+    /// pipeline apply checkpoint. On the next pipeline start, the table-sync
+    /// worker uses that metadata to drop the existing destination table before
+    /// preparing the replacement copy.
+    ResetTableForResync {
+        /// The only table whose state is reset.
         table_id: TableId,
     },
     /// Reset current table states for a fresh synchronization pass.
@@ -105,6 +119,19 @@ pub trait TableStateLifecycleStore: Sync {
     /// around [`TableStateOperation::ResetForResync`].
     fn reset_table_states_for_resync(&self) -> impl Future<Output = EtlResult<usize>> + Send {
         async move { self.apply_table_state_operation(TableStateOperation::ResetForResync).await }
+    }
+
+    /// Resets exactly one table to `Init` while preserving pipeline-wide apply
+    /// progress and the metadata required to drop its existing destination.
+    fn reset_table_state_for_resync(
+        &self,
+        table_id: TableId,
+    ) -> impl Future<Output = EtlResult<()>> + Send {
+        async move {
+            self.apply_table_state_operation(TableStateOperation::ResetTableForResync { table_id })
+                .await?;
+            Ok(())
+        }
     }
 
     /// Deletes all stored ETL state for `table_id`.

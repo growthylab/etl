@@ -15,6 +15,7 @@ use crate::{
     store::{
         DestinationTablesMetadata, SchemaStore, StateStore, TableSchemaSnapshots,
         TableStateLifecycleStore, TableStateOperation, TableStates,
+        table_state_can_reset_for_resync,
     },
 };
 
@@ -257,6 +258,33 @@ impl TableStateLifecycleStore for MemoryStore {
                 inner.replication_checkpoints.remove(&WorkerType::TableSync { table_id });
 
                 Ok(0)
+            }
+            TableStateOperation::ResetTableForResync { table_id } => {
+                let mut inner = self.inner.lock().await;
+                let current_state = inner.table_states.get(&table_id).ok_or_else(|| {
+                    etl_error!(
+                        ErrorKind::InvalidState,
+                        "Table state not found for resync",
+                        format!("No table state exists for table ID {}", table_id.0)
+                    )
+                })?;
+                if !table_state_can_reset_for_resync(current_state) {
+                    return Err(etl_error!(
+                        ErrorKind::InvalidState,
+                        "Table is not in a resettable state",
+                        "Only Ready, SyncDone, or Errored tables may be reset for resync"
+                    ));
+                }
+                let states = Arc::make_mut(&mut inner.table_states);
+                let current_state = states.insert(table_id, TableState::Init).ok_or_else(|| {
+                    etl_error!(ErrorKind::InvalidState, "Table state disappeared during resync")
+                })?;
+                inner
+                    .table_state_history
+                    .entry(table_id)
+                    .or_insert_with(Vec::new)
+                    .push(current_state);
+                Ok(1)
             }
             TableStateOperation::ResetForResync => {
                 let mut guard = self.inner.lock().await;

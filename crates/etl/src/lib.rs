@@ -140,6 +140,7 @@
 //!     let config = PipelineConfig {
 //!         id: 1,
 //!         publication_name: "my_publication".to_string(),
+//!         require_all_tables_publication: false,
 //!         pg_connection: pg_config,
 //!         store_pg_connection: None,
 //!         replication_slot: Default::default(),

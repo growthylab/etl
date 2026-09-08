@@ -2948,6 +2948,7 @@ mod tests {
             pipeline: PipelineConfig {
                 id: 42,
                 publication_name: "all-pub".to_owned(),
+                require_all_tables_publication: false,
                 replication_slot: Default::default(),
                 pg_connection: PgConnectionConfig {
                     host: "localhost".to_owned(),

@@ -524,6 +524,7 @@ impl StoredPipelineConfig {
         PipelineConfig {
             id: pipeline_id,
             publication_name: self.publication_name,
+            require_all_tables_publication: false,
             pg_connection: pg_connection_config,
             store_pg_connection: None,
             replication_slot: self.replication_slot,

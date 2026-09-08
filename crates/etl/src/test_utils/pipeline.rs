@@ -57,6 +57,7 @@ pub struct PipelineBuilder<S, D> {
     pg_connection_config: PgConnectionConfig,
     pipeline_id: PipelineId,
     publication_name: String,
+    require_all_tables_publication: bool,
     store: S,
     destination: D,
     /// Batch configuration.
@@ -120,6 +121,7 @@ where
             pg_connection_config,
             pipeline_id,
             publication_name,
+            require_all_tables_publication: false,
             store,
             destination,
             batch: BatchConfig {
@@ -198,6 +200,13 @@ where
         self
     }
 
+    /// Requires the publication to remain `FOR ALL TABLES` with every change
+    /// kind enabled for the lifetime of the pipeline.
+    pub fn with_require_all_tables_publication(mut self, required: bool) -> Self {
+        self.require_all_tables_publication = required;
+        self
+    }
+
     /// Builds and returns the configured pipeline.
     ///
     /// This method consumes the builder and creates a `Pipeline` instance with
@@ -207,6 +216,7 @@ where
         let config = PipelineConfig {
             id: self.pipeline_id,
             publication_name: self.publication_name,
+            require_all_tables_publication: self.require_all_tables_publication,
             pg_connection: self.pg_connection_config,
             store_pg_connection: None,
             replication_slot: self.replication_slot,

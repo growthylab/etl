@@ -1605,7 +1605,7 @@ async fn streaming_reconnect_does_not_replay_already_flushed_events() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn publication_for_all_tables_in_schema_ignores_new_tables_until_restart() {
+async fn publication_for_all_tables_in_schema_discovers_new_tables_without_restart() {
     init_test_tracing();
 
     let database = spawn_source_database().await;
@@ -1629,13 +1629,15 @@ async fn publication_for_all_tables_in_schema_ignores_new_tables_until_restart()
     let destination = TestDestinationWrapper::wrap(MemoryDestination::new(store.clone()));
 
     let pipeline_id: PipelineId = random();
-    let mut pipeline = create_pipeline(
-        &database.config,
+    let mut pipeline = PipelineBuilder::new(
+        database.config.clone(),
         pipeline_id,
         publication_name.to_owned(),
         store.clone(),
         destination.clone(),
-    );
+    )
+    .with_table_sync_monitor_refresh_interval_ms(100)
+    .build();
 
     let table_sync_complete_notify = store.notify_on_table_sync_complete(table_1_id).await;
     let table_ready_notify =
@@ -1661,42 +1663,11 @@ async fn publication_for_all_tables_in_schema_ignores_new_tables_until_restart()
         database.create_table(table_2.clone(), true, &[("value", "int4 not null")]).await.unwrap();
     database.insert_values(table_2.clone(), &["value"], &[&1_i32]).await.unwrap();
 
-    // Wait for the events to come in from the new table to make sure the pipeline
-    // reacts to them gracefully even if they are not replicated.
-    sleep(Duration::from_secs(2)).await;
-
-    // Shutdown and verify no errors occurred.
-    pipeline.shutdown_and_wait().await.unwrap();
-
-    // Check that only the schemas of the first table were stored.
-    let table_schemas = store.get_latest_table_schemas().await;
-    assert_eq!(table_schemas.len(), 1);
-    assert!(table_schemas.contains_key(&table_1_id));
-    assert!(!table_schemas.contains_key(&table_2_id));
-
-    // Verify the table rows and events inserted into table 1.
-    let table_rows = destination.get_table_rows().await;
-    assert_eq!(table_rows.get(&table_1_id).unwrap().len(), 1);
-    let events = destination.get_events().await;
-    let grouped_events = group_events_by_type_and_table_id(&events);
-    let insert_events = grouped_events.get(&(EventType::Insert, table_1_id)).unwrap();
-    assert_eq!(insert_events.len(), 1);
-
-    // We restart the pipeline and verify that the new table is now processed.
-    let mut pipeline = create_pipeline(
-        &database.config,
-        pipeline_id,
-        publication_name.to_owned(),
-        store.clone(),
-        destination.clone(),
-    );
-
+    // The running apply worker periodically expands the publication and starts
+    // an initial copy for the newly discovered table.
     let table_sync_complete_notify = store.notify_on_table_sync_complete(table_2_id).await;
     let table_ready_notify =
         store.notify_on_table_state_type(table_2_id, TableStateType::Ready).await;
-
-    pipeline.start().await.unwrap();
-
     table_sync_complete_notify.notified().await;
 
     // Wait for an insert event in table 2.
@@ -1709,22 +1680,86 @@ async fn publication_for_all_tables_in_schema_ignores_new_tables_until_restart()
     insert_events_notify.notified().await;
     table_ready_notify.notified().await;
 
-    // Shutdown and verify no errors occurred.
     pipeline.shutdown_and_wait().await.unwrap();
 
-    // Check that both schemas exist.
+    // Both initial and late-created tables were synchronized by one pipeline
+    // invocation; the second row arrived through CDC after handoff.
     let table_schemas = store.get_latest_table_schemas().await;
     assert_eq!(table_schemas.len(), 2);
     assert!(table_schemas.contains_key(&table_1_id));
     assert!(table_schemas.contains_key(&table_2_id));
 
-    // Verify the table rows and events inserted into table 2.
     let table_rows = destination.get_table_rows().await;
     assert_eq!(table_rows.get(&table_2_id).unwrap().len(), 1);
     let events = destination.get_events().await;
     let grouped_events = group_events_by_type_and_table_id(&events);
     let insert_events = grouped_events.get(&(EventType::Insert, table_2_id)).unwrap();
     assert_eq!(insert_events.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn required_all_tables_publication_fails_closed_when_scope_is_downgraded() {
+    init_test_tracing();
+
+    let database = spawn_source_database().await;
+    let table_name = test_table_name("scope_guard");
+    let table_id = database
+        .create_table(table_name.clone(), true, &[("value", "text not null")])
+        .await
+        .unwrap();
+    database.insert_values(table_name.clone(), &["value"], &[&"initial"]).await.unwrap();
+    let omitted_table_name = test_table_name("scope_guard_omitted");
+    let omitted_table_id = database
+        .create_table(omitted_table_name, true, &[("value", "text not null")])
+        .await
+        .unwrap();
+
+    let publication_name = "test_required_all_tables";
+    database.create_publication_for_all(publication_name, None).await.unwrap();
+
+    let store = NotifyingStore::new();
+    let destination = TestDestinationWrapper::wrap(MemoryDestination::new(store.clone()));
+    let mut pipeline = PipelineBuilder::new(
+        database.config.clone(),
+        random(),
+        publication_name.to_owned(),
+        store.clone(),
+        destination,
+    )
+    .with_table_sync_monitor_refresh_interval_ms(100)
+    .with_require_all_tables_publication(true)
+    .build();
+
+    let table_sync_complete = store.notify_on_table_sync_complete(table_id).await;
+    let omitted_table_sync_complete = store.notify_on_table_sync_complete(omitted_table_id).await;
+    pipeline.start().await.unwrap();
+    table_sync_complete.notified().await;
+    omitted_table_sync_complete.notified().await;
+
+    // Replace the publication atomically so its name never disappears. A
+    // name-only liveness check and pg_get_publication_tables() would both
+    // succeed, but the omitted live tables would silently stop receiving CDC.
+    database
+        .client
+        .as_ref()
+        .unwrap()
+        .batch_execute(&format!(
+            "begin; drop publication {}; create publication {} for table {}; commit;",
+            quote_identifier(publication_name),
+            quote_identifier(publication_name),
+            table_name.as_quoted_identifier(),
+        ))
+        .await
+        .unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(5), pipeline.wait())
+        .await
+        .expect("publication invariant failure did not stop the pipeline")
+        .expect_err("downgraded publication must fail the pipeline");
+    assert!(
+        error.to_string().contains("Publication must remain FOR ALL TABLES"),
+        "unexpected error: {error}"
+    );
 }
 
 async fn run_table_sync_copy_case<F>(

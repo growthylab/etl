@@ -13,15 +13,12 @@ use tracing::{
     Event,
     subscriber::{SetGlobalDefaultError, set_global_default},
 };
-use tracing_appender::{
-    non_blocking::WorkerGuard,
-    rolling::{self, InitError},
-};
+use tracing_appender::{non_blocking::WorkerGuard, rolling::InitError};
 use tracing_log::{LogTracer, NormalizeEvent, log_tracer::SetLoggerError};
 use tracing_subscriber::{
     EnvFilter,
     fmt::{
-        self as tracing_fmt, FmtContext, FormattedFields, MakeWriter, fmt,
+        self as tracing_fmt, FmtContext, FormattedFields, fmt,
         format::{self, FormatEvent, FormatFields, Writer},
         time::FormatTime,
     },
@@ -318,33 +315,20 @@ pub fn init_tracing_with_top_level_fields(
 
 /// Configures tracing for production environments.
 ///
-/// Sets up structured JSON logging to rotating daily files with project
-/// injection.
-fn configure_prod_tracing(filter: EnvFilter, app_name: &str) -> Result<LogFlusher, TracingError> {
-    let filename_suffix = "log";
-    let log_dir = "logs";
-
-    let file_appender = rolling::Builder::new()
-        .filename_prefix(app_name)
-        .filename_suffix(filename_suffix)
-        .rotation(rolling::Rotation::DAILY)
-        .max_log_files(5)
-        .build(log_dir)?;
-
-    // Create a non-blocking appender to avoid blocking the logging thread
-    // when writing to the file. This is important for performance.
-    let (file_appender, guard) = tracing_appender::non_blocking(file_appender);
-
+/// Sets up structured JSON logging to stdout with project injection. Container
+/// runtimes collect stdout and provide retention and rotation outside the
+/// process, so the replicator must not hide production logs in its filesystem.
+fn configure_prod_tracing(filter: EnvFilter, _app_name: &str) -> Result<LogFlusher, TracingError> {
     let subscriber = fmt()
         .with_env_filter(filter)
         .fmt_fields(format::JsonFields::new())
         .event_format(JsonContextFormatter::new(tracing_fmt::time::SystemTime))
-        .with_writer(move || file_appender.make_writer())
+        .with_writer(io::stdout)
         .finish();
 
     set_global_default(subscriber)?;
 
-    Ok(LogFlusher::Flusher(guard))
+    Ok(LogFlusher::NullFlusher)
 }
 
 /// Configures tracing for development environments.

@@ -78,7 +78,7 @@ config = { version = "0.14", default-features = false }
 configcat = { version = "0.1.3", default-features = false }
 const-oid = { version = "0.9.6", default-features = false }
 constant_time_eq = { version = "0.4.2" }
-duckdb = { version = "1", default-features = false }
+duckdb = { version = "~1.10505.0", default-features = false }
 etl = { path = "crates/etl", default-features = false }
 etl-config = { path = "crates/etl-config", default-features = false }
 etl-destinations = { path = "crates/etl-destinations", default-features = false }

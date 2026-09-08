@@ -25,6 +25,7 @@ mod state;
 
 pub use both::{memory::MemoryStore, postgres::PostgresStore};
 pub use capabilities::{DestinationStore, PipelineStore, SharedStateStore};
+pub(crate) use lifecycle::table_state_can_reset_for_resync;
 pub use lifecycle::{TableStateLifecycleStore, TableStateOperation};
 pub use schema::SchemaStore;
 pub(crate) use schema::TableSchemaSnapshots;

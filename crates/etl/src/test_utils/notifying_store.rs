@@ -22,6 +22,7 @@ use crate::{
     store::{
         DestinationTablesMetadata, SchemaStore, StateStore, TableSchemaSnapshots,
         TableStateLifecycleStore, TableStateOperation, TableStates,
+        table_state_can_reset_for_resync,
     },
     test_utils::notify::TimedNotify,
 };
@@ -487,6 +488,27 @@ impl TableStateLifecycleStore for NotifyingStore {
                 inner.check_conditions();
 
                 Ok(0)
+            }
+            TableStateOperation::ResetTableForResync { table_id } => {
+                let mut inner = self.inner.write().await;
+                let states = Arc::make_mut(&mut inner.table_states);
+                let current_state = states.get(&table_id).ok_or_else(|| {
+                    etl_error!(
+                        ErrorKind::InvalidState,
+                        "Table state not found for resync",
+                        format!("No table state exists for table ID {}", table_id.0)
+                    )
+                })?;
+                if !table_state_can_reset_for_resync(current_state) {
+                    return Err(etl_error!(
+                        ErrorKind::InvalidState,
+                        "Table is not in a resettable state",
+                        "Only Ready, SyncDone, or Errored tables may be reset for resync"
+                    ));
+                }
+                states.insert(table_id, TableState::Init);
+                inner.check_conditions();
+                Ok(1)
             }
             TableStateOperation::ResetForResync => {
                 let mut guard = self.inner.write().await;

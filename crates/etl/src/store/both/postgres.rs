@@ -31,6 +31,7 @@ use crate::{
     store::{
         DestinationTablesMetadata, SchemaStore, StateStore, TableSchemaSnapshots,
         TableStateLifecycleStore, TableStateOperation, TableStates,
+        table_state_can_reset_for_resync,
     },
 };
 
@@ -189,6 +190,15 @@ impl PostgresStore {
     ) -> EtlResult<Self> {
         migrations::run_postgres_store_migrations(&connection_config).await?;
 
+        Ok(Self::open_existing(pipeline_id, connection_config))
+    }
+
+    /// Opens an already initialized Postgres store without running migrations.
+    ///
+    /// This is intended for narrowly scoped administrative commands that must
+    /// fail if the durable store schema is absent or outdated rather than
+    /// performing unrelated DDL as a side effect.
+    pub fn open_existing(pipeline_id: PipelineId, connection_config: PgConnectionConfig) -> Self {
         let pool = create_database_pool(&connection_config);
         let inner = Inner {
             state_counts: HashMap::new(),
@@ -197,7 +207,7 @@ impl PostgresStore {
             destination_tables_metadata: Arc::new(BTreeMap::new()),
         };
 
-        Ok(Self { pipeline_id, pool, inner: Arc::new(Mutex::new(inner)) })
+        Self { pipeline_id, pool, inner: Arc::new(Mutex::new(inner)) }
     }
 }
 
@@ -741,6 +751,36 @@ impl TableStateLifecycleStore for PostgresStore {
                 Arc::make_mut(&mut inner.destination_tables_metadata).remove(&table_id);
 
                 Ok(0)
+            }
+            TableStateOperation::ResetTableForResync { table_id } => {
+                let mut inner = self.inner.lock().await;
+                let current_state = inner.table_states.get(&table_id).ok_or_else(|| {
+                    etl_error!(
+                        ErrorKind::InvalidState,
+                        "Table state not found for resync",
+                        format!("No table state exists for table ID {}", table_id.0)
+                    )
+                })?;
+                if !table_state_can_reset_for_resync(current_state) {
+                    return Err(etl_error!(
+                        ErrorKind::InvalidState,
+                        "Table is not in a resettable state",
+                        "Only Ready, SyncDone, or Errored tables may be reset for resync"
+                    ));
+                }
+
+                let (state_type, metadata) = TableState::Init.to_storage_format()?;
+                pg_table_state::update_table_state_raw(
+                    &self.pool,
+                    self.pipeline_id as i64,
+                    table_id,
+                    state_type,
+                    metadata,
+                )
+                .await?;
+                inner.set_table_state(table_id, TableState::Init);
+                emit_table_metrics(&inner.state_counts);
+                Ok(1)
             }
             TableStateOperation::ResetForResync => {
                 let (state_type, metadata) = TableState::Init.to_storage_format()?;

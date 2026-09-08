@@ -174,6 +174,20 @@ where
         let replication_client =
             PgReplicationClient::connect(self.config.pg_connection.clone()).await?;
 
+        // Keep low-frequency source metadata queries off the replication
+        // protocol connection. The strict publication assertion runs before
+        // stored table state can be reconciled, preventing a downgraded
+        // publication from purging state during restart.
+        let out_of_band_source_pool = OutOfBandSourcePool::new(
+            &self.config.pg_connection,
+            Duration::from_millis(self.config.table_sync_monitor_refresh_interval_ms),
+        );
+        if self.config.require_all_tables_publication {
+            out_of_band_source_pool
+                .assert_all_tables_publication(&self.config.publication_name)
+                .await?;
+        }
+
         // We load the destination table metadata and schemas from the store to have
         // them cached for quick access.
         //
@@ -199,13 +213,6 @@ where
         // workers can be running at the same time.
         let table_sync_worker_permits =
             Arc::new(Semaphore::new(self.config.max_table_sync_workers as usize));
-
-        // We create a shared lazy pool for low-frequency, out-of-band source
-        // database queries that should not use the replication connection.
-        let out_of_band_source_pool = OutOfBandSourcePool::new(
-            &self.config.pg_connection,
-            Duration::from_millis(self.config.table_sync_monitor_refresh_interval_ms),
-        );
 
         // We create and start the apply worker.
         let apply_worker = ApplyWorker::new(

@@ -159,6 +159,7 @@ fn pipeline_config(pg_connection: PgConnectionConfig) -> PipelineConfig {
     PipelineConfig {
         id: 1,
         publication_name: "missing_publication".to_owned(),
+        require_all_tables_publication: false,
         pg_connection,
         store_pg_connection: None,
         replication_slot: Default::default(),
@@ -220,6 +221,252 @@ async fn pipeline_start_runs_source_migrations_without_postgres_store_tables() {
     assert!(source_helper_exists(&database).await);
     assert!(!postgres_store_table_exists(&database).await);
     assert_eq!(applied_migration_versions(&database).await, source_migration_versions());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn all_tables_publish_flags_guard_rejects_partial_publication_during_install() {
+    init_test_tracing();
+
+    let database = spawn_unmigrated_database().await;
+    let client = database.client.as_ref().expect("database client should be initialized");
+    client
+        .batch_execute(
+            "create table public.partial_publish_existing (
+                 id bigint primary key,
+                 value text not null
+             );
+             create publication partial_publish_all
+                 for all tables
+                 with (publish = 'insert, update, delete');",
+        )
+        .await
+        .unwrap();
+
+    let migration_error = run_source_migrations(&database.config)
+        .await
+        .expect_err("migration must reject an existing partial FOR ALL TABLES publication");
+    assert!(
+        migration_error.to_string().contains("must publish INSERT, UPDATE, DELETE, and TRUNCATE"),
+        "unexpected migration error: {migration_error}"
+    );
+    assert!(
+        !query_bool(
+            &database,
+            "select exists (
+                 select 1
+                 from pg_catalog.pg_proc p
+                 join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+                 where n.nspname = 'etl'
+                   and p.proname = 'assert_all_tables_publications_publish_all_changes'
+             )",
+        )
+        .await,
+        "the failed guard migration must roll back its assertion function"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn all_tables_identity_guard_rejects_ambiguous_existing_and_future_tables() {
+    init_test_tracing();
+
+    let database = spawn_unmigrated_database().await;
+    run_source_migrations(&database.config).await.unwrap();
+    let client = database.client.as_ref().expect("database client should be initialized");
+
+    client
+        .batch_execute("create table public.invalid_existing (value text not null)")
+        .await
+        .unwrap();
+    let publication_error = client
+        .batch_execute("create publication identity_guard_all for all tables")
+        .await
+        .expect_err("FOR ALL TABLES must reject an existing table without a key");
+    assert_eq!(publication_error.code().map(|code| code.code()), Some("55000"));
+
+    client
+        .batch_execute(
+            "drop table public.invalid_existing;
+             create table public.rls_existing (
+                 id bigint primary key,
+                 value text not null
+             );
+             alter table public.rls_existing enable row level security;",
+        )
+        .await
+        .unwrap();
+    let rls_publication_error = client
+        .batch_execute("create publication identity_guard_all for all tables")
+        .await
+        .expect_err("FOR ALL TABLES must reject an existing row-security table");
+    assert_eq!(rls_publication_error.code().map(|code| code.code()), Some("55000"));
+
+    client
+        .batch_execute(
+            "drop table public.rls_existing;
+             create table public.generated_existing (
+                 id bigint primary key,
+                 input_value bigint not null,
+                 generated_value bigint generated always as (input_value * 2) stored
+             );
+             create publication identity_guard_all for all tables;",
+        )
+        .await
+        .unwrap();
+
+    client
+        .batch_execute(
+            "create table public.generated_late (
+                 id bigint primary key,
+                 input_value bigint not null,
+                 generated_value bigint generated always as (input_value * 2) stored
+             )",
+        )
+        .await
+        .expect("non-key generated columns are intentionally omitted from replication");
+
+    let generated_identity_error = client
+        .batch_execute(
+            "create table public.generated_identity_late (
+                 source_id bigint not null,
+                 id bigint generated always as (source_id + 1) stored primary key
+             )",
+        )
+        .await
+        .expect_err("a generated replica-identity column must be rejected");
+    assert_eq!(generated_identity_error.code().map(|code| code.code()), Some("55000"));
+    assert!(
+        !query_bool(
+            &database,
+            "select pg_catalog.to_regclass('public.generated_identity_late') is not null",
+        )
+        .await
+    );
+
+    client
+        .batch_execute(
+            "drop publication identity_guard_all;
+             drop table public.generated_late;
+             drop table public.generated_existing;
+             create table public.multidimensional_existing (
+                 id bigint primary key,
+                 matrix_values text[][] not null
+             );",
+        )
+        .await
+        .unwrap();
+    let multidimensional_publication_error = client
+        .batch_execute("create publication identity_guard_all for all tables")
+        .await
+        .expect_err("FOR ALL TABLES must reject declared multidimensional arrays");
+    assert_eq!(multidimensional_publication_error.code().map(|code| code.code()), Some("55000"));
+
+    client
+        .batch_execute(
+            "drop table public.multidimensional_existing;
+             create table public.default_identity (
+                 id bigint primary key,
+                 value text not null
+             );
+             create table public.index_identity (
+                 id bigint not null,
+                 value text not null
+             );
+             create unique index index_identity_id_key on public.index_identity (id);
+             alter table public.index_identity
+                 replica identity using index index_identity_id_key;
+             create publication identity_guard_all for all tables;",
+        )
+        .await
+        .unwrap();
+
+    let late_table_error = client
+        .batch_execute("create table public.invalid_late (value text not null)")
+        .await
+        .expect_err("a late table without an inline primary key must be rejected");
+    assert_eq!(late_table_error.code().map(|code| code.code()), Some("55000"));
+    assert!(
+        !query_bool(&database, "select pg_catalog.to_regclass('public.invalid_late') is not null",)
+            .await
+    );
+
+    client
+        .batch_execute(
+            "create table public.valid_late (
+                 id bigint primary key,
+                 value text not null
+             )",
+        )
+        .await
+        .unwrap();
+
+    for (publish, missing_operation) in [
+        ("update, delete, truncate", "INSERT"),
+        ("insert, delete, truncate", "UPDATE"),
+        ("insert, update, truncate", "DELETE"),
+        ("insert, update, delete", "TRUNCATE"),
+    ] {
+        let publication_options_error = client
+            .batch_execute(&format!(
+                "alter publication identity_guard_all set (publish = '{publish}')"
+            ))
+            .await
+            .expect_err("FOR ALL TABLES must reject a partial publish operation set");
+        assert_eq!(
+            publication_options_error.code().map(|code| code.code()),
+            Some("55000"),
+            "disabling {missing_operation} must fail closed"
+        );
+
+        let flags_row = client
+            .query_one(
+                "select pubinsert, pubupdate, pubdelete, pubtruncate
+                 from pg_catalog.pg_publication
+                 where pubname = 'identity_guard_all'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let flags: (bool, bool, bool, bool) =
+            (flags_row.get(0), flags_row.get(1), flags_row.get(2), flags_row.get(3));
+        assert_eq!(
+            flags,
+            (true, true, true, true),
+            "failed ALTER PUBLICATION must roll back all publish flags"
+        );
+    }
+
+    let full_identity_error = client
+        .batch_execute("alter table public.valid_late replica identity full")
+        .await
+        .expect_err("REPLICA IDENTITY FULL must be rejected as a non-key identity");
+    assert_eq!(full_identity_error.code().map(|code| code.code()), Some("55000"));
+
+    let relreplident: String = client
+        .query_one(
+            "select c.relreplident::text
+             from pg_catalog.pg_class c
+             where c.oid = 'public.valid_late'::pg_catalog.regclass",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(relreplident, "d");
+
+    let rls_enable_error = client
+        .batch_execute("alter table public.valid_late enable row level security")
+        .await
+        .expect_err("enabling row security on a published table must be rejected");
+    assert_eq!(rls_enable_error.code().map(|code| code.code()), Some("55000"));
+    assert!(
+        !query_bool(
+            &database,
+            "select c.relrowsecurity
+             from pg_catalog.pg_class c
+             where c.oid = 'public.valid_late'::pg_catalog.regclass",
+        )
+        .await
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1089,11 +1336,35 @@ async fn split_migrations_can_be_reverted_independently() {
     assert_eq!(applied_migration_versions(&database).await, all_split_migration_versions());
 
     let client = database.client.as_ref().expect("database client should be initialized");
-    let previous_source_version =
-        source_migration_versions().into_iter().rev().nth(1).expect("a previous migration exists");
+    let latest_function_definition: String = client
+        .query_one(
+            "select pg_catalog.pg_get_functiondef(
+                'etl.emit_schema_change_messages()'::pg_catalog.regprocedure
+            )",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(latest_function_definition.contains("type_extension_name"));
+
+    let base_source_version =
+        source_migration_versions().into_iter().next().expect("a source migration exists");
     let mut conn = migration_connection(&database.config).await;
-    source_migrator().undo(&mut conn, previous_source_version).await.unwrap();
+    source_migrator().undo(&mut conn, base_source_version).await.unwrap();
     drop(conn);
+
+    assert!(
+        !query_bool(
+            &database,
+            "select exists (
+                select 1
+                from pg_catalog.pg_event_trigger
+                where evtname = 'supabase_etl_00_all_tables_identity_guard'
+            )",
+        )
+        .await
+    );
 
     let tags: Vec<String> = client
         .query_one(
