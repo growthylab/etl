@@ -1,8 +1,11 @@
 # GrowthyLab ETL engine
 
 Branch `growthy/bayes-replicator` is based on Supabase ETL commit
-`9cd1c04c542bb59de58323a86cb8aeb451e7ae8b`. Bayes pins an immutable commit
-in Cargo.toml. No upstream pull request is part of this change.
+`9cd1c04c542bb59de58323a86cb8aeb451e7ae8b`. Bayes tracks this branch in Cargo.toml; Cargo.lock records the resolved commit.
+Push necessary, validated changes directly to this fork branch without opening
+a fork PR. After each push, update Bayes's ETL lockfile resolution to the branch
+head and include that update in the Bayes change. Existing builds use the locked
+commit until it is updated. No upstream pull request is required now.
 
 The engine preserves the deployed behavior for custom PostgreSQL type metadata
 (including extension-owned pgvector and custom arrays), transactional schema
