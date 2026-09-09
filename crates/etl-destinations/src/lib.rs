@@ -5,18 +5,17 @@
 //! to cloud services.
 
 #[cfg(any(
-    feature = "support",
     feature = "bigquery",
     feature = "clickhouse",
     feature = "ducklake",
     feature = "iceberg",
     feature = "snowflake"
 ))]
-pub mod recovery;
-#[cfg(any(feature = "support", feature = "bigquery", feature = "ducklake", feature = "snowflake"))]
-pub mod retry;
-#[cfg(any(feature = "support", feature = "ducklake", feature = "snowflake"))]
-pub mod sql;
+mod recovery;
+#[cfg(any(feature = "bigquery", feature = "ducklake", feature = "snowflake"))]
+mod retry;
+#[cfg(any(feature = "ducklake", feature = "snowflake"))]
+mod sql;
 #[cfg(any(
     feature = "bigquery",
     feature = "clickhouse",

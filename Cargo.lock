@@ -2198,6 +2198,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
  "tracing",
@@ -2209,12 +2210,10 @@ name = "etl-telemetry"
 version = "0.1.0"
 dependencies = [
  "etl-config",
- "metrics",
  "metrics-exporter-prometheus",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "tikv-jemalloc-ctl",
  "tokio",
  "tracing",
  "tracing-appender",

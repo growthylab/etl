@@ -14,11 +14,20 @@ The config crate carries the matching DuckLake schema/resource settings. The
 maintenance dependency uses the dynamically linked DuckDB 1.5.5 version shared
 with Bayes. Error reports preserve their source chain in JSON tracing.
 
-Bayes owns its destination adapter and service binary. It reuses
-`etl-destinations` with only the `support` feature for recovery/retry/SQL helpers,
-`etl-telemetry` runtime metrics, and `etl-maintenance` through an owned-table
-entry point on its existing DuckDB instance. It does not compile this fork's
-replicator binary or enable the upstream DuckLake destination.
+Bayes owns its destination adapter and service binary. It uses ETL crates through
+existing public interfaces first. A fork change is allowed only when those
+interfaces cannot satisfy a necessary requirement and the minimal change has an
+independent rationale for a future upstream PR. Reducing Bayes line count alone
+is not a reason to expose private modules or move application code into ETL.
+Scheduling, table ownership, deployment policy and adapters remain in Bayes.
+
+The maintenance extension exposes existing single-table merge/rewrite operations
+for a caller-owned connection. The original public runner creates its own pool
+and runs catalog-wide work, which cannot meet an embedded writer's shared-instance
+and table-scope requirements. This minimal API is intended for a future upstream
+contribution supporting embedded maintenance; it does not introduce a Bayes
+scheduler or change the standalone runner's selection policy. Transaction/error
+handling and actual rewrite result reporting also benefit the existing runner.
 
 Local validation (PostgreSQL 17/pgvector in OrbStack):
 - etl-config library: 46 tests
