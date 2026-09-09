@@ -16,7 +16,7 @@ use metrics::{Unit, describe_gauge, gauge};
 use tokio::task::JoinHandle;
 use tracing::debug;
 
-use crate::metrics::{APP_TYPE_LABEL, APP_TYPE_VALUE};
+use super::{APP_TYPE_LABEL, APP_TYPE_VALUE};
 
 /// Current number of worker threads used by the runtime.
 const TOKIO_METRICS_WORKERS: &str = "tokio_metrics_workers";

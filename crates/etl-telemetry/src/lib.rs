@@ -6,3 +6,6 @@
 
 pub mod metrics;
 pub mod tracing;
+
+#[cfg(feature = "runtime-metrics")]
+pub mod runtime_metrics;

@@ -11,7 +11,7 @@ use etl::{
 use tracing::warn;
 
 /// Warns that a destination is intentionally skipping a column type change.
-pub(crate) fn warn_unsupported_column_type_change(
+pub fn warn_unsupported_column_type_change(
     destination_name: &str,
     destination_table_id: impl Display,
     alteration: &ColumnAlteration,
@@ -37,7 +37,7 @@ pub(crate) fn warn_unsupported_column_type_change(
 /// Supported schema and publication-mask changes receive a new [`SnapshotId`].
 /// An equal snapshot with a different mask therefore has no valid ordering and
 /// must fail closed instead of driving destination DDL.
-pub(crate) fn ensure_relation_schema_transition(
+pub fn ensure_relation_schema_transition(
     destination_name: &str,
     table_id: TableId,
     applied_snapshot_id: SnapshotId,
@@ -84,7 +84,7 @@ pub(crate) fn ensure_relation_schema_transition(
 /// Caches may avoid remote work after this check, but they cannot replace it:
 /// the durable snapshot ID and replication mask define the only row shape the
 /// current destination table may accept.
-pub(crate) fn ensure_destination_schema_matches_metadata(
+pub fn ensure_destination_schema_matches_metadata(
     destination_name: &str,
     table_id: TableId,
     metadata: &DestinationTableMetadata,

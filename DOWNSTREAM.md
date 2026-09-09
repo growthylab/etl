@@ -14,8 +14,11 @@ The config crate carries the matching DuckLake schema/resource settings. The
 maintenance dependency uses the dynamically linked DuckDB 1.5.5 version shared
 with Bayes. Error reports preserve their source chain in JSON tracing.
 
-Bayes owns the destination implementation and service binary in its Rust
-workspace; it does not compile this fork's etl-replicator or etl-destinations.
+Bayes owns its destination adapter and service binary. It reuses
+`etl-destinations` with only the `support` feature for recovery/retry/SQL helpers,
+`etl-telemetry` runtime metrics, and `etl-maintenance` through an owned-table
+entry point on its existing DuckDB instance. It does not compile this fork's
+replicator binary or enable the upstream DuckLake destination.
 
 Local validation (PostgreSQL 17/pgvector in OrbStack):
 - etl-config library: 46 tests

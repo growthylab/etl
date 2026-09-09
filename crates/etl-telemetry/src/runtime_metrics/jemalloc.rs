@@ -13,11 +13,11 @@
 use std::{fmt::Display, time::Duration};
 
 use metrics::{Unit, describe_gauge, gauge};
-use tikv_jemalloc_ctl::{epoch, opt, raw, stats};
+use tikv_jemalloc_ctl::{epoch, opt, stats};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::metrics::{APP_TYPE_LABEL, APP_TYPE_VALUE};
+use super::{APP_TYPE_LABEL, APP_TYPE_VALUE};
 
 /// Total bytes allocated by the application and currently in use.
 ///
@@ -124,27 +124,31 @@ const JEMALLOC_FRAGMENTATION_RATIO: &str = "jemalloc_fragmentation_ratio";
 /// Polling interval for jemalloc statistics.
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// An unavailable metric is not zero. Preserve the original mallctl error.
+fn observed_read<T>(name: &str, result: Result<T, tikv_jemalloc_ctl::Error>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            warn!(metric = name, error = %error, "jemalloc metric read failed");
+            None
+        }
+    }
+}
+
 /// Logs the current jemalloc configuration for validation.
 ///
 /// Reads and logs opt.* values to verify the malloc_conf settings were applied.
 /// Uses raw mallctl for decay settings not exposed by the typed API.
 fn log_jemalloc_config() {
     // Read typed opt values.
-    let background_thread = opt::background_thread::read().ok();
-    let opt_narenas = opt::narenas::read().ok(); // 0 = auto
-    let tcache = opt::tcache::read().ok();
-    let tcache_max = opt::tcache_max::read().ok();
-
-    // Read values not exposed in typed API via raw mallctl.
-    // SAFETY: These are read-only queries to jemalloc's opt.* configuration values.
-    // The keys are valid null-terminated strings and the return types match
-    // jemalloc's types.
-    let dirty_decay_ms: Option<isize> = unsafe { raw::read(b"opt.dirty_decay_ms\0") }.ok();
-    let muzzy_decay_ms: Option<isize> = unsafe { raw::read(b"opt.muzzy_decay_ms\0") }.ok();
-    let abort_conf: Option<bool> = unsafe { raw::read(b"opt.abort_conf\0") }.ok();
+    let background_thread = observed_read("background_thread", opt::background_thread::read());
+    let opt_narenas = observed_read("opt_narenas", opt::narenas::read()); // 0 = auto
+    let tcache = observed_read("tcache", opt::tcache::read());
+    let tcache_max = observed_read("tcache_max", opt::tcache_max::read());
 
     // Get actual runtime narenas (not the configured value).
-    let actual_narenas = tikv_jemalloc_ctl::arenas::narenas::read().ok();
+    let actual_narenas =
+        observed_read("actual_narenas", tikv_jemalloc_ctl::arenas::narenas::read());
 
     debug!(
         background_thread = %display_optional_value(background_thread),
@@ -152,9 +156,6 @@ fn log_jemalloc_config() {
         narenas_actual = %display_optional_value(actual_narenas),
         tcache = %display_optional_value(tcache),
         tcache_max = %display_optional_value(tcache_max),
-        dirty_decay_ms = %display_optional_value(dirty_decay_ms),
-        muzzy_decay_ms = %display_optional_value(muzzy_decay_ms),
-        abort_conf = %display_optional_value(abort_conf),
         "jemalloc configuration"
     );
 }
@@ -279,12 +280,34 @@ pub(super) fn spawn_jemalloc_metrics_task() -> JoinHandle<()> {
             }
 
             // Read all statistics.
-            let allocated = allocated_mib.read().unwrap_or(0) as f64;
-            let active = active_mib.read().unwrap_or(0) as f64;
-            let resident = resident_mib.read().unwrap_or(0) as f64;
-            let mapped = mapped_mib.read().unwrap_or(0) as f64;
-            let retained = retained_mib.read().unwrap_or(0) as f64;
-            let metadata = metadata_mib.read().unwrap_or(0) as f64;
+            let readings = (
+                observed_read("allocated", allocated_mib.read()),
+                observed_read("active", active_mib.read()),
+                observed_read("resident", resident_mib.read()),
+                observed_read("mapped", mapped_mib.read()),
+                observed_read("retained", retained_mib.read()),
+                observed_read("metadata", metadata_mib.read()),
+            );
+            let (
+                Some(allocated),
+                Some(active),
+                Some(resident),
+                Some(mapped),
+                Some(retained),
+                Some(metadata),
+            ) = readings
+            else {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            };
+            let (allocated, active, resident, mapped, retained, metadata) = (
+                allocated as f64,
+                active as f64,
+                resident as f64,
+                mapped as f64,
+                retained as f64,
+                metadata as f64,
+            );
 
             // Update gauges with app_type labels.
             gauge!(JEMALLOC_ALLOCATED_BYTES, APP_TYPE_LABEL => APP_TYPE_VALUE).set(allocated);

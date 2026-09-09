@@ -12,7 +12,11 @@ homepage.workspace = true
 test = false
 doctest = false
 
+[features]
+runtime-metrics = ["dep:metrics", "dep:tikv-jemalloc-ctl"]
+
 [dependencies]
+metrics = { workspace = true, optional = true }
 etl-config = { workspace = true }
 
 metrics-exporter-prometheus = { workspace = true, features = ["http-listener"] }
@@ -24,6 +28,9 @@ tracing = { workspace = true, default-features = true }
 tracing-appender = { workspace = true }
 tracing-log = { workspace = true, features = ["std", "log-tracer"] }
 tracing-subscriber = { workspace = true, default-features = true, features = ["json", "env-filter", "ansi"] }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemalloc-ctl = { workspace = true, optional = true }
 
 [lints]
 workspace = true

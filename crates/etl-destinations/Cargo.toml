@@ -13,6 +13,8 @@ homepage.workspace = true
 doctest = false
 
 [features]
+# Common helpers for custom destinations, without enabling a database client.
+support = ["dep:tokio", "dep:tracing"]
 ducklake = [
     "dep:duckdb",
     "dep:etl-maintenance",

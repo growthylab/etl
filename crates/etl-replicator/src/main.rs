@@ -60,7 +60,7 @@ mod error_notification;
 mod error_reporting;
 mod init;
 #[cfg(feature = "any-destination")]
-mod metrics;
+use etl_telemetry::runtime_metrics as metrics;
 mod sentry;
 
 /// The name of the environment variable which contains version information for

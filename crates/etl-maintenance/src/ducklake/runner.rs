@@ -84,13 +84,13 @@ const TABLE_LABEL: &str = "table";
 const SMALL_FILE_SIZE_BYTES: i64 = 5 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct DuckLakeMaintenanceTableName {
+pub struct DuckLakeMaintenanceTableName {
     schema_name: String,
     table_name: String,
 }
 
 impl DuckLakeMaintenanceTableName {
-    fn new(schema_name: String, table_name: String) -> Self {
+    pub fn new(schema_name: String, table_name: String) -> Self {
         Self { schema_name, table_name }
     }
 
@@ -1102,10 +1102,30 @@ impl r2d2::ManageConnection for DuckLakeConnectionManager {
     }
 }
 
+/// Executes maintenance on an existing DuckDB instance. Implementations must
+/// retain writer exclusion until the native operation exits, including when
+/// the calling future is cancelled, and enforce their native query timeout.
+pub trait DuckLakeMaintenanceExecutor: Sync {
+    fn run<R, F>(&self, operation: F) -> impl std::future::Future<Output = EtlResult<R>> + Send
+    where
+        R: Send + 'static,
+        F: FnOnce(&duckdb::Connection) -> EtlResult<R> + Send + 'static;
+}
+
 #[derive(Clone)]
 struct DuckDbMaintenanceExecutor {
     pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
     blocking_slots: Arc<Semaphore>,
+}
+
+impl DuckLakeMaintenanceExecutor for DuckDbMaintenanceExecutor {
+    async fn run<R, F>(&self, operation: F) -> EtlResult<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&duckdb::Connection) -> EtlResult<R> + Send + 'static,
+    {
+        self.run_with_timeout(MAINTENANCE_QUERY_TIMEOUT, operation).await
+    }
 }
 
 impl DuckDbMaintenanceExecutor {
@@ -1511,8 +1531,7 @@ async fn build_warm_ducklake_pool(
 }
 
 fn format_query_error_detail(sql: &str) -> String {
-    let compact_sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
-    format!("sql: {compact_sql}")
+    format!("SQL: {sql}")
 }
 
 fn attach_step_uses_postgres_catalog(step: &DuckLakeSetupStep) -> bool {
@@ -1571,7 +1590,8 @@ pub struct MergeAdjacentFilesMaintenanceConfig {
 pub struct RewriteDataFilesMaintenanceConfig {
     /// Whether rewrite-data-files is enabled.
     pub enabled: bool,
-    /// Minimum active data-file count before rewrite is attempted.
+    /// Additional file-count trigger for rewrite. Tables with delete files are
+    /// evaluated regardless of this threshold; use i64::MAX for deletes only.
     pub min_active_data_files: i64,
     /// Maximum tables selected in one run.
     pub max_tables_per_run: u32,
@@ -1750,6 +1770,96 @@ pub async fn run_maintenance_once(
 
     info!(outcome = ?outcome, applied = outcome.applied(), "ducklake external maintenance completed");
     Ok(outcome)
+}
+
+/// Maintains only explicitly owned user tables using the writer's own instance.
+///
+/// Reuses the standalone runner's selection and operation implementation
+/// without its catalog-wide helper cleanup, snapshot expiry, or file deletion.
+/// Every table is evaluated regardless of failures on earlier tables. Each
+/// operation commits independently, so successful work survives a later
+/// failure. The caller controls scheduling and writer exclusion through the
+/// executor.
+pub async fn run_scoped_maintenance(
+    duckdb: &impl DuckLakeMaintenanceExecutor,
+    metadata_pg_pool: &PgPool,
+    metadata_schema: &str,
+    table_names: &[DuckLakeMaintenanceTableName],
+    merge: &MergeAdjacentFilesMaintenanceConfig,
+    rewrite: RewriteDataFilesMaintenanceConfig,
+) -> EtlResult<DuckLakeMaintenanceOutcome> {
+    let mut outcome = DuckLakeMaintenanceOutcome::default();
+    let mut failures = Vec::new();
+    for table in table_names {
+        // Each table gets both evaluations; rewritten files can be merged in
+        // this same pass. No catalog-wide pre-merge is permitted in this API.
+        let tables = std::slice::from_ref(table);
+        if rewrite.enabled
+            && let Err(error) = run_rewrite_data_files(
+                duckdb,
+                metadata_pg_pool,
+                metadata_schema,
+                tables,
+                rewrite,
+                &mut outcome,
+            )
+            .await
+        {
+            warn!(table = %table, error = %error, "ducklake scoped rewrite failed; continuing maintenance");
+            failures.push(format!("{table}: rewrite_data_files: {error}"));
+        }
+        if merge.enabled {
+            let budget = match query_table_storage_metrics(metadata_pg_pool, metadata_schema, table)
+                .await
+            {
+                Ok(metrics) => metrics.active_data_files.max(0) as u64,
+                Err(error) => {
+                    warn!(table = %table, error = %error, "ducklake scoped merge sampling failed");
+                    failures.push(format!("{table}: storage metrics: {error}"));
+                    continue;
+                }
+            };
+            // Each successful merge removes at least one input file. Limit the
+            // work to the starting file count so continuously arriving writes
+            // cannot keep this table in the worker forever. Already committed
+            // units survive later failures and the writer resumes between them.
+            let tables_before = outcome.merge_adjacent_files_tables;
+            for _ in 0..budget {
+                let before = outcome.merge_adjacent_files_created;
+                if let Err(error) = run_merge_adjacent_files(
+                    duckdb,
+                    metadata_pg_pool,
+                    metadata_schema,
+                    tables,
+                    merge,
+                    &mut outcome,
+                )
+                .await
+                {
+                    warn!(table = %table, error = %error, "ducklake scoped merge failed; continuing maintenance");
+                    failures.push(format!("{table}: merge_adjacent_files: {error}"));
+                    break;
+                }
+                if outcome.merge_adjacent_files_created == before {
+                    break;
+                }
+            }
+            // The outcome counts tables, not committed units on the same table.
+            outcome.merge_adjacent_files_tables =
+                tables_before + u32::from(outcome.merge_adjacent_files_tables > tables_before);
+        }
+    }
+    info!(table_count = table_names.len(), failed_operations = failures.len(), outcome = ?outcome,
+        "ducklake scoped maintenance pass finished");
+    if failures.is_empty() {
+        Ok(outcome)
+    } else {
+        Err(etl_error!(
+            ErrorKind::DestinationQueryFailed,
+            "DuckLake scoped maintenance failed",
+            failures.join("\n")
+        ))
+    }
 }
 
 /// Validates one maintenance runner config.
@@ -2054,7 +2164,7 @@ async fn run_inline_flush(
 
 /// Runs bounded merge-adjacent-files on selected tables.
 async fn run_merge_adjacent_files(
-    duckdb: &DuckDbMaintenanceExecutor,
+    duckdb: &impl DuckLakeMaintenanceExecutor,
     metadata_pg_pool: &PgPool,
     metadata_schema: &str,
     table_names: &[DuckLakeMaintenanceTableName],
@@ -2106,6 +2216,7 @@ async fn run_merge_adjacent_files(
         info!(
             table = %table_name,
             files_created,
+            no_op = files_created == 0,
             "ducklake merge-adjacent-files completed"
         );
     }
@@ -2138,7 +2249,7 @@ async fn merge_adjacent_files_for_rewrite(duckdb: &DuckDbMaintenanceExecutor) ->
 
 /// Runs bounded rewrite-data-files on selected tables.
 async fn run_rewrite_data_files(
-    duckdb: &DuckDbMaintenanceExecutor,
+    duckdb: &impl DuckLakeMaintenanceExecutor,
     metadata_pg_pool: &PgPool,
     metadata_schema: &str,
     table_names: &[DuckLakeMaintenanceTableName],
@@ -2178,6 +2289,7 @@ async fn run_rewrite_data_files(
         info!(
             table = %table_name,
             files_created,
+            no_op = files_created == 0,
             "ducklake rewrite-data-files completed"
         );
     }
@@ -2415,7 +2527,7 @@ async fn select_rewrite_tables(
 
 /// Returns whether a table should be rewritten.
 fn should_rewrite(metrics: &DuckLakeTableStorageMetrics, min_active_data_files: i64) -> bool {
-    metrics.active_data_files > min_active_data_files
+    metrics.active_delete_files > 0 || metrics.active_data_files > min_active_data_files
 }
 
 /// Flushes inlined user data for one table.
@@ -2492,20 +2604,13 @@ fn rewrite_data_files(
     table_name: &DuckLakeMaintenanceTableName,
 ) -> EtlResult<u64> {
     let sql = format!(
-        "CALL ducklake_rewrite_data_files({}, {}, schema => {});",
+        "SELECT COALESCE(SUM(files_created), 0) FROM ducklake_rewrite_data_files({}, {}, schema \
+         => {});",
         quote_literal(LAKE_CATALOG),
         quote_literal(&table_name.table_name),
         quote_literal(&table_name.schema_name)
     );
-    conn.execute_batch(&sql).map_err(|source| {
-        etl_error!(
-            ErrorKind::DestinationQueryFailed,
-            "DuckLake rewrite data files failed",
-            format_query_error_detail(&sql),
-            source: source
-        )
-    })?;
-    Ok(0)
+    count_maintenance_files(conn, &sql, "DuckLake rewrite data files failed")
 }
 
 /// Calls DuckLake snapshot expiration.
@@ -3057,15 +3162,50 @@ fn count_maintenance_files(
     sql: &str,
     description: &'static str,
 ) -> EtlResult<u64> {
-    let files_created: i64 = conn.query_row(sql, [], |row| row.get(0)).map_err(|source| {
-        etl_error!(
-            ErrorKind::DestinationQueryFailed,
-            description,
-            format_query_error_detail(sql),
-            source: source
-        )
-    })?;
-    Ok(files_created.max(0) as u64)
+    maintenance_transaction(conn, sql, || {
+        let files_created: i64 = conn.query_row(sql, [], |row| row.get(0)).map_err(|source| {
+            etl_error!(
+                ErrorKind::DestinationQueryFailed,
+                description,
+                format_query_error_detail(sql),
+                source: source
+            )
+        })?;
+        Ok(files_created.max(0) as u64)
+    })
+}
+
+/// DuckLake table functions must be prepared and consumed in the same explicit
+/// transaction. In autocommit, preparing a maintenance table function may end
+/// the transaction before its result is scanned.
+fn maintenance_transaction<R>(
+    conn: &duckdb::Connection,
+    sql: &str,
+    operation: impl FnOnce() -> EtlResult<R>,
+) -> EtlResult<R> {
+    let execute = |statement: &str| {
+        conn.execute_batch(statement).map_err(|source| {
+            etl_error!(ErrorKind::DestinationQueryFailed, "DuckLake maintenance transaction failed",
+            format!("{statement}; maintenance SQL: {sql}"), source: source)
+        })
+    };
+    execute("BEGIN TRANSACTION")?;
+    let result = operation().and_then(|value| execute("COMMIT").map(|()| value));
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            warn!(error = %error, sql, "ducklake maintenance transaction failed");
+            if let Err(rollback) = execute("ROLLBACK") {
+                warn!(error = %rollback, sql, "ducklake maintenance rollback failed");
+                return Err(etl_error!(
+                    ErrorKind::DestinationQueryFailed,
+                    "DuckLake maintenance and rollback failed",
+                    format!("original error: {error}\nrollback error: {rollback}")
+                ));
+            }
+            Err(error)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3221,19 +3361,27 @@ async fn query_table_storage_metrics(
         active_delete_files,
         _active_delete_bytes,
         deleted_rows,
-    ): (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(AssertSqlSafe(sql))
-        .bind(&table_name.schema_name)
-        .bind(&table_name.table_name)
-        .fetch_one(metadata_pg_pool)
-        .await
-        .map_err(|source| {
-            etl_error!(
-                ErrorKind::DestinationQueryFailed,
-                "DuckLake table storage metrics query failed",
-                format!("table={table_name}, metadata_schema={metadata_schema}"),
-                source: source
-            )
-        })?;
+    ): (i64, i64, i64, i64, i64, i64, i64) = tokio::time::timeout(
+        crate::ExternalMaintenanceWatcherConfig::default().store_timeout,
+        sqlx::query_as(AssertSqlSafe(&sql))
+            .bind(&table_name.schema_name)
+            .bind(&table_name.table_name)
+            .fetch_one(metadata_pg_pool),
+    )
+    .await
+    .map_err(|source| {
+        etl_error!(ErrorKind::DestinationQueryFailed,
+            "DuckLake table storage metrics query timed out",
+            format!("table={table_name}, SQL: {sql}"), source: source)
+    })?
+    .map_err(|source| {
+        etl_error!(
+            ErrorKind::DestinationQueryFailed,
+            "DuckLake table storage metrics query failed",
+            format!("table={table_name}, metadata_schema={metadata_schema}, SQL: {sql}"),
+            source: source
+        )
+    })?;
 
     Ok(DuckLakeTableStorageMetrics {
         active_data_files,
@@ -3708,10 +3856,43 @@ mod tests {
     }
 
     #[test]
-    fn should_rewrite_requires_only_file_count() {
-        assert!(!should_rewrite(&metrics(39, 1, 50), 40));
-        assert!(!should_rewrite(&metrics(40, 1, 50), 40));
+    fn should_rewrite_checks_delete_pressure_independently_of_file_count() {
+        assert!(should_rewrite(&metrics(1, 1, 50), i64::MAX));
+        assert!(!should_rewrite(&metrics(40, 0, 0), 40));
         assert!(should_rewrite(&metrics(41, 0, 0), 40));
+        assert!(!should_rewrite(&metrics(41, 0, 0), i64::MAX));
+    }
+
+    #[test]
+    fn maintenance_transaction_rolls_back_and_keeps_original_sql_error() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE writes(id INTEGER)").unwrap();
+        let sql = "SELECT\n missing_column FROM writes";
+        let result: EtlResult<()> = maintenance_transaction(&conn, sql, || {
+            conn.execute_batch("INSERT INTO writes VALUES (1)").unwrap();
+            count_maintenance_rows(&conn, sql, "test maintenance failed").map(|_| ())
+        });
+        let detail = result.unwrap_err().to_string();
+        assert!(detail.contains(sql));
+        assert!(detail.contains("missing_column"));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM writes", [], |row| row.get::<_, i64>(0)).unwrap(),
+            0
+        );
+        conn.execute_batch("BEGIN; INSERT INTO writes VALUES (2); COMMIT").unwrap();
+    }
+
+    #[test]
+    fn maintenance_transaction_preserves_both_operation_and_rollback_errors() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let result: EtlResult<()> = maintenance_transaction(&conn, "maintenance SQL", || {
+            conn.execute_batch("ROLLBACK").unwrap();
+            Err(etl_error!(ErrorKind::DestinationQueryFailed, "original maintenance failure"))
+        });
+        let detail = result.unwrap_err().to_string();
+        assert!(detail.contains("original maintenance failure"));
+        assert!(detail.contains("rollback error"));
+        assert!(detail.contains("no transaction is active"));
     }
 
     #[test]

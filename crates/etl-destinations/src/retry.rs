@@ -9,18 +9,18 @@ use std::{future::Future, time::Duration};
 ///
 /// `max_retries` counts retries after the initial attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RetryPolicy {
+pub struct RetryPolicy {
     /// Maximum number of retries after the first attempt.
-    pub(crate) max_retries: u32,
+    pub max_retries: u32,
     /// Delay before the first retry.
-    pub(crate) initial_delay: Duration,
+    pub initial_delay: Duration,
     /// Upper bound for the exponential backoff base delay.
-    pub(crate) max_delay: Duration,
+    pub max_delay: Duration,
 }
 
 /// Retry decision for one failed attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RetryDecision {
+pub enum RetryDecision {
     /// Retry the operation after the computed delay.
     Retry,
     /// Stop retrying and return the error immediately.
@@ -28,44 +28,34 @@ pub(crate) enum RetryDecision {
 }
 
 /// Retry metadata emitted before one sleep.
-#[allow(dead_code)]
 #[derive(Debug)]
-pub(crate) struct RetryAttempt<'a, E> {
+pub struct RetryAttempt<'a, E> {
     /// One-based retry number.
-    pub(crate) retry_index: u32,
+    pub retry_index: u32,
     /// Configured retry limit.
-    pub(crate) max_retries: u32,
+    pub max_retries: u32,
     /// Exponential backoff delay before caller-specific shaping.
-    pub(crate) base_delay: Duration,
+    pub base_delay: Duration,
     /// Final delay that will be slept.
-    pub(crate) sleep_delay: Duration,
+    pub sleep_delay: Duration,
     /// Error that triggered the retry.
-    pub(crate) error: &'a E,
+    pub error: &'a E,
 }
 
 /// Final failure after the retry helper stops.
-#[allow(dead_code)]
 #[derive(Debug)]
-pub(crate) struct RetryFailure<E> {
+pub struct RetryFailure<E> {
     /// Total attempts including the initial attempt.
-    pub(crate) total_attempts: u32,
+    pub total_attempts: u32,
     /// Last error returned by the operation.
-    pub(crate) last_error: E,
+    pub last_error: E,
 }
 
 /// Executes an async operation with exponential backoff.
 ///
 /// The helper owns attempt counting, delay growth, and sleeping. Callers retain
 /// control over retry classification, delay shaping, logging, and metrics.
-pub(crate) async fn retry_with_backoff<
-    T,
-    E,
-    AttemptFn,
-    AttemptFut,
-    ShouldRetry,
-    TransformDelay,
-    OnRetry,
->(
+pub async fn retry_with_backoff<T, E, AttemptFn, AttemptFut, ShouldRetry, TransformDelay, OnRetry>(
     policy: RetryPolicy,
     mut should_retry: ShouldRetry,
     mut transform_delay: TransformDelay,

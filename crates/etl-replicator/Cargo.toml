@@ -30,7 +30,7 @@ etl = { workspace = true }
 etl-config = { workspace = true, features = ["supabase"] }
 etl-destinations = { workspace = true }
 etl-maintenance = { workspace = true }
-etl-telemetry = { workspace = true }
+etl-telemetry = { workspace = true, features = ["runtime-metrics"] }
 k8s-openapi = { workspace = true, features = ["latest"] }
 metrics = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls", "json"] }
@@ -46,7 +46,6 @@ tracing = { workspace = true, default-features = true }
 tracing-subscriber = { workspace = true, features = ["ansi", "env-filter", "fmt"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemalloc-ctl = { workspace = true }
 tikv-jemallocator = { workspace = true }
 
 [lints]
