@@ -3363,7 +3363,7 @@ async fn query_table_storage_metrics(
         deleted_rows,
     ): (i64, i64, i64, i64, i64, i64, i64) = tokio::time::timeout(
         crate::ExternalMaintenanceWatcherConfig::default().store_timeout,
-        sqlx::query_as(AssertSqlSafe(&sql))
+        sqlx::query_as(AssertSqlSafe(sql.as_str()))
             .bind(&table_name.schema_name)
             .bind(&table_name.table_name)
             .fetch_one(metadata_pg_pool),
