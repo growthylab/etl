@@ -1,6 +1,6 @@
 //! Host configuration for an embedded DuckLake destination.
 
-use std::{num::NonZeroUsize, sync::Arc};
+use std::sync::Arc;
 
 use etl::{error::EtlResult, schema::TableName};
 
@@ -19,6 +19,4 @@ pub(super) type TableNameMapper =
 pub(super) struct EmbeddingOptions {
     pub(super) connection_initializer: Option<ConnectionInitializer>,
     pub(super) table_name_mapper: Option<TableNameMapper>,
-    pub(super) cdc_batch_size: Option<NonZeroUsize>,
-    pub(super) cdc_rewrite_budget: Option<NonZeroUsize>,
 }

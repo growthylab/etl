@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    num::NonZeroUsize,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -692,9 +691,9 @@ impl<S> DuckLakeDestinationBuilder<S> {
     /// Return a fresh instance with DuckLake attached as `lake`, using the same
     /// catalog, metadata schema and data path passed to this builder. The host
     /// owns extension loading, secrets, resource limits, attachment options and
-    /// catalog writer options for both COPY and CDC. Standalone S3, Parquet
-    /// setup and temporary COPY inlining overrides are bypassed.
-    /// ETL still configures writer sessions and manages replay helper tables.
+    /// catalog writer options. Standalone S3 and Parquet setup are bypassed.
+    /// ETL retains its COPY-to-Parquet and streaming-inlining lifecycle,
+    /// configures writer sessions and manages replay helper tables.
     /// Do not retain connections to retired instances in the callback.
     pub fn connection_initializer<F>(mut self, initialize: F) -> Self
     where
@@ -718,29 +717,6 @@ impl<S> DuckLakeDestinationBuilder<S> {
         F: Fn(&TableName) -> EtlResult<DuckLakeTableName> + Send + Sync + 'static,
     {
         self.embedding.table_name_mapper = Some(Arc::new(map));
-        self
-    }
-
-    /// Sets the maximum number of CDC mutations in one DuckLake transaction.
-    ///
-    /// Defaults to 16. Larger transactions can reduce file creation when data
-    /// inlining is disabled, at the cost of longer transactions and retries.
-    /// This only groups mutations already delivered by the pipeline; it does
-    /// not wait for additional events or change the pipeline batch limits.
-    pub fn cdc_batch_size(mut self, size: NonZeroUsize) -> Self {
-        self.embedding.cdc_batch_size = Some(size);
-        self
-    }
-
-    /// Limits row rewrite work in each CDC transaction independently of insert
-    /// volume.
-    ///
-    /// Deletes and partial updates cost one unit; full updates and replacements
-    /// cost two (delete plus insert). Inserts cost zero and remain bounded by
-    /// [`Self::cdc_batch_size`]. A single mutation is never split, even if its
-    /// cost exceeds the budget. No additional limit is applied by default.
-    pub fn cdc_rewrite_budget(mut self, budget: NonZeroUsize) -> Self {
-        self.embedding.cdc_rewrite_budget = Some(budget);
         self
     }
 
@@ -2392,12 +2368,6 @@ where
         &self,
         table_name: &DuckLakeTableName,
     ) -> EtlResult<()> {
-        // Host setup owns inlining for both COPY and CDC. Do not introduce a
-        // table override that would mask its attachment or schema settings.
-        if self.embedding.connection_initializer.is_some() {
-            return Ok(());
-        }
-
         if self.copy_direct_to_parquet_tables.lock().contains(table_name) {
             return Ok(());
         }
@@ -2413,12 +2383,6 @@ where
         &self,
         table_name: &DuckLakeTableName,
     ) -> EtlResult<()> {
-        // Host setup owns inlining for both COPY and CDC. Do not introduce a
-        // table override that would mask its attachment or schema settings.
-        if self.embedding.connection_initializer.is_some() {
-            return Ok(());
-        }
-
         self.set_copy_data_inlining_row_limit(table_name, ATTACH_DATA_INLINING_ROW_LIMIT).await?;
         self.copy_direct_to_parquet_tables.lock().remove(table_name);
         Ok(())
@@ -3451,8 +3415,6 @@ where
                             );
 
                             let prepared_batches = prepare_mutation_table_batches(
-                                destination.embedding.cdc_batch_size,
-                                destination.embedding.cdc_rewrite_budget,
                                 &segment.replicated_table_schema,
                                 destination_table_name.clone(),
                                 replay_epoch,

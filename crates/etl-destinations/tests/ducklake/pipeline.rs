@@ -2004,7 +2004,7 @@ async fn embedded_destination_keeps_copy_cdc_and_maintenance_on_one_instance() {
             etl_error!(ErrorKind::DestinationQueryFailed, "Inline verification failed", source: source)
         })
     }).await.unwrap();
-    assert_eq!(flushed, 0);
+    assert_eq!(flushed, 1, "embedded COPY completion must restore streaming inlining");
     pipeline.shutdown_and_wait().await.unwrap();
     drop(wrapped);
     drop(raw);

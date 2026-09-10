@@ -29,8 +29,8 @@ When embedding DuckLake, the builder also accepts a `connection_initializer`
 and a `table_name_mapper`. The initializer returns a fresh DuckDB instance with
 `lake` already attached to the configured catalog and data path. It owns
 extension loading, credentials, resource/spill limits and catalog options,
-including schema-scoped options and the attachment's data inlining limit for both
-COPY and CDC. Host initialization bypasses the standalone COPY inlining override.
+including schema-scoped options. ETL keeps its upstream COPY-to-Parquet and
+CDC inlining lifecycle even when a host initializes the instance.
 ETL continues to own COPY, CDC, replay state, pooled connection clones and session
 settings. The initializer runs again on instance replacement; it must not retain
 connections to retired instances. Existing persisted table names take precedence
@@ -41,11 +41,6 @@ instance under the existing mutation pause and query watchdog. The caller owns
 the schedule and table selection. Cancellation does not release the pause until
 the blocking operation exits. Callbacks must finish transactions and must not
 retain cloned connections outside the operation.
-
-The builder's `cdc_batch_size` controls the transaction cap for mutations already
-received from the pipeline (default: 16). Increasing it can reduce file creation
-with inlining disabled, with longer transactions and larger retry units. It does
-not change how long the pipeline waits to fill an input batch.
 
 The `bundled` feature is enabled by default and keeps the bundled DuckDB/JSON/
 Parquet build. Hosts supplying a compatible native DuckDB library can disable
