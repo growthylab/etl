@@ -2166,7 +2166,7 @@ fn apply_table_batch(
                     );
                     let _entered = operation_span.enter();
                     let started = Instant::now();
-                    debug!("ducklake batch operation started");
+                    info!("ducklake batch operation started");
                     let result = apply_table_mutation(
                         conn,
                         batch,
@@ -2192,6 +2192,10 @@ fn apply_table_batch(
             }
         }
 
+        info!(
+            elapsed_ms = batch_started.elapsed().as_millis() as u64,
+            "ducklake batch checkpoint starting"
+        );
         if batch.uses_streaming_progress() {
             update_table_streaming_progress(conn, batch)?;
         } else {
@@ -2202,6 +2206,10 @@ fn apply_table_batch(
 
     match result {
         Ok(()) => {
+            info!(
+                elapsed_ms = batch_started.elapsed().as_millis() as u64,
+                "ducklake batch committing"
+            );
             conn.execute_batch("COMMIT").map_err(|error| {
                 tracing::error!(error = %error, "error commit");
                 reusable_staging_table.cleanup(conn);
