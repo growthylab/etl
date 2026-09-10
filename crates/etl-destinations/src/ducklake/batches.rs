@@ -2188,10 +2188,8 @@ fn apply_table_batch(
                             error_kind = ?error.kind(),
                             interrupt_reason = operation_context.interrupt_reason_label(),
                             "ducklake batch operation failed");
-                    } else if elapsed_ms >= 1000 {
-                        info!(elapsed_ms, batch_elapsed_ms, "ducklake batch operation slow");
                     } else {
-                        debug!(elapsed_ms, batch_elapsed_ms, "ducklake batch operation completed");
+                        info!(elapsed_ms, batch_elapsed_ms, "ducklake batch operation completed");
                     }
                     result?;
                 }
