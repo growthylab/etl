@@ -2,6 +2,7 @@ mod batches;
 mod client;
 mod config;
 mod core;
+mod diagnostics;
 mod embedding;
 mod encoding;
 mod external_maintenance;

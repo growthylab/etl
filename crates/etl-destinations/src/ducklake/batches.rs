@@ -46,6 +46,7 @@ use crate::{
             run_duckdb_blocking_with_context,
         },
         core::is_create_table_conflict,
+        diagnostics::query_log_detail,
         encoding::{
             PreparedRows, cell_to_sql_literal_ref, prepare_copy_rows, prepare_rows,
             table_row_to_sql_literal_ref,
@@ -197,6 +198,7 @@ pub(super) enum TableMutation {
 }
 
 /// Prepared table mutations ready for execution and retries.
+#[derive(Debug)]
 enum PreparedTableMutation {
     Upsert(PreparedRows),
     Delete {
@@ -691,7 +693,7 @@ pub(super) async fn apply_table_batch_with_retry(
                 max = attempt.max_retries,
                 table = %table_name,
                 batch_id = %batch_id,
-                error = %attempt.error,
+                error = %query_log_detail(attempt.error),
                 "ducklake table mutation attempt failed, retrying"
             );
         },
@@ -1785,7 +1787,7 @@ impl ReusableStagingTable {
 
         let staging_table = quote_identifier(&self.staging_name);
         if let Err(error) = conn.execute_batch(&format!("drop table if exists {staging_table}")) {
-            tracing::error!(error = %error, "error drop table staging");
+            tracing::error!(error = %query_log_detail(&error), "error drop table staging");
         }
     }
 
@@ -1818,7 +1820,7 @@ impl ReusableStagingTable {
              select {column_list} from {target_table} limit 0;"
         ))
         .map_err(|error| {
-            tracing::error!(error = %error, "error creating temporary table");
+            tracing::error!(error = %query_log_detail(&error), "error creating temporary table");
 
             etl_error!(
                 ErrorKind::DestinationQueryFailed,
@@ -1839,7 +1841,7 @@ impl ReusableStagingTable {
             "insert into {target_table} ({column_list}) select {column_list} from {staging_table};"
         );
         conn.execute_batch(&sql).map_err(|error| {
-            tracing::error!(error = %error, "error inserting rows");
+            tracing::error!(error = %query_log_detail(&error), "error inserting rows");
             etl_error!(
                 ErrorKind::DestinationQueryFailed,
                 "DuckLake INSERT SELECT failed",
@@ -1859,7 +1861,7 @@ impl ReusableStagingTable {
         let staging_table = quote_identifier(&self.staging_name);
         let sql = format!("truncate table {staging_table};");
         conn.execute_batch(&sql).map_err(|error| {
-            tracing::error!(error = %error, "error clear staging");
+            tracing::error!(error = %query_log_detail(&error), "error clear staging");
             etl_error!(
                 ErrorKind::DestinationQueryFailed,
                 "DuckLake staging table clear failed",
@@ -1874,7 +1876,7 @@ impl ReusableStagingTable {
         match prepared_rows {
             PreparedRows::Appender(all_values) => {
                 let mut appender = conn.appender(&self.staging_name).map_err(|error| {
-                    tracing::error!(error = %error, "error appender");
+                    tracing::error!(error = %query_log_detail(&error), "error appender");
                     etl_error!(
                         ErrorKind::DestinationQueryFailed,
                         "DuckLake staging appender creation failed",
@@ -1884,7 +1886,7 @@ impl ReusableStagingTable {
                 for values in all_values {
                     appender.append_row(duckdb::appender_params_from_iter(values)).map_err(
                         |err| {
-                            tracing::error!(error = %err, "error append row");
+                            tracing::error!(error = %query_log_detail(&err), "error append row");
                             etl_error!(
                                 ErrorKind::DestinationQueryFailed,
                                 "DuckLake staging append_row failed",
@@ -1894,7 +1896,7 @@ impl ReusableStagingTable {
                     )?;
                 }
                 appender.flush().map_err(|err| {
-                    tracing::error!(error = %err, "error flush");
+                    tracing::error!(error = %query_log_detail(&err), "error flush");
                     etl_error!(
                         ErrorKind::DestinationQueryFailed,
                         "DuckLake staging appender flush failed",
@@ -1904,7 +1906,7 @@ impl ReusableStagingTable {
             }
             PreparedRows::ArrowRecordBatch(record_batch) => {
                 let mut appender = conn.appender(&self.staging_name).map_err(|error| {
-                    tracing::error!(error = %error, "error appender");
+                    tracing::error!(error = %query_log_detail(&error), "error appender");
                     etl_error!(
                         ErrorKind::DestinationQueryFailed,
                         "DuckLake staging appender creation failed",
@@ -1912,7 +1914,7 @@ impl ReusableStagingTable {
                     )
                 })?;
                 appender.append_record_batch(record_batch.clone()).map_err(|err| {
-                    tracing::error!(error = %err, "error append record batch");
+                    tracing::error!(error = %query_log_detail(&err), "error append record batch");
                     etl_error!(
                         ErrorKind::DestinationQueryFailed,
                         "DuckLake staging append_record_batch failed",
@@ -1920,7 +1922,7 @@ impl ReusableStagingTable {
                     )
                 })?;
                 appender.flush().map_err(|err| {
-                    tracing::error!(error = %err, "error flush");
+                    tracing::error!(error = %query_log_detail(&err), "error flush");
                     etl_error!(
                         ErrorKind::DestinationQueryFailed,
                         "DuckLake staging appender flush failed",
@@ -2134,7 +2136,7 @@ fn apply_table_batch(
     info!("ducklake atomic batch started");
 
     conn.execute_batch("BEGIN TRANSACTION").map_err(|error| {
-        tracing::error!(error = %error, "error transaction");
+        tracing::error!(error = %query_log_detail(&error), "error transaction");
         etl_error!(
             ErrorKind::DestinationQueryFailed,
             "DuckLake BEGIN TRANSACTION failed",
@@ -2177,7 +2179,14 @@ fn apply_table_batch(
                     let elapsed_ms = started.elapsed().as_millis() as u64;
                     let batch_elapsed_ms = batch_started.elapsed().as_millis() as u64;
                     if let Err(error) = &result {
-                        warn!(elapsed_ms, batch_elapsed_ms, error = %error,
+                        #[cfg(feature = "ducklake-query-error-details")]
+                        tracing::error!(mutation = ?prepared_mutation,
+                            insert_column_names = ?batch.insert_column_names,
+                            "ducklake failed operation original input");
+                        warn!(elapsed_ms, batch_elapsed_ms,
+                            error = %query_log_detail(error),
+                            error_kind = ?error.kind(),
+                            interrupt_reason = operation_context.interrupt_reason_label(),
                             "ducklake batch operation failed");
                     } else if elapsed_ms >= 1000 {
                         info!(elapsed_ms, batch_elapsed_ms, "ducklake batch operation slow");
@@ -2211,7 +2220,7 @@ fn apply_table_batch(
                 "ducklake batch committing"
             );
             conn.execute_batch("COMMIT").map_err(|error| {
-                tracing::error!(error = %error, "error commit");
+                tracing::error!(error = %query_log_detail(&error), "error commit");
                 reusable_staging_table.cleanup(conn);
                 etl_error!(
                     ErrorKind::DestinationQueryFailed,
@@ -2251,11 +2260,12 @@ fn apply_table_batch(
         }
         Err(err) => {
             warn!(elapsed_ms = batch_started.elapsed().as_millis() as u64,
-                error = %err, "ducklake atomic batch rolling back");
+                error = %query_log_detail(&err),
+                error_kind = ?err.kind(), "ducklake atomic batch rolling back");
             let rollback = conn.execute_batch("ROLLBACK");
             reusable_staging_table.cleanup(conn);
             if let Err(err) = rollback {
-                tracing::error!(error = %err, "error rollback");
+                tracing::error!(error = %query_log_detail(&err), "error rollback");
             }
 
             Err(err)
@@ -2271,7 +2281,7 @@ fn apply_truncate_batch_action(
     let target_table = qualified_lake_table_name(table_name);
     let sql = format!("TRUNCATE TABLE {target_table};");
     conn.execute_batch(&sql).map_err(|error| {
-        tracing::error!(error = %error, "error truncating table");
+        tracing::error!(error = %query_log_detail(&error), "error truncating table");
         etl_error!(
             ErrorKind::DestinationQueryFailed,
             "DuckLake TRUNCATE TABLE failed",
@@ -2361,7 +2371,7 @@ fn apply_delete_mutation(
             let duckdb_interrupted = is_duckdb_interrupt_error(&error);
             let error = DuckDbSensitiveQueryError { error, sql: sql_query.clone() };
             tracing::error!(
-                error = "DuckDB DELETE failed; row-bearing diagnostics omitted from logs",
+                error = %query_log_detail(&error),
                 table = %batch.table_name,
                 batch_id = %batch.batch_id,
                 batch_kind = batch.batch_kind.as_str(),
@@ -2415,7 +2425,7 @@ fn apply_update_mutation(
     let sql_query = format!("UPDATE {target_table} SET {set_clause} WHERE {predicate};");
     conn.execute_batch(&sql_query).map_err(|error| {
         let error = DuckDbSensitiveQueryError { error, sql: sql_query.clone() };
-        tracing::error!(error = "DuckDB UPDATE failed; row-bearing diagnostics omitted from logs", table = %table_name, "error updating rows");
+        tracing::error!(error = %query_log_detail(&error), table = %table_name, "error updating rows");
         etl_error!(
             ErrorKind::DestinationQueryFailed,
             "DuckLake UPDATE failed",
@@ -2496,9 +2506,11 @@ fn insert_rows_into_staging_with_sql(
 ) -> EtlResult<()> {
     let staging_table = quote_identifier(staging);
     for chunk in row_literals.chunks(SQL_INSERT_BATCH_SIZE) {
-        conn.execute_batch(&format!("INSERT INTO {staging_table} VALUES {};", chunk.join(", ")))
+        let sql = format!("INSERT INTO {staging_table} VALUES {};", chunk.join(", "));
+        conn.execute_batch(&sql)
             .map_err(|err| {
-                tracing::error!(error = %err, "error insert_rows_into_staging_with_sql");
+                let err = DuckDbSensitiveQueryError { error: err, sql: sql.clone() };
+                tracing::error!(error = %query_log_detail(&err), "error insert_rows_into_staging_with_sql");
                 etl_error!(
                     ErrorKind::DestinationQueryFailed,
                     "DuckLake staging row insert failed",

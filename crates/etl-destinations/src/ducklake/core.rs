@@ -191,8 +191,8 @@ async fn finish_table_tasks(tasks: &mut tokio::task::JoinSet<EtlResult<()>>) -> 
         let result = result.map_err(|source| etl_error!(ErrorKind::ApplyWorkerPanic, "DuckLake table task failed", source: source)).and_then(|result| result);
         if let Err(error) = result {
             // A returned error may carry opt-in row-bearing diagnostics.
-            // Automatic logs keep only the owned description and error kind.
-            tracing::error!(error = error.description().unwrap_or("DuckLake table task failed"), error_kind = ?error.kind(), "ducklake table task failed");
+            // Consumer opt-in preserves the complete original failure diagnostics.
+            tracing::error!(error = %super::diagnostics::query_log_detail(&error), error_kind = ?error.kind(), "ducklake table task failed");
             if first_error.is_none() {
                 first_error = Some(error);
             }

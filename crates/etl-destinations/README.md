@@ -54,8 +54,9 @@ must load extensions matching that library. Other dependencies enabling `bundled
 will still enable it through Cargo feature unification.
 
 `ducklake-query-error-details` explicitly includes original DuckDB UPDATE/DELETE
-errors, their source chains and SQL in returned errors. Automatic mutation/task
-logs retain structural context without rendering those errors. Returned errors can contain row values;
+errors, their source chains and SQL in returned errors. Opt-in mutation/task
+logs preserve original errors, their complete chains, SQL and row values without
+sanitizing or rewriting them. Default logs omit detailed errors. These diagnostics can contain row values;
 leave the feature disabled to retain the default redaction. Concurrent table
 failures are logged individually and accepted table tasks finish before the
 first error is returned to the apply loop.

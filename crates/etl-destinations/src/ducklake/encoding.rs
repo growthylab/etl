@@ -24,6 +24,7 @@ use pg_escape::quote_literal;
 use crate::ducklake::DUCKLAKE_COLUMN_NAME_MAPPING;
 
 /// Prepared row payload reused across retry attempts.
+#[derive(Debug)]
 pub(super) enum PreparedRows {
     Appender(Vec<Vec<Value>>),
     ArrowRecordBatch(RecordBatch),
