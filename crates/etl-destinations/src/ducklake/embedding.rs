@@ -17,6 +17,7 @@ pub(super) type TableNameMapper =
 /// Optional host policies; absent callbacks retain the standalone defaults.
 #[derive(Clone, Default)]
 pub(super) struct EmbeddingOptions {
+    pub(super) streaming_batch: crate::ducklake::DuckLakeStreamingBatchConfig,
     pub(super) connection_initializer: Option<ConnectionInitializer>,
     pub(super) table_name_mapper: Option<TableNameMapper>,
 }

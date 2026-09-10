@@ -190,7 +190,8 @@ async fn finish_table_tasks(tasks: &mut tokio::task::JoinSet<EtlResult<()>>) -> 
         let result = result.map_err(|source| etl_error!(ErrorKind::ApplyWorkerPanic, "DuckLake table task failed", source: source)).and_then(|result| result);
         if let Err(error) = result {
             // A returned error may carry opt-in row-bearing diagnostics.
-            // Consumer opt-in preserves the complete original failure diagnostics.
+            // Consumer opt-in preserves the complete original failure
+            // diagnostics.
             tracing::error!(error = %super::diagnostics::query_log_detail(&error), error_kind = ?error.kind(), "ducklake table task failed");
             if first_error.is_none() {
                 first_error = Some(error);
@@ -762,6 +763,15 @@ impl<S> DuckLakeDestinationBuilder<S> {
         expire_snapshots_older_than: Option<String>,
     ) -> Self {
         self.expire_snapshots_older_than = expire_snapshots_older_than;
+        self
+    }
+
+    /// Sets the row and byte limits for atomic streaming batches.
+    pub fn streaming_batch(
+        mut self,
+        config: crate::ducklake::DuckLakeStreamingBatchConfig,
+    ) -> Self {
+        self.embedding.streaming_batch = config;
         self
     }
 
@@ -3032,8 +3042,9 @@ where
                 if !active_sort_order_matches(&active, &columns) {
                     statements.push(build_set_sorted_by_sql_ducklake(table_name, &columns));
                 }
-                // Keep foreground insert latency unchanged. Flush and compaction
-                // still use the table's active sort order.
+                // Keep foreground insert latency unchanged. Flush and
+                // compaction still use the table's active sort
+                // order.
                 statements.push(build_disable_sort_on_insert_sql_ducklake(table_name));
                 statements.join(";\n")
             }
@@ -3238,7 +3249,8 @@ where
             let mut table_id_to_mutations: HashMap<TableId, Vec<TableMutationSegment>> =
                 HashMap::new();
 
-            // Accumulate row events, stopping at the first DDL or truncate boundary.
+            // Accumulate row events, stopping at the first DDL or truncate
+            // boundary.
             while let Some(event) = event_iter.peek() {
                 if matches!(event, Event::Relation(_) | Event::Truncate(_)) {
                     break;
@@ -3384,7 +3396,8 @@ where
                                 );
                                 continue;
                             }
-                            // Schema reconciliation also acquires the table write slot.
+                            // Schema reconciliation also acquires the table
+                            // write slot.
                             drop(replay_table_write_permit);
                             let ready_table_name = destination
                                 .ensure_table_ready_for_streaming_schema(
@@ -3415,6 +3428,7 @@ where
                             );
 
                             let prepared_batches = prepare_mutation_table_batches(
+                                destination.embedding.streaming_batch,
                                 &segment.replicated_table_schema,
                                 destination_table_name.clone(),
                                 replay_epoch,
@@ -3448,7 +3462,8 @@ where
                 }
             }
 
-            // Collect contiguous truncate events while preserving table-local order.
+            // Collect contiguous truncate events while preserving table-local
+            // order.
             let mut truncate_table_ids: HashMap<
                 TableId,
                 (ReplicatedTableSchema, Vec<TrackedTruncateEvent>),
@@ -3501,7 +3516,8 @@ where
                             );
                             return Ok(());
                         }
-                        // Schema reconciliation also acquires the table write slot.
+                        // Schema reconciliation also acquires the table write
+                        // slot.
                         drop(replay_table_write_permit);
                         let ready_table_name = destination
                             .ensure_table_ready_for_streaming_schema(&replicated_table_schema)

@@ -10,7 +10,7 @@
 #[cfg(feature = "test-utils")]
 use std::sync::LazyLock;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error, fmt,
     hash::{Hash, Hasher},
     sync::{
@@ -39,7 +39,8 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{
     ducklake::{
-        DUCKLAKE_COLUMN_NAME_MAPPING, DuckLakeTableName, LAKE_CATALOG,
+        DUCKLAKE_COLUMN_NAME_MAPPING, DuckLakeStreamingBatchConfig, DuckLakeTableName,
+        LAKE_CATALOG,
         client::{
             DuckLakeBlockingOperationContext, DuckLakeConnectionManager, format_query_error_detail,
             is_ducklake_shutdown_requested_error, run_duckdb_blocking,
@@ -72,13 +73,6 @@ const SQL_INSERT_BATCH_SIZE: usize = 128;
 /// Keep this small so each delete statement remains cheap while still avoiding
 /// one round-trip per deleted row.
 const SQL_DELETE_BATCH_SIZE: usize = 16;
-/// Maximum number of ordered CDC mutations grouped into one atomic DuckLake
-/// transaction.
-///
-/// Keeping mixed insert/delete/update streams in the same batch improves
-/// insert throughput on interleaved workloads while still capping transaction
-/// lifetime for DuckLake conflict handling.
-const CDC_MUTATION_BATCH_SIZE: usize = 16;
 /// ETL-managed marker table storing per-table applied copy batches.
 const APPLIED_BATCHES_TABLE: &str = "__etl_applied_table_batches";
 /// Data inlining limit for append-only DuckLake helper tables.
@@ -204,6 +198,8 @@ enum PreparedTableMutation {
     Delete {
         // For WHERE clause predicates used in DELETE statements.
         predicates: Vec<String>,
+        // Null-safe set join for canonical integer/UUID identities.
+        key_set: Option<String>,
         // To know if it's coming from an update or delete operation.
         origin: &'static str,
     },
@@ -752,6 +748,7 @@ pub(super) async fn apply_table_batch_with_retry(
 ///
 /// Mutations stay in source order and use the upstream CDC mutation cap.
 pub(super) fn prepare_mutation_table_batches(
+    config: DuckLakeStreamingBatchConfig,
     replicated_table_schema: &ReplicatedTableSchema,
     table_name: DuckLakeTableName,
     replay_epoch: String,
@@ -759,10 +756,19 @@ pub(super) fn prepare_mutation_table_batches(
 ) -> EtlResult<Vec<PreparedDuckLakeTableBatch>> {
     let mut prepared_batches = Vec::new();
     let mut pending_mutations = Vec::new();
+    let mut pending_bytes = 0usize;
 
     for tracked_mutation in tracked_mutations {
-        pending_mutations.push(tracked_mutation);
-        if pending_mutations.len() >= CDC_MUTATION_BATCH_SIZE {
+        let mutation_bytes = match &tracked_mutation.mutation {
+            TableMutation::Insert(row) | TableMutation::Replace(row) => row.size_hint(),
+            TableMutation::Delete(row) => row.size_hint(),
+            TableMutation::Update { delete_row, new_row } => {
+                delete_row.size_hint().saturating_add(new_row.size_hint())
+            }
+        };
+        if !pending_mutations.is_empty()
+            && pending_bytes.saturating_add(mutation_bytes) > config.max_bytes
+        {
             push_prepared_mutation_batch(
                 &mut prepared_batches,
                 replicated_table_schema,
@@ -770,6 +776,19 @@ pub(super) fn prepare_mutation_table_batches(
                 &replay_epoch,
                 std::mem::take(&mut pending_mutations),
             )?;
+            pending_bytes = 0;
+        }
+        pending_bytes = pending_bytes.saturating_add(mutation_bytes);
+        pending_mutations.push(tracked_mutation);
+        if pending_mutations.len() >= config.max_rows {
+            push_prepared_mutation_batch(
+                &mut prepared_batches,
+                replicated_table_schema,
+                &table_name,
+                &replay_epoch,
+                std::mem::take(&mut pending_mutations),
+            )?;
+            pending_bytes = 0;
         }
     }
 
@@ -1159,69 +1178,203 @@ fn push_prepared_mutation_batch(
     Ok(())
 }
 
-/// Combines independent full-row rewrites without moving a write across a
-/// dependency. Repeated identities, changed identities, and partial updates
-/// remain ordering barriers. The enclosing batch still owns commit and replay.
-fn prepare_row_rewrites(
+/// Flushes a normalized full-row run before an operation that needs stored
+/// values. Deletes precede surviving rows, and duplicate inserts are retained.
+fn flush_full_row_writes(
+    prepared: &mut Vec<PreparedTableMutation>,
+    predicates: &mut Vec<String>,
+    rows: &mut Vec<Option<TableRow>>,
+    keys: &mut Vec<String>,
     schema: &ReplicatedTableSchema,
-    predicate: String,
-    row: TableRow,
-    origin: &'static str,
-    remaining: &mut std::iter::Peekable<std::vec::IntoIter<TableMutation>>,
-) -> EtlResult<Vec<PreparedTableMutation>> {
-    // Only canonical integer/UUID identities permit textual predicate equality
-    // to prove disjointness. Other types (collation, NaN, numeric scale, etc.)
-    // retain the ordered path rather than guessing at SQL equality semantics.
-    let can_combine = schema.identity_column_schemas().all(|column| {
-        matches!(
-            column.typ,
-            etl::schema::Type::INT2
-                | etl::schema::Type::INT4
-                | etl::schema::Type::INT8
-                | etl::schema::Type::UUID
-        )
-    }) && delete_predicate_from_row(schema, &row)? == predicate;
-    let mut predicates = vec![predicate];
-    let mut rows = vec![row];
-    while can_combine && predicates.len() < SQL_DELETE_BATCH_SIZE {
-        let next_predicate = match remaining.peek() {
-            Some(TableMutation::Replace(row)) if origin == "replace" => {
-                delete_predicate_from_row(schema, row)?
-            }
-            Some(TableMutation::Update { delete_row, new_row: UpdatedTableRow::Full(row) })
-                if origin == "update" =>
-            {
-                let old_predicate = delete_predicate_from_row(schema, delete_row)?;
-                if old_predicate != delete_predicate_from_row(schema, row)? {
-                    break;
-                }
-                old_predicate
-            }
-            _ => break,
-        };
-        if predicates.contains(&next_predicate) {
-            break;
-        }
-        // Validation above borrowed the event; consume it only after proving
-        // it is independent of every rewrite already in this group.
-        let Some(
-            TableMutation::Replace(row)
-            | TableMutation::Update { new_row: UpdatedTableRow::Full(row), .. },
-        ) = remaining.next()
-        else {
-            unreachable!("the peeked full-row rewrite is still next");
-        };
-        predicates.push(next_predicate);
-        rows.push(row);
+    origin: &mut Option<&'static str>,
+) {
+    if !predicates.is_empty() {
+        prepared.push(PreparedTableMutation::Delete {
+            key_set: Some(format!(
+                "USING (VALUES {}) AS cdc_keys({}) WHERE {}",
+                std::mem::take(keys).join(","),
+                schema
+                    .identity_column_schemas()
+                    .map(|c| quote_identifier(&DUCKLAKE_COLUMN_NAME_MAPPING.map_name(&c.name)))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                schema
+                    .identity_column_schemas()
+                    .map(|c| {
+                        let name =
+                            quote_identifier(&DUCKLAKE_COLUMN_NAME_MAPPING.map_name(&c.name));
+                        format!("cdc_target.{name} IS NOT DISTINCT FROM cdc_keys.{name}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            )),
+            predicates: std::mem::take(predicates),
+            origin: origin.take().unwrap_or("mixed"),
+        });
     }
-    Ok(vec![
-        PreparedTableMutation::Delete { predicates, origin },
-        PreparedTableMutation::Upsert(prepare_rows(rows)),
-    ])
+    if !rows.is_empty() {
+        prepared.push(PreparedTableMutation::Upsert(prepare_rows(
+            std::mem::take(rows).into_iter().flatten().collect(),
+        )));
+    }
 }
 
-/// Groups ordered row mutations into retryable DuckDB operations.
+/// Normalizes full-row CDC operations inside an existing atomic batch.
+///
+/// The invariant is: applying the pending deletes to the original table and
+/// then appending pending rows equals executing the consumed events in order.
+/// Deleting an identity removes both original rows and earlier pending rows;
+/// inserting only appends. A key-changing full update deletes its OLD identity
+/// and appends the NEW row without deleting existing rows at the new identity.
+/// Partial updates fold known pending rows; otherwise they flush the run to
+/// recover missing values from storage.
 fn prepare_table_mutations(
+    schema: &ReplicatedTableSchema,
+    mutations: Vec<TableMutation>,
+) -> EtlResult<Vec<PreparedTableMutation>> {
+    // Predicate equality is a complete identity comparison only for canonical
+    // integer and UUID columns. Other types retain SQL's equality semantics.
+    let canonical_identity = schema.identity_column_schemas().next().is_some()
+        && schema.identity_column_schemas().all(|column| {
+            matches!(
+                column.typ,
+                etl::schema::Type::INT2
+                    | etl::schema::Type::INT4
+                    | etl::schema::Type::INT8
+                    | etl::schema::Type::UUID
+            )
+        });
+    if !canonical_identity {
+        return prepare_ordered_table_mutations(schema, mutations);
+    }
+
+    let mut prepared = Vec::new();
+    let mut predicates = Vec::new();
+    let mut rows: Vec<Option<TableRow>> = Vec::new();
+    let mut origin = None;
+    let mut keys = Vec::new();
+    let mut deleted = HashSet::new();
+    let mut positions: HashMap<String, Vec<usize>> = HashMap::new();
+    for mutation in mutations {
+        let (delete, insert) = match mutation {
+            TableMutation::Insert(row) => (None, Some(row)),
+            TableMutation::Delete(old) => (
+                Some((
+                    delete_predicate_from_row(schema, &old)?,
+                    delete_key_values(schema, &old)?
+                        .into_iter()
+                        .map(|(_, cell)| cell_to_sql_literal_ref(cell))
+                        .collect::<Vec<_>>(),
+                    "delete",
+                )),
+                None,
+            ),
+            TableMutation::Replace(row) => (
+                Some((
+                    delete_predicate_from_row(schema, &row)?,
+                    delete_key_values(schema, &row)?
+                        .into_iter()
+                        .map(|(_, cell)| cell_to_sql_literal_ref(cell))
+                        .collect::<Vec<_>>(),
+                    "replace",
+                )),
+                Some(row),
+            ),
+            TableMutation::Update { delete_row, new_row: UpdatedTableRow::Full(row) } => (
+                Some((
+                    delete_predicate_from_row(schema, &delete_row)?,
+                    delete_key_values(schema, &delete_row)?
+                        .into_iter()
+                        .map(|(_, cell)| cell_to_sql_literal_ref(cell))
+                        .collect::<Vec<_>>(),
+                    "update",
+                )),
+                Some(row),
+            ),
+            TableMutation::Update { delete_row, new_row: UpdatedTableRow::Partial(row) } => {
+                let predicate = delete_predicate_from_row(schema, &delete_row)?;
+                let assignments = update_assignments_from_partial_row(schema, &row)?;
+                // Once the original identity is deleted, every surviving row
+                // at that identity is known in memory. Patch those rows only;
+                // an absent row must not become an insert.
+                if deleted.contains(&predicate) {
+                    for index in positions.remove(&predicate).unwrap_or_default() {
+                        let Some(previous) = rows[index].take() else {
+                            continue;
+                        };
+                        let mut present = row.values().iter();
+                        let values = previous
+                            .into_values()
+                            .into_iter()
+                            .enumerate()
+                            .map(|(column, old)| {
+                                if row.missing_column_indexes().contains(&column) {
+                                    old
+                                } else {
+                                    present
+                                        .next()
+                                        .expect("validated partial row has each present column")
+                                        .clone()
+                                }
+                            })
+                            .collect();
+                        let updated = TableRow::new(values);
+                        positions
+                            .entry(delete_predicate_from_row(schema, &updated)?)
+                            .or_default()
+                            .push(index);
+                        rows[index] = Some(updated);
+                    }
+                    continue;
+                }
+                flush_full_row_writes(
+                    &mut prepared,
+                    &mut predicates,
+                    &mut rows,
+                    &mut keys,
+                    schema,
+                    &mut origin,
+                );
+                positions.clear();
+                deleted.clear();
+                prepared.push(PreparedTableMutation::Update { assignments, predicate });
+                continue;
+            }
+        };
+        if let Some((predicate, key, delete_origin)) = delete {
+            if let Some(indexes) = positions.remove(&predicate) {
+                for index in indexes {
+                    rows[index] = None;
+                }
+            }
+            if deleted.insert(predicate.clone()) {
+                predicates.push(predicate);
+                keys.push(format!("({})", key.join(",")));
+            }
+            origin = Some(match origin {
+                None => delete_origin,
+                Some(previous) if previous == delete_origin => previous,
+                Some(_) => "mixed",
+            });
+        }
+        if let Some(row) = insert {
+            positions.entry(delete_predicate_from_row(schema, &row)?).or_default().push(rows.len());
+            rows.push(Some(row));
+        }
+    }
+    flush_full_row_writes(
+        &mut prepared,
+        &mut predicates,
+        &mut rows,
+        &mut keys,
+        schema,
+        &mut origin,
+    );
+    Ok(prepared)
+}
+
+/// Preserves SQL operation order when identities cannot be compared in Rust.
+fn prepare_ordered_table_mutations(
     replicated_table_schema: &ReplicatedTableSchema,
     mutations: Vec<TableMutation>,
 ) -> EtlResult<Vec<PreparedTableMutation>> {
@@ -1229,12 +1382,12 @@ fn prepare_table_mutations(
     let mut upsert_rows = Vec::new();
     let mut delete_predicates = Vec::new();
 
-    let mut mutations = mutations.into_iter().peekable();
-    while let Some(mutation) = mutations.next() {
+    for mutation in mutations {
         match mutation {
             TableMutation::Insert(row) => {
                 if !delete_predicates.is_empty() {
                     prepared_mutations.push(PreparedTableMutation::Delete {
+                        key_set: None,
                         predicates: std::mem::take(&mut delete_predicates),
                         origin: "delete",
                     });
@@ -1257,19 +1410,23 @@ fn prepare_table_mutations(
                 }
                 if !delete_predicates.is_empty() {
                     prepared_mutations.push(PreparedTableMutation::Delete {
+                        key_set: None,
                         predicates: std::mem::take(&mut delete_predicates),
                         origin: "delete",
                     });
                 }
                 match new_row {
                     UpdatedTableRow::Full(upsert_row) => {
-                        prepared_mutations.extend(prepare_row_rewrites(
-                            replicated_table_schema,
-                            delete_predicate_from_row(replicated_table_schema, &delete_row)?,
-                            upsert_row,
-                            "update",
-                            &mut mutations,
-                        )?);
+                        prepared_mutations.push(PreparedTableMutation::Delete {
+                            key_set: None,
+                            predicates: vec![delete_predicate_from_row(
+                                replicated_table_schema,
+                                &delete_row,
+                            )?],
+                            origin: "update",
+                        });
+                        prepared_mutations
+                            .push(PreparedTableMutation::Upsert(prepare_rows(vec![upsert_row])));
                     }
                     UpdatedTableRow::Partial(partial_row) => {
                         prepared_mutations.push(PreparedTableMutation::Update {
@@ -1293,18 +1450,18 @@ fn prepare_table_mutations(
                 }
                 if !delete_predicates.is_empty() {
                     prepared_mutations.push(PreparedTableMutation::Delete {
+                        key_set: None,
                         predicates: std::mem::take(&mut delete_predicates),
                         origin: "delete",
                     });
                 }
 
-                prepared_mutations.extend(prepare_row_rewrites(
-                    replicated_table_schema,
-                    delete_predicate_from_row(replicated_table_schema, &row)?,
-                    row,
-                    "replace",
-                    &mut mutations,
-                )?);
+                prepared_mutations.push(PreparedTableMutation::Delete {
+                    key_set: None,
+                    predicates: vec![delete_predicate_from_row(replicated_table_schema, &row)?],
+                    origin: "replace",
+                });
+                prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(vec![row])));
             }
         }
     }
@@ -1314,6 +1471,7 @@ fn prepare_table_mutations(
     }
     if !delete_predicates.is_empty() {
         prepared_mutations.push(PreparedTableMutation::Delete {
+            key_set: None,
             predicates: delete_predicates,
             origin: "delete",
         });
@@ -1323,10 +1481,10 @@ fn prepare_table_mutations(
 }
 
 /// Builds a `WHERE` clause from the replica-identity values stored in `row`.
-fn delete_predicate_from_row<'a>(
-    replicated_table_schema: &ReplicatedTableSchema,
+fn delete_key_values<'a>(
+    replicated_table_schema: &'a ReplicatedTableSchema,
     row: impl Into<DeletePredicateRowRef<'a>>,
-) -> EtlResult<String> {
+) -> EtlResult<Vec<(&'a etl::schema::ColumnSchema, &'a Cell)>> {
     let row = row.into();
     let replicated_column_schemas: Vec<_> = replicated_table_schema.column_schemas().collect();
     let identity_column_schemas: Vec<_> =
@@ -1399,6 +1557,15 @@ fn delete_predicate_from_row<'a>(
         }
     };
 
+    Ok(key_values)
+}
+
+/// Builds a predicate with PostgreSQL identity NULL semantics.
+fn delete_predicate_from_row<'a>(
+    replicated_table_schema: &'a ReplicatedTableSchema,
+    row: impl Into<DeletePredicateRowRef<'a>>,
+) -> EtlResult<String> {
+    let key_values = delete_key_values(replicated_table_schema, row)?;
     let mut predicates = Vec::new();
     for (column_schema, value) in key_values {
         let quoted_column =
@@ -2349,13 +2516,20 @@ fn apply_table_mutation(
             .record(prepared_rows_count(prepared_rows) as f64);
             apply_upsert_mutation(conn, prepared_rows, reusable_staging_table)
         }
-        PreparedTableMutation::Delete { predicates, origin } => {
+        PreparedTableMutation::Delete { predicates, origin, key_set } => {
             histogram!(
                 ETL_DUCKLAKE_DELETE_PREDICATES,
                 BATCH_KIND_LABEL => batch.batch_kind.as_str(),
                 DELETE_ORIGIN_LABEL => *origin,
             )
             .record(predicates.len() as f64);
+            if let Some(key_set) = key_set {
+                let sql = format!(
+                    "DELETE FROM {} AS cdc_target {key_set}",
+                    qualified_lake_table_name(&batch.table_name)
+                );
+                return conn.execute_batch(&sql).map_err(|source| etl_error!(ErrorKind::DestinationQueryFailed, "DuckLake key-set delete failed", source: DuckDbSensitiveQueryError { error: source, sql }));
+            }
             apply_delete_mutation(conn, batch, predicates.as_slice(), origin, operation_context)
         }
         PreparedTableMutation::Update { assignments, predicate } => apply_update_mutation(
@@ -3091,6 +3265,7 @@ mod tests {
         .unwrap();
         let schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
+            DuckLakeStreamingBatchConfig::default(),
             &schema,
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
@@ -3106,6 +3281,7 @@ mod tests {
         assert_eq!(progress.last_sequence_key.tx_ordinal, 15);
         // The second batch deletes first, then fails inserting a malformed row.
         let mut failed = prepare_mutation_table_batches(
+            DuckLakeStreamingBatchConfig::default(),
             &schema,
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
@@ -3135,7 +3311,8 @@ mod tests {
                 .tx_ordinal,
             15
         );
-        // Replaying the entire source transaction skips committed work and continues.
+        // Replaying the entire source transaction skips committed work and
+        // continues.
         apply_table_batches(&conn, &batches, &context).unwrap();
         apply_table_batches(&conn, &batches, &context).unwrap();
         let rows = conn
@@ -3197,6 +3374,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn interleaved_inserts_and_rewrites_share_one_delete_scan() {
+        let schema = make_replicated_schema();
+        let mut mutations = Vec::new();
+        for id in 0..8 {
+            let row =
+                |value: &str| TableRow::new(vec![Cell::I32(id), Cell::String(value.to_owned())]);
+            mutations.push(TableMutation::Insert(row("started")));
+            mutations.push(TableMutation::Replace(row("completed")));
+        }
+        let prepared = prepare_table_mutations(&schema, mutations).unwrap();
+        let deletes = prepared
+            .iter()
+            .filter(|operation| matches!(operation, PreparedTableMutation::Delete { .. }))
+            .count();
+        assert_eq!(deletes, 1);
+    }
+
+    #[test]
+    fn full_row_event_classes_share_one_delete_scan() {
+        let schema = make_replicated_schema();
+        let row = |id| TableRow::new(vec![Cell::I32(id), Cell::String("value".to_owned())]);
+        let mutations = vec![
+            TableMutation::Insert(row(1)),
+            TableMutation::Replace(row(1)),
+            TableMutation::Delete(OldTableRow::Key(TableRow::new(vec![Cell::I32(1)]))),
+            TableMutation::Update {
+                delete_row: OldTableRow::Key(TableRow::new(vec![Cell::I32(2)])),
+                new_row: UpdatedTableRow::Full(row(3)),
+            },
+            TableMutation::Replace(row(3)),
+            TableMutation::Insert(row(4)),
+        ];
+        let prepared = prepare_table_mutations(&schema, mutations).unwrap();
+        assert_eq!(prepared.len(), 2);
+        let PreparedTableMutation::Delete { predicates, .. } = &prepared[0] else {
+            panic!("expected delete");
+        };
+        assert_eq!(predicates.len(), 3);
+    }
+
     /// Builds mixed CDC operations, including dependencies on earlier keys.
     fn rewrite_case(kind: usize, version: usize) -> TableMutation {
         let row = |id| TableRow::new(vec![Cell::I32(id), Cell::String(format!("v{version}"))]);
@@ -3211,8 +3429,30 @@ mod tests {
                 new_row: UpdatedTableRow::Partial(PartialTableRow::new(2, row(1), vec![])),
             },
             5 => TableMutation::Delete(OldTableRow::Key(TableRow::new(vec![Cell::I32(1)]))),
-            6 => TableMutation::Insert(row(1)),
-            _ => unreachable!("test case kind is in 0..7"),
+            6 | 7 => TableMutation::Insert(row(i32::try_from(kind - 5).unwrap())),
+            8 | 9 => TableMutation::Update {
+                delete_row: OldTableRow::Key(TableRow::new(vec![Cell::I32(1)])),
+                new_row: UpdatedTableRow::Partial(PartialTableRow::new(
+                    2,
+                    TableRow::new(vec![Cell::I32(if kind == 8 { 1 } else { 2 })]),
+                    vec![1],
+                )),
+            },
+            10 => TableMutation::Delete(OldTableRow::Full(row(2))),
+            11 => TableMutation::Update {
+                delete_row: OldTableRow::Full(row(2)),
+                new_row: UpdatedTableRow::Full(row(1)),
+            },
+            12 => TableMutation::Update {
+                delete_row: OldTableRow::Key(TableRow::new(vec![Cell::I32(3)])),
+                new_row: UpdatedTableRow::Partial(PartialTableRow::new(
+                    2,
+                    TableRow::new(vec![Cell::String(format!("v{version}"))]),
+                    vec![0],
+                )),
+            },
+            13 => TableMutation::Replace(TableRow::new(vec![Cell::I32(1), Cell::Null])),
+            _ => unreachable!("test case kind is in 0..14"),
         }
     }
 
@@ -3223,18 +3463,43 @@ mod tests {
         schema: &ReplicatedTableSchema,
         kinds: &[usize],
         grouped: bool,
-    ) -> Vec<(i32, String)> {
+    ) -> Vec<(i32, Option<String>)> {
         conn.execute_batch(
             "delete from lake.public.users;
              insert into lake.public.users values (1, 'before-1'), (2, 'before-2');",
         )
         .unwrap();
         let mutations = kinds.iter().enumerate().map(|(i, kind)| rewrite_case(*kind, i));
-        let operations = if grouped {
-            prepare_table_mutations(schema, mutations.collect()).unwrap()
+        let operations: Vec<_> = if grouped {
+            prepare_mutation_table_batches(
+                DuckLakeStreamingBatchConfig::default(),
+                schema,
+                ducklake_table_name(),
+                LEGACY_REPLAY_EPOCH.to_owned(),
+                mutations
+                    .enumerate()
+                    .map(|(index, mutation)| {
+                        TrackedTableMutation::new(
+                            EventSequenceKey::new(PgLsn::from(100), u64::try_from(index).unwrap()),
+                            mutation,
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap()
+            .into_iter()
+            .flat_map(|batch| {
+                let PreparedDuckLakeTableBatchAction::Mutation(operations) = batch.action else {
+                    panic!("expected row mutations");
+                };
+                operations
+            })
+            .collect()
         } else {
             mutations
-                .flat_map(|mutation| prepare_table_mutations(schema, vec![mutation]).unwrap())
+                .flat_map(|mutation| {
+                    prepare_ordered_table_mutations(schema, vec![mutation]).unwrap()
+                })
                 .collect()
         };
         let batch = make_prepared_batch(ducklake_table_name());
@@ -3268,11 +3533,38 @@ mod tests {
         )
         .unwrap();
         let schema = make_replicated_schema();
+        for kinds in [
+            vec![6, 0, 7, 1],
+            vec![0, 7, 1, 7],
+            vec![0, 7, 7, 1],
+            vec![0, 7, 1, 3],
+            vec![0, 7, 1, 4],
+            vec![0, 7, 1, 5],
+        ] {
+            assert_eq!(
+                execute_rewrite_case(&conn, &schema, &kinds, true),
+                execute_rewrite_case(&conn, &schema, &kinds, false),
+                "case {kinds:?}",
+            );
+        }
+        // Reproducible longer streams cross the 16-event atomic batch cap.
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(20260910);
+        for length in [15, 16, 17, 31, 32, 33, 64] {
+            for _ in 0..8 {
+                let kinds: Vec<_> = (0..length).map(|_| rng.random_range(0..14)).collect();
+                assert_eq!(
+                    execute_rewrite_case(&conn, &schema, &kinds, true),
+                    execute_rewrite_case(&conn, &schema, &kinds, false),
+                    "case {kinds:?}",
+                );
+            }
+        }
         // Enumerate repeat-key, key-change, partial-update, insert and delete
         // interactions both before and after a candidate coalesced run.
-        for a in 0..7 {
-            for b in 0..7 {
-                for c in 0..7 {
+        for a in 0..14 {
+            for b in 0..14 {
+                for c in 0..14 {
                     let kinds = [a, b, c];
                     assert_eq!(
                         execute_rewrite_case(&conn, &schema, &kinds, true),
@@ -3285,7 +3577,7 @@ mod tests {
     }
 
     #[test]
-    fn uuid_rewrites_batch_and_repeated_identity_splits_the_run() {
+    fn uuid_rewrites_batch_and_repeated_identity_keeps_the_last_row() {
         let schema = make_replicated_schema_with_columns(vec![
             ColumnSchema::new("id".to_owned(), PgType::UUID, -1, 1, false).with_primary_key(1),
             ColumnSchema::new("name".to_owned(), PgType::TEXT, -1, 2, true),
@@ -3298,15 +3590,182 @@ mod tests {
             ]))
         });
         let prepared = prepare_table_mutations(&schema, mutations.into()).unwrap();
-        assert_eq!(prepared.len(), 4);
+        assert_eq!(prepared.len(), 2);
         let PreparedTableMutation::Delete { predicates, .. } = &prepared[0] else {
             panic!("expected delete")
         };
         assert_eq!(predicates.len(), 2);
-        let PreparedTableMutation::Delete { predicates, .. } = &prepared[2] else {
-            panic!("expected delete")
+        let PreparedTableMutation::Upsert(rows) = &prepared[1] else { panic!("expected insert") };
+        assert_eq!(prepared_rows_count(rows), 2);
+    }
+
+    #[test]
+    fn composite_identity_types_match_ordered_sql() {
+        let ids = ["00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002"];
+        let cases = [
+            (PgType::INT2, "smallint", vec![Cell::I16(1), Cell::I16(2), Cell::Null]),
+            (PgType::INT8, "bigint", vec![Cell::I64(i64::MIN), Cell::I64(i64::MAX), Cell::Null]),
+            (
+                PgType::UUID,
+                "uuid",
+                vec![
+                    Cell::Uuid(ids[0].parse().unwrap()),
+                    Cell::Uuid(ids[1].parse().unwrap()),
+                    Cell::Null,
+                ],
+            ),
+            (PgType::UUID, "uuid", vec![Cell::Null, Cell::Null, Cell::Null]),
+            (PgType::FLOAT8, "double", vec![Cell::F64(0.0), Cell::F64(-0.0), Cell::F64(f64::NAN)]),
+            (
+                PgType::TEXT,
+                "varchar collate nocase",
+                vec![
+                    Cell::String("a".to_owned()),
+                    Cell::String("A".to_owned()),
+                    Cell::String("a' ".to_owned()),
+                ],
+            ),
+        ];
+        for (typ, sql_type, keys) in cases {
+            let schema = make_replicated_schema_with_columns(vec![
+                ColumnSchema::new("id".to_owned(), typ, -1, 1, true).with_primary_key(1),
+                ColumnSchema::new("bucket".to_owned(), PgType::INT4, -1, 2, false)
+                    .with_primary_key(2),
+                ColumnSchema::new("name".to_owned(), PgType::TEXT, -1, 3, true),
+            ]);
+            let conn = duckdb::Connection::open_in_memory().unwrap();
+            attach_lake_catalog(&conn);
+            conn.execute_batch(&format!(
+                "create schema lake.public; create table lake.public.users (id {sql_type}, bucket \
+                 integer, name varchar)",
+            ))
+            .unwrap();
+            let mut results = Vec::new();
+            for grouped in [false, true] {
+                conn.execute_batch("delete from lake.public.users").unwrap();
+                let row = |index: usize, bucket: i32, value: &str| {
+                    TableRow::new(vec![
+                        keys[index].clone(),
+                        Cell::I32(bucket),
+                        Cell::String(value.to_owned()),
+                    ])
+                };
+                let key = |index: usize, bucket: i32| {
+                    OldTableRow::Key(TableRow::new(vec![keys[index].clone(), Cell::I32(bucket)]))
+                };
+                let mutations = vec![
+                    TableMutation::Insert(row(0, 0, "start")),
+                    TableMutation::Replace(row(1, 0, "replace")),
+                    TableMutation::Update {
+                        delete_row: key(0, 0),
+                        new_row: UpdatedTableRow::Full(row(2, 1, "move")),
+                    },
+                    TableMutation::Insert(row(2, 0, "other bucket")),
+                    TableMutation::Update {
+                        delete_row: key(2, 1),
+                        new_row: UpdatedTableRow::Partial(PartialTableRow::new(
+                            3,
+                            TableRow::new(vec![Cell::String("partial".to_owned())]),
+                            vec![0, 1],
+                        )),
+                    },
+                    TableMutation::Delete(key(1, 0)),
+                    TableMutation::Replace(row(2, 1, "final")),
+                ];
+                let operations = if grouped {
+                    prepare_table_mutations(&schema, mutations).unwrap()
+                } else {
+                    prepare_ordered_table_mutations(&schema, mutations).unwrap()
+                };
+                let batch = make_prepared_batch(ducklake_table_name());
+                let mut staging =
+                    ReusableStagingTable::new(&batch.table_name, replicated_column_names(&schema));
+                for operation in &operations {
+                    apply_table_mutation(
+                        &conn,
+                        &batch,
+                        operation,
+                        &mut staging,
+                        &DuckLakeBlockingOperationContext::for_tests(),
+                    )
+                    .unwrap();
+                }
+                staging.cleanup(&conn);
+                let result = conn
+                    .prepare("select to_json(t) from lake.public.users t order by to_json(t)")
+                    .unwrap()
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                results.push(result);
+            }
+            assert_eq!(results[0], results[1], "type {sql_type}");
+        }
+    }
+
+    #[test]
+    fn truncate_between_normalized_batches_preserves_replay_order() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        attach_lake_catalog(&conn);
+        conn.execute_batch(
+            "create schema lake.public;
+             create table lake.public.users (id integer, name varchar);
+             create table lake.__etl_streaming_progress (
+                 table_name varchar, replay_epoch varchar, last_commit_lsn ubigint,
+                 last_tx_ordinal ubigint, updated_at timestamptz);",
+        )
+        .unwrap();
+        let schema = make_replicated_schema();
+        let make_batch = |lsn: u64| {
+            prepare_mutation_table_batches(
+                DuckLakeStreamingBatchConfig::default(),
+                &schema,
+                ducklake_table_name(),
+                LEGACY_REPLAY_EPOCH.to_owned(),
+                vec![TrackedTableMutation::new(
+                    EventSequenceKey::new(PgLsn::from(lsn), 0),
+                    TableMutation::Insert(TableRow::new(vec![
+                        Cell::I32(i32::try_from(lsn).unwrap()),
+                        Cell::String("row".to_owned()),
+                    ])),
+                )],
+            )
+            .unwrap()
+            .remove(0)
         };
-        assert_eq!(predicates.len(), 1);
+        let batches = vec![
+            make_batch(100),
+            prepare_truncate_table_batch(
+                ducklake_table_name(),
+                LEGACY_REPLAY_EPOCH.to_owned(),
+                vec![TrackedTruncateEvent::new(EventSequenceKey::new(PgLsn::from(200), 0), 0)],
+            ),
+            make_batch(300),
+        ];
+        let context = DuckLakeBlockingOperationContext::for_tests();
+        apply_table_batches(&conn, &batches[..2], &context).unwrap();
+        assert_eq!(
+            conn.query_row("select count(*) from lake.public.users", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        for _ in 0..2 {
+            apply_table_batches(&conn, &batches, &context).unwrap();
+            assert_eq!(
+                conn.query_row("select id from lake.public.users", [], |r| r.get::<_, i32>(0))
+                    .unwrap(),
+                300
+            );
+        }
+        assert_eq!(
+            read_table_streaming_progress(&conn, &ducklake_table_name(), LEGACY_REPLAY_EPOCH)
+                .unwrap()
+                .unwrap()
+                .last_sequence_key
+                .commit_lsn,
+            PgLsn::from(300)
+        );
     }
 
     #[test]
@@ -3335,7 +3794,7 @@ mod tests {
 
         assert_eq!(prepared.len(), 2);
         match &prepared[0] {
-            PreparedTableMutation::Delete { predicates, origin } => {
+            PreparedTableMutation::Delete { predicates, origin, .. } => {
                 assert_eq!(predicates, &vec!["\"id\" = 1".to_owned()]);
                 assert_eq!(origin, &"replace");
             }
@@ -3513,6 +3972,7 @@ mod tests {
     fn prepare_mutation_table_batches_insert_only_uses_single_upsert_operation() {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
+            DuckLakeStreamingBatchConfig::default(),
             &replicated_table_schema,
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
@@ -3560,9 +4020,10 @@ mod tests {
     }
 
     #[test]
-    fn prepare_mutation_table_batches_split_mixed_cdc_at_delete_boundaries() {
+    fn prepare_mutation_table_batches_coalesce_insert_delete_insert() {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
+            DuckLakeStreamingBatchConfig::default(),
             &replicated_table_schema,
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
@@ -3596,14 +4057,10 @@ mod tests {
 
         match &batches[0].action {
             PreparedDuckLakeTableBatchAction::Mutation(prepared) => {
-                assert_eq!(prepared.len(), 3);
+                assert_eq!(prepared.len(), 2);
+                assert!(matches!(prepared[0], PreparedTableMutation::Delete { .. }));
                 assert!(matches!(
-                    prepared[0],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
-                ));
-                assert!(matches!(prepared[1], PreparedTableMutation::Delete { .. }));
-                assert!(matches!(
-                    prepared[2],
+                    prepared[1],
                     PreparedTableMutation::Upsert(PreparedRows::Appender(_))
                 ));
             }
@@ -3615,6 +4072,7 @@ mod tests {
     fn prepare_mutation_table_batches_group_contiguous_deletes() {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
+            DuckLakeStreamingBatchConfig::default(),
             &replicated_table_schema,
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
@@ -3642,7 +4100,7 @@ mod tests {
             PreparedDuckLakeTableBatchAction::Mutation(prepared) => {
                 assert_eq!(prepared.len(), 1);
                 match &prepared[0] {
-                    PreparedTableMutation::Delete { predicates, origin } => {
+                    PreparedTableMutation::Delete { predicates, origin, .. } => {
                         assert_eq!(origin, &"delete");
                         assert_eq!(
                             predicates,
@@ -3662,6 +4120,7 @@ mod tests {
     fn prepare_mutation_table_batches_group_contiguous_updates() {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
+            DuckLakeStreamingBatchConfig::default(),
             &replicated_table_schema,
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
@@ -3713,7 +4172,7 @@ mod tests {
     #[test]
     fn prepare_mutation_table_batches_split_non_inserts_at_cap() {
         let replicated_table_schema = make_replicated_schema();
-        let batch_size = CDC_MUTATION_BATCH_SIZE;
+        let batch_size = DuckLakeStreamingBatchConfig::default().max_rows;
         let tracked = (0..=batch_size)
             .map(|idx| {
                 TrackedTableMutation::new(
@@ -3726,6 +4185,7 @@ mod tests {
             })
             .collect();
         let batches = prepare_mutation_table_batches(
+            DuckLakeStreamingBatchConfig::default(),
             &replicated_table_schema,
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
@@ -3761,9 +4221,10 @@ mod tests {
     }
 
     #[test]
-    fn prepare_mutation_table_batches_isolate_update_in_its_own_atomic_batch() {
+    fn prepare_mutation_table_batches_coalesce_update_with_trailing_insert() {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
+            DuckLakeStreamingBatchConfig::default(),
             &replicated_table_schema,
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
@@ -3803,20 +4264,16 @@ mod tests {
 
         match &batches[0].action {
             PreparedDuckLakeTableBatchAction::Mutation(prepared) => {
-                assert_eq!(prepared.len(), 4);
+                assert_eq!(prepared.len(), 2);
+                assert!(matches!(prepared[0], PreparedTableMutation::Delete { .. }));
                 assert!(matches!(
-                    prepared[0],
+                    prepared[1],
                     PreparedTableMutation::Upsert(PreparedRows::Appender(_))
                 ));
-                assert!(matches!(prepared[1], PreparedTableMutation::Delete { .. }));
-                assert!(matches!(
-                    prepared[2],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
-                ));
-                assert!(matches!(
-                    prepared[3],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
-                ));
+                let PreparedTableMutation::Upsert(rows) = &prepared[1] else {
+                    panic!("expected insert")
+                };
+                assert_eq!(prepared_rows_count(rows), 2);
             }
             PreparedDuckLakeTableBatchAction::Truncate => panic!("expected mutation batch"),
         }
@@ -3995,5 +4452,157 @@ mod tests {
         );
 
         assert_ne!(first.batch_id, second.batch_id);
+    }
+    /// Real DuckLake/Parquet benchmark; opt in explicitly and keep artifacts on
+    /// the caller-selected filesystem. No PostgreSQL or object store is used.
+    #[test]
+    #[ignore = "local DuckLake performance experiment"]
+    fn benchmark_mixed_cdc_ducklake() {
+        let root = std::env::var("CDC_BENCH_DIR").unwrap();
+        let schema = make_replicated_schema();
+        for round in 0..3 {
+            for (mode, cap) in
+                [("ordered", 16), ("normalized", 16), ("normalized", 256), ("normalized", 1024)]
+            {
+                let run = tempfile::Builder::new()
+                    .prefix(&format!("{mode}-{cap}-{round}-"))
+                    .tempdir_in(&root)
+                    .unwrap();
+                let path = run.path().to_string_lossy().into_owned();
+                std::fs::create_dir_all(&path).unwrap();
+                let conn = duckdb::Connection::open_in_memory().unwrap();
+                conn.execute_batch("INSTALL ducklake; LOAD ducklake; SET threads=1;").unwrap();
+                conn.execute_batch(&format!(
+                    "ATTACH 'ducklake:{path}/catalog.duckdb' AS lake (DATA_PATH '{path}/data', \
+                     DATA_INLINING_ROW_LIMIT 0); CREATE SCHEMA lake.public; CREATE TABLE \
+                     lake.public.users(id INTEGER, name VARCHAR); CREATE TABLE \
+                     lake.__etl_streaming_progress(table_name VARCHAR, replay_epoch VARCHAR, \
+                     last_commit_lsn UBIGINT, last_tx_ordinal UBIGINT, updated_at TIMESTAMPTZ);"
+                ))
+                .unwrap();
+                for file in 0..10 {
+                    conn.execute_batch(&format!(
+                        "INSERT INTO lake.public.users SELECT i::INTEGER, 'before' FROM range({}, \
+                         {}) r(i)",
+                        file * 10000,
+                        (file + 1) * 10000
+                    ))
+                    .unwrap();
+                }
+                conn.execute_batch("CALL lake.set_option('data_inlining_row_limit', 1000000)")
+                    .unwrap();
+                let version: String = conn.query_row("SELECT version()", [], |r| r.get(0)).unwrap();
+                let started = std::time::Instant::now();
+                let mutations = (0..2048)
+                    .flat_map(|id| {
+                        let row = |name: &str| {
+                            TableRow::new(vec![
+                                Cell::I32(100000 + id),
+                                Cell::String(name.to_owned()),
+                            ])
+                        };
+                        [
+                            TableMutation::Insert(row("started")),
+                            TableMutation::Replace(row("completed")),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                let mut batches = Vec::new();
+                let mut iter = mutations.into_iter();
+                loop {
+                    let chunk = iter.by_ref().take(cap).collect::<Vec<_>>();
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    let mut batch = make_prepared_batch(ducklake_table_name());
+                    batch.insert_column_names = replicated_column_names(&schema);
+                    batch.last_sequence_key = Some(EventSequenceKey::new(
+                        PgLsn::from(100),
+                        u64::try_from(batches.len()).unwrap(),
+                    ));
+                    batch.action =
+                        PreparedDuckLakeTableBatchAction::Mutation(if mode == "ordered" {
+                            prepare_ordered_table_mutations(&schema, chunk).unwrap()
+                        } else {
+                            prepare_table_mutations(&schema, chunk).unwrap()
+                        });
+                    batches.push(batch);
+                }
+                let prepared_ms = started.elapsed().as_millis();
+                let operations: usize = batches.iter().map(prepared_mutation_count).sum();
+                for batch in &batches {
+                    apply_table_batch(&conn, batch, &DuckLakeBlockingOperationContext::for_tests())
+                        .unwrap();
+                }
+                let elapsed_ms = started.elapsed().as_millis();
+                let counts: (i64, i64, i64) = conn
+                    .query_row(
+                        "SELECT count(*), count(*) FILTER (WHERE name='completed'), count(*) \
+                         FILTER (WHERE name='started') FROM lake.public.users",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .unwrap();
+                assert_eq!(counts, (102048, 2048, 0));
+                let mismatches: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM (SELECT id,name FROM lake.public.users EXCEPT ALL \
+                         SELECT i::INTEGER, CASE WHEN i < 100000 THEN 'before' ELSE 'completed' \
+                         END FROM range(102048) r(i))",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(mismatches, 0);
+                println!(
+                    "BENCH mode={mode} cap={cap} round={round} engine={version} events=4096 \
+                     batches={} operations={operations} prepare_ms={prepared_ms} \
+                     elapsed_ms={elapsed_ms}",
+                    batches.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_batches_obey_byte_limit_and_regroup_after_replay() {
+        let schema = make_replicated_schema();
+        let make = || {
+            (0..40)
+                .map(|id| {
+                    TrackedTableMutation::new(
+                        EventSequenceKey::new(PgLsn::from(100), id),
+                        TableMutation::Replace(TableRow::new(vec![
+                            Cell::I32(i32::try_from(id).unwrap()),
+                            Cell::String("x".repeat(1024)),
+                        ])),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let batches = prepare_mutation_table_batches(
+            DuckLakeStreamingBatchConfig::new(1024, 1).unwrap(),
+            &schema,
+            ducklake_table_name(),
+            LEGACY_REPLAY_EPOCH.to_owned(),
+            make(),
+        )
+        .unwrap();
+        assert_eq!(batches.len(), 40);
+        let pending = retain_mutations_after_sequence_key(
+            make(),
+            Some(EventSequenceKey::new(PgLsn::from(100), 15)),
+        );
+        let batches = prepare_mutation_table_batches(
+            DuckLakeStreamingBatchConfig::new(1024, 1024 * 1024).unwrap(),
+            &schema,
+            ducklake_table_name(),
+            LEGACY_REPLAY_EPOCH.to_owned(),
+            pending,
+        )
+        .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].first_sequence_key.unwrap().tx_ordinal, 16);
+        assert_eq!(batches[0].last_sequence_key.unwrap().tx_ordinal, 39);
     }
 }

@@ -150,3 +150,30 @@ pub use external_maintenance::{
     ExternalMaintenanceStore, ExternalMaintenanceWatcherConfig, PostgresExternalMaintenanceStore,
     run_external_maintenance_watcher,
 };
+
+/// Bounds one atomic streaming transaction without delaying source delivery.
+#[derive(Clone, Copy, Debug)]
+pub struct DuckLakeStreamingBatchConfig {
+    pub(super) max_rows: usize,
+    pub(super) max_bytes: usize,
+}
+
+impl DuckLakeStreamingBatchConfig {
+    /// Creates nonzero row and decoded-byte limits. One indivisible event may
+    /// exceed the byte limit; it is processed alone.
+    pub fn new(max_rows: usize, max_bytes: usize) -> EtlResult<Self> {
+        if max_rows == 0 || max_bytes == 0 {
+            return Err(etl_error!(
+                ErrorKind::ConfigError,
+                "Streaming batch limits must be nonzero"
+            ));
+        }
+        Ok(Self { max_rows, max_bytes })
+    }
+}
+
+impl Default for DuckLakeStreamingBatchConfig {
+    fn default() -> Self {
+        Self { max_rows: 16, max_bytes: 32 * 1024 * 1024 }
+    }
+}
