@@ -684,6 +684,18 @@ impl<S> DuckLakeDestinationBuilder<S> {
         self
     }
 
+    /// Limits row rewrite work in each CDC transaction independently of insert
+    /// volume.
+    ///
+    /// Deletes and partial updates cost one unit; full updates and replacements
+    /// cost two (delete plus insert). Inserts cost zero and remain bounded by
+    /// [`Self::cdc_batch_size`]. A single mutation is never split, even if its
+    /// cost exceeds the budget. No additional limit is applied by default.
+    pub fn cdc_rewrite_budget(mut self, budget: NonZeroUsize) -> Self {
+        self.embedding.cdc_rewrite_budget = Some(budget);
+        self
+    }
+
     /// Sets optional S3 credentials and endpoint configuration.
     pub fn s3(mut self, s3: Option<S3Config>) -> Self {
         self.s3 = s3;
@@ -3379,6 +3391,7 @@ where
 
                             let prepared_batches = prepare_mutation_table_batches(
                                 destination.embedding.cdc_batch_size,
+                                destination.embedding.cdc_rewrite_budget,
                                 &segment.replicated_table_schema,
                                 destination_table_name.clone(),
                                 replay_epoch,

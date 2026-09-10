@@ -35,7 +35,7 @@ use pg_escape::quote_literal;
 use rand::Rng;
 use tokio::{sync::Semaphore, time::Instant};
 use tokio_postgres::types::PgLsn;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     ducklake::{
@@ -638,77 +638,24 @@ fn helper_table_has_column(
     })
 }
 
-/// Applies all prepared atomic batches for one table, reusing one DuckDB
-/// connection per attempt and skipping already committed segments.
+/// Applies ordered atomic batches with a separate retry and timeout budget for
+/// each.
+///
+/// A committed batch must not consume the next batch's execution budget. The
+/// replay watermark remains atomic with its data, including ambiguous commits.
 pub(super) async fn apply_table_batches_with_retry(
     pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
     blocking_slots: Arc<Semaphore>,
     batches: Vec<PreparedDuckLakeTableBatch>,
 ) -> EtlResult<()> {
-    if batches.is_empty() {
-        return Ok(());
+    if let Some(first) = batches.first() {
+        info!(table = %first.table_name, batch_count = batches.len(),
+            "ducklake table batches prepared");
     }
-
-    let batch_count = batches.len();
-    let batches = Arc::new(batches);
-    let table_name = batches[0].table_name.clone();
-
-    retry_with_backoff(
-        RetryPolicy {
-            max_retries: MAX_COMMIT_RETRIES,
-            initial_delay: Duration::from_millis(INITIAL_RETRY_DELAY_MS),
-            max_delay: Duration::from_millis(MAX_RETRY_DELAY_MS),
-        },
-        ducklake_retry_decision,
-        jitter_ducklake_retry_delay,
-        |attempt: RetryAttempt<'_, etl::error::EtlError>| {
-            counter!(
-                ETL_DUCKLAKE_RETRIES_TOTAL,
-                BATCH_KIND_LABEL => DuckLakeTableBatchKind::Mutation.as_str(),
-                RETRY_SCOPE_LABEL => "table_sequence",
-            )
-            .increment(1);
-            warn!(
-                attempt = attempt.retry_index,
-                max = attempt.max_retries,
-                table = %table_name,
-                batch_count,
-                error = %attempt.error,
-                "ducklake table batch sequence failed, retrying"
-            );
-        },
-        move || {
-            let attempt_batches = Arc::clone(&batches);
-            let pool = Arc::clone(&pool);
-            let blocking_slots = Arc::clone(&blocking_slots);
-            async move {
-                run_duckdb_blocking_with_context(pool, blocking_slots, move |conn, context| {
-                    apply_table_batches(conn, attempt_batches.as_ref(), context)?;
-                    Ok(())
-                })
-                .await
-            }
-        },
-    )
-    .await
-    .map_err(|failure| {
-        if is_ducklake_shutdown_requested_error(&failure.last_error) {
-            return failure.last_error;
-        }
-
-        counter!(
-            ETL_DUCKLAKE_FAILED_BATCHES_TOTAL,
-            BATCH_KIND_LABEL => DuckLakeTableBatchKind::Mutation.as_str(),
-            RETRY_SCOPE_LABEL => "table_sequence",
-        )
-        .increment(1);
-        etl_error!(
-            ErrorKind::DestinationAtomicBatchRetryable,
-            "DuckLake atomic table batch sequence failed after retries",
-            format!("table={table_name}, batch_count={batch_count}"),
-            source: failure.last_error
-        )
-    })
+    for batch in batches {
+        apply_table_batch_with_retry(Arc::clone(&pool), Arc::clone(&blocking_slots), batch).await?;
+    }
+    Ok(())
 }
 
 /// Applies one atomic per-table batch and retries on failure.
@@ -801,11 +748,11 @@ pub(super) async fn apply_table_batch_with_retry(
 
 /// Prepares ordered atomic batches for one table's CDC mutations.
 ///
-/// Mutations stay in source order and are split only at the batch-size cap so
-/// mixed CDC streams can commit larger insert groups without breaking atomic
-/// ordering.
+/// Mutations stay in source order. Row count bounds all batches; the optional
+/// rewrite budget bounds expensive per-row SQL without shrinking insert runs.
 pub(super) fn prepare_mutation_table_batches(
     batch_size: Option<std::num::NonZeroUsize>,
+    rewrite_budget: Option<std::num::NonZeroUsize>,
     replicated_table_schema: &ReplicatedTableSchema,
     table_name: DuckLakeTableName,
     replay_epoch: String,
@@ -814,10 +761,32 @@ pub(super) fn prepare_mutation_table_batches(
     let batch_size = batch_size.map_or(CDC_MUTATION_BATCH_SIZE, std::num::NonZeroUsize::get);
     let mut prepared_batches = Vec::new();
     let mut pending_mutations = Vec::new();
+    let mut rewrite_cost = 0usize;
 
     for tracked_mutation in tracked_mutations {
+        let cost = match &tracked_mutation.mutation {
+            TableMutation::Insert(_) => 0,
+            TableMutation::Delete(_)
+            | TableMutation::Update { new_row: UpdatedTableRow::Partial(_), .. } => 1,
+            TableMutation::Replace(_)
+            | TableMutation::Update { new_row: UpdatedTableRow::Full(_), .. } => 2,
+        };
+        if !pending_mutations.is_empty()
+            && rewrite_budget.is_some_and(|budget| rewrite_cost + cost > budget.get())
+        {
+            push_prepared_mutation_batch(
+                &mut prepared_batches,
+                replicated_table_schema,
+                &table_name,
+                &replay_epoch,
+                std::mem::take(&mut pending_mutations),
+            )?;
+            rewrite_cost = 0;
+        }
+        rewrite_cost += cost;
         pending_mutations.push(tracked_mutation);
         if pending_mutations.len() >= batch_size {
+            rewrite_cost = 0;
             push_prepared_mutation_batch(
                 &mut prepared_batches,
                 replicated_table_schema,
@@ -2150,6 +2119,19 @@ fn apply_table_batch(
     operation_context: &DuckLakeBlockingOperationContext,
 ) -> EtlResult<()> {
     let batch_started = Instant::now();
+    let batch_span = tracing::info_span!(
+        "ducklake_atomic_batch",
+        table = %batch.table_name,
+        batch_id = %batch.batch_id,
+        batch_kind = batch.batch_kind.as_str(),
+        first_sequence_key = %format_optional_sequence_key(batch.first_sequence_key),
+        last_sequence_key = %format_optional_sequence_key(batch.last_sequence_key),
+        operation_id = operation_context.operation_id(),
+        timeout_ms = operation_context.timeout_ms(),
+        prepared_operations = prepared_mutation_count(batch),
+    );
+    let _entered = batch_span.enter();
+    info!("ducklake atomic batch started");
 
     conn.execute_batch("BEGIN TRANSACTION").map_err(|error| {
         tracing::error!(error = %error, "error transaction");
@@ -2165,14 +2147,44 @@ fn apply_table_batch(
     let result = (|| -> EtlResult<()> {
         match &batch.action {
             PreparedDuckLakeTableBatchAction::Mutation(prepared_mutations) => {
-                for prepared_mutation in prepared_mutations {
-                    apply_table_mutation(
+                for (operation_index, prepared_mutation) in prepared_mutations.iter().enumerate() {
+                    let operation_kind = match prepared_mutation {
+                        PreparedTableMutation::Upsert(_) => "insert",
+                        PreparedTableMutation::Delete { .. } => "delete",
+                        PreparedTableMutation::Update { .. } => "update",
+                    };
+                    let operation_rows = match prepared_mutation {
+                        PreparedTableMutation::Upsert(rows) => prepared_rows_count(rows),
+                        PreparedTableMutation::Delete { predicates, .. } => predicates.len(),
+                        PreparedTableMutation::Update { .. } => 1,
+                    };
+                    let operation_span = tracing::info_span!(
+                        "ducklake_batch_operation",
+                        operation_index,
+                        operation_kind,
+                        operation_rows,
+                    );
+                    let _entered = operation_span.enter();
+                    let started = Instant::now();
+                    debug!("ducklake batch operation started");
+                    let result = apply_table_mutation(
                         conn,
                         batch,
                         prepared_mutation,
                         &mut reusable_staging_table,
                         operation_context,
-                    )?;
+                    );
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    let batch_elapsed_ms = batch_started.elapsed().as_millis() as u64;
+                    if let Err(error) = &result {
+                        warn!(elapsed_ms, batch_elapsed_ms, error = %error,
+                            "ducklake batch operation failed");
+                    } else if elapsed_ms >= 1000 {
+                        info!(elapsed_ms, batch_elapsed_ms, "ducklake batch operation slow");
+                    } else {
+                        debug!(elapsed_ms, batch_elapsed_ms, "ducklake batch operation completed");
+                    }
+                    result?;
                 }
             }
             PreparedDuckLakeTableBatchAction::Truncate => {
@@ -2212,7 +2224,8 @@ fn apply_table_batch(
                 SUB_BATCH_KIND_LABEL => batch_log_kind(batch),
             )
             .record(prepared_mutation_count(batch) as f64);
-            trace!(
+            info!(
+                elapsed_ms = batch_started.elapsed().as_millis() as u64,
                 table = %batch.table_name,
                 batch_id = %batch.batch_id,
                 batch_kind = batch.batch_kind.as_str(),
@@ -2229,6 +2242,8 @@ fn apply_table_batch(
             Ok(())
         }
         Err(err) => {
+            warn!(elapsed_ms = batch_started.elapsed().as_millis() as u64,
+                error = %err, "ducklake atomic batch rolling back");
             let rollback = conn.execute_batch("ROLLBACK");
             reusable_staging_table.cleanup(conn);
             if let Err(err) = rollback {
@@ -2993,6 +3008,158 @@ mod tests {
         assert_eq!(error.description(), Some("DuckLake delete requires a replica identity"));
     }
 
+    /// Builds a backlog with repeated keys inside one source transaction.
+    fn replacement_backlog(count: u64) -> Vec<TrackedTableMutation> {
+        (0..count)
+            .map(|index| {
+                TrackedTableMutation::new(
+                    EventSequenceKey::new(PgLsn::from(100), index),
+                    TableMutation::Replace(TableRow::new(vec![
+                        Cell::I32(i32::try_from(index % 7).unwrap()),
+                        Cell::String(format!("version-{index}")),
+                    ])),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rewrite_budget_bounds_backlog_without_shrinking_insert_batches() {
+        let schema = make_replicated_schema();
+        let row_limit = std::num::NonZeroUsize::new(1024);
+        let budget = std::num::NonZeroUsize::new(16);
+        let prepare = |budget, mutations| {
+            prepare_mutation_table_batches(
+                row_limit,
+                budget,
+                &schema,
+                ducklake_table_name(),
+                LEGACY_REPLAY_EPOCH.to_owned(),
+                mutations,
+            )
+            .unwrap()
+        };
+        let original = prepare(None, replacement_backlog(764));
+        assert_eq!(original.len(), 1);
+        assert_eq!(prepared_mutation_count(&original[0]), 1528);
+        let bounded = prepare(budget, replacement_backlog(764));
+        assert_eq!(bounded.len(), 96);
+        assert!(bounded.iter().all(|batch| prepared_mutation_count(batch) <= 16));
+        for pair in bounded.windows(2) {
+            assert_eq!(
+                pair[0].last_sequence_key.unwrap().tx_ordinal + 1,
+                pair[1].first_sequence_key.unwrap().tx_ordinal
+            );
+        }
+        assert_eq!(bounded.last().unwrap().last_sequence_key.unwrap().tx_ordinal, 763);
+        let inserts = replacement_backlog(1024)
+            .into_iter()
+            .map(|mut tracked| {
+                let TableMutation::Replace(row) = tracked.mutation else { unreachable!() };
+                tracked.mutation = TableMutation::Insert(row);
+                tracked
+            })
+            .collect();
+        let inserts = prepare(budget, inserts);
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(prepared_mutation_count(&inserts[0]), 1);
+        assert_eq!(apply_sub_batch_rows(&inserts[0]), Some(1024));
+    }
+
+    #[test]
+    fn rewrite_budget_preserves_replay_and_rolls_back_only_failed_batch() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        attach_lake_catalog(&conn);
+        conn.execute_batch(
+            "create schema lake.public;
+             create table lake.public.users (id integer, name varchar);
+             create table lake.__etl_streaming_progress (
+                 table_name varchar, replay_epoch varchar, last_commit_lsn ubigint,
+                 last_tx_ordinal ubigint, updated_at timestamptz);",
+        )
+        .unwrap();
+        let schema = make_replicated_schema();
+        let batches = prepare_mutation_table_batches(
+            std::num::NonZeroUsize::new(1024),
+            std::num::NonZeroUsize::new(16),
+            &schema,
+            ducklake_table_name(),
+            LEGACY_REPLAY_EPOCH.to_owned(),
+            replacement_backlog(20),
+        )
+        .unwrap();
+        let context = DuckLakeBlockingOperationContext::for_tests();
+        apply_table_batches(&conn, &batches[..1], &context).unwrap();
+        let progress =
+            read_table_streaming_progress(&conn, &ducklake_table_name(), LEGACY_REPLAY_EPOCH)
+                .unwrap()
+                .unwrap();
+        assert_eq!(progress.last_sequence_key.tx_ordinal, 7);
+        // The second batch deletes first, then fails inserting a malformed row.
+        let mut failed = prepare_mutation_table_batches(
+            std::num::NonZeroUsize::new(1024),
+            std::num::NonZeroUsize::new(16),
+            &schema,
+            ducklake_table_name(),
+            LEGACY_REPLAY_EPOCH.to_owned(),
+            replacement_backlog(20),
+        )
+        .unwrap()
+        .remove(1);
+        let PreparedDuckLakeTableBatchAction::Mutation(operations) = &mut failed.action else {
+            unreachable!()
+        };
+        operations[1] = PreparedTableMutation::Upsert(prepare_rows(vec![TableRow::new(vec![
+            Cell::String("invalid-integer".to_owned()),
+            Cell::Null,
+        ])]));
+        assert!(apply_table_batches(&conn, &[failed], &context).is_err());
+        assert_eq!(
+            conn.query_row("select count(*) from lake.public.users", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            read_table_streaming_progress(&conn, &ducklake_table_name(), LEGACY_REPLAY_EPOCH)
+                .unwrap()
+                .unwrap()
+                .last_sequence_key
+                .tx_ordinal,
+            7
+        );
+        // Replaying the entire source transaction skips committed work and continues.
+        apply_table_batches(&conn, &batches, &context).unwrap();
+        apply_table_batches(&conn, &batches, &context).unwrap();
+        let rows = conn
+            .prepare("select id, name from lake.public.users order by id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (0, "version-14".to_owned()),
+                (1, "version-15".to_owned()),
+                (2, "version-16".to_owned()),
+                (3, "version-17".to_owned()),
+                (4, "version-18".to_owned()),
+                (5, "version-19".to_owned()),
+                (6, "version-13".to_owned())
+            ]
+        );
+        assert_eq!(
+            read_table_streaming_progress(&conn, &ducklake_table_name(), LEGACY_REPLAY_EPOCH)
+                .unwrap()
+                .unwrap()
+                .last_sequence_key
+                .tx_ordinal,
+            19
+        );
+    }
+
     #[test]
     fn prepare_table_mutations_replace_emits_delete_then_upsert() {
         let replicated_table_schema = make_replicated_schema();
@@ -3183,6 +3350,7 @@ mod tests {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
             None,
+            None,
             &replicated_table_schema,
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
@@ -3233,6 +3401,7 @@ mod tests {
     fn prepare_mutation_table_batches_split_mixed_cdc_at_delete_boundaries() {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
+            None,
             None,
             &replicated_table_schema,
             ducklake_table_name(),
@@ -3287,6 +3456,7 @@ mod tests {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
             None,
+            None,
             &replicated_table_schema,
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
@@ -3334,6 +3504,7 @@ mod tests {
     fn prepare_mutation_table_batches_group_contiguous_updates() {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
+            None,
             None,
             &replicated_table_schema,
             ducklake_table_name(),
@@ -3407,6 +3578,7 @@ mod tests {
                 .collect();
             let batches = prepare_mutation_table_batches(
                 configured_size,
+                None,
                 &replicated_table_schema,
                 ducklake_table_name(),
                 LEGACY_REPLAY_EPOCH.to_owned(),
@@ -3446,6 +3618,7 @@ mod tests {
     fn prepare_mutation_table_batches_isolate_update_in_its_own_atomic_batch() {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
+            None,
             None,
             &replicated_table_schema,
             ducklake_table_name(),

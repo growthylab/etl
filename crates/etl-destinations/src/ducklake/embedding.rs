@@ -20,4 +20,5 @@ pub(super) struct EmbeddingOptions {
     pub(super) connection_initializer: Option<ConnectionInitializer>,
     pub(super) table_name_mapper: Option<TableNameMapper>,
     pub(super) cdc_batch_size: Option<NonZeroUsize>,
+    pub(super) cdc_rewrite_budget: Option<NonZeroUsize>,
 }
