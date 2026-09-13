@@ -704,6 +704,20 @@ impl<S> DuckLakeDestinationBuilder<S> {
         self
     }
 
+    /// Uses a host-owned PostgreSQL pool for catalog metadata queries.
+    ///
+    /// The destination otherwise builds a one-connection pool from the catalog
+    /// URL. That pool can only present the credential embedded in the URL, so a
+    /// host that authenticates to the catalog with a rotating credential (an
+    /// RDS IAM token expires after fifteen minutes and every reconnect needs a
+    /// fresh one) passes its own pool and keeps that pool's connect options
+    /// current. The pool must reach the same catalog database and metadata
+    /// schema as the catalog URL, and it is shared across pool generations.
+    pub fn metadata_pg_pool(mut self, pool: PgPool) -> Self {
+        self.embedding.metadata_pg_pool = Some(pool);
+        self
+    }
+
     /// Maps newly discovered tables to their durable destination names.
     ///
     /// The mapping must be deterministic, injective under ASCII
@@ -2084,7 +2098,10 @@ where
             }
         };
         let metadata_schema = Arc::<str>::from(metadata_schema);
-        let metadata_pg_pool = build_ducklake_metadata_pg_pool(&catalog_url)?;
+        let metadata_pg_pool = match embedding.metadata_pg_pool.clone() {
+            Some(pool) => pool,
+            None => build_ducklake_metadata_pg_pool(&catalog_url)?,
+        };
         ensure_replay_epoch_table_exists(&metadata_pg_pool, metadata_schema.as_ref()).await?;
         let table_creation_slots = Arc::new(Semaphore::new(1));
         let applied_batches_table_created = Arc::new(AtomicBool::new(false));

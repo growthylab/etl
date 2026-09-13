@@ -20,4 +20,11 @@ pub(super) struct EmbeddingOptions {
     pub(super) streaming_batch: crate::ducklake::DuckLakeStreamingBatchConfig,
     pub(super) connection_initializer: Option<ConnectionInitializer>,
     pub(super) table_name_mapper: Option<TableNameMapper>,
+    /// Host-owned PostgreSQL pool for the catalog metadata queries.
+    ///
+    /// When absent the destination derives a pool from the catalog URL. A host
+    /// whose catalog credential rotates (for example an IAM auth token that
+    /// expires after fifteen minutes) supplies a pool whose connect options it
+    /// refreshes itself, because a URL can only ever carry one credential.
+    pub(super) metadata_pg_pool: Option<sqlx::PgPool>,
 }
