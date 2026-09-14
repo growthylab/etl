@@ -52,6 +52,7 @@ use crate::{
             PreparedRows, cell_to_sql_literal_ref, prepare_copy_rows, prepare_rows,
             table_row_to_sql_literal_ref,
         },
+        key_set::{DeleteKeySet, KeyComponent},
         metrics::{
             BATCH_KIND_LABEL, DELETE_ORIGIN_LABEL, ETL_DUCKLAKE_BATCH_COMMIT_DURATION_SECONDS,
             ETL_DUCKLAKE_BATCH_PREPARED_MUTATIONS, ETL_DUCKLAKE_DELETE_PREDICATES,
@@ -1184,30 +1185,12 @@ fn flush_full_row_writes(
     prepared: &mut Vec<PreparedTableMutation>,
     predicates: &mut Vec<String>,
     rows: &mut Vec<Option<TableRow>>,
-    keys: &mut Vec<String>,
-    schema: &ReplicatedTableSchema,
+    key_set: &mut DeleteKeySet,
     origin: &mut Option<&'static str>,
 ) {
     if !predicates.is_empty() {
         prepared.push(PreparedTableMutation::Delete {
-            key_set: Some(format!(
-                "USING (VALUES {}) AS cdc_keys({}) WHERE {}",
-                std::mem::take(keys).join(","),
-                schema
-                    .identity_column_schemas()
-                    .map(|c| quote_identifier(&DUCKLAKE_COLUMN_NAME_MAPPING.map_name(&c.name)))
-                    .collect::<Vec<_>>()
-                    .join(","),
-                schema
-                    .identity_column_schemas()
-                    .map(|c| {
-                        let name =
-                            quote_identifier(&DUCKLAKE_COLUMN_NAME_MAPPING.map_name(&c.name));
-                        format!("cdc_target.{name} IS NOT DISTINCT FROM cdc_keys.{name}")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" AND ")
-            )),
+            key_set: key_set.take_clause(),
             predicates: std::mem::take(predicates),
             origin: origin.take().unwrap_or("mixed"),
         });
@@ -1252,7 +1235,7 @@ fn prepare_table_mutations(
     let mut predicates = Vec::new();
     let mut rows: Vec<Option<TableRow>> = Vec::new();
     let mut origin = None;
-    let mut keys = Vec::new();
+    let mut key_set = DeleteKeySet::new(schema);
     let mut deleted = HashSet::new();
     let mut positions: HashMap<String, Vec<usize>> = HashMap::new();
     for mutation in mutations {
@@ -1261,10 +1244,7 @@ fn prepare_table_mutations(
             TableMutation::Delete(old) => (
                 Some((
                     delete_predicate_from_row(schema, &old)?,
-                    delete_key_values(schema, &old)?
-                        .into_iter()
-                        .map(|(_, cell)| cell_to_sql_literal_ref(cell))
-                        .collect::<Vec<_>>(),
+                    delete_key_components(schema, &old)?,
                     "delete",
                 )),
                 None,
@@ -1272,10 +1252,7 @@ fn prepare_table_mutations(
             TableMutation::Replace(row) => (
                 Some((
                     delete_predicate_from_row(schema, &row)?,
-                    delete_key_values(schema, &row)?
-                        .into_iter()
-                        .map(|(_, cell)| cell_to_sql_literal_ref(cell))
-                        .collect::<Vec<_>>(),
+                    delete_key_components(schema, &row)?,
                     "replace",
                 )),
                 Some(row),
@@ -1283,10 +1260,7 @@ fn prepare_table_mutations(
             TableMutation::Update { delete_row, new_row: UpdatedTableRow::Full(row) } => (
                 Some((
                     delete_predicate_from_row(schema, &delete_row)?,
-                    delete_key_values(schema, &delete_row)?
-                        .into_iter()
-                        .map(|(_, cell)| cell_to_sql_literal_ref(cell))
-                        .collect::<Vec<_>>(),
+                    delete_key_components(schema, &delete_row)?,
                     "update",
                 )),
                 Some(row),
@@ -1331,8 +1305,7 @@ fn prepare_table_mutations(
                     &mut prepared,
                     &mut predicates,
                     &mut rows,
-                    &mut keys,
-                    schema,
+                    &mut key_set,
                     &mut origin,
                 );
                 positions.clear();
@@ -1349,7 +1322,7 @@ fn prepare_table_mutations(
             }
             if deleted.insert(predicate.clone()) {
                 predicates.push(predicate);
-                keys.push(format!("({})", key.join(",")));
+                key_set.push(&key);
             }
             origin = Some(match origin {
                 None => delete_origin,
@@ -1362,14 +1335,7 @@ fn prepare_table_mutations(
             rows.push(Some(row));
         }
     }
-    flush_full_row_writes(
-        &mut prepared,
-        &mut predicates,
-        &mut rows,
-        &mut keys,
-        schema,
-        &mut origin,
-    );
+    flush_full_row_writes(&mut prepared, &mut predicates, &mut rows, &mut key_set, &mut origin);
     Ok(prepared)
 }
 
@@ -1558,6 +1524,21 @@ fn delete_key_values<'a>(
     };
 
     Ok(key_values)
+}
+
+/// Builds the key-set components of one identity from a row.
+///
+/// The SQL literal is generated once and reused for both the `VALUES` key list
+/// and any range bound derived from it, so a bound never re-parses a rendered
+/// literal.
+fn delete_key_components<'a>(
+    replicated_table_schema: &'a ReplicatedTableSchema,
+    row: impl Into<DeletePredicateRowRef<'a>>,
+) -> EtlResult<Vec<KeyComponent>> {
+    Ok(delete_key_values(replicated_table_schema, row)?
+        .into_iter()
+        .map(|(_, cell)| KeyComponent::from_cell(cell, cell_to_sql_literal_ref(cell)))
+        .collect())
 }
 
 /// Builds a predicate with PostgreSQL identity NULL semantics.
