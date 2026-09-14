@@ -9,6 +9,7 @@ mod external_maintenance;
 mod inline_size;
 mod key_set;
 mod metrics;
+mod partial_update;
 mod replay_epoch;
 mod schema;
 mod sql;

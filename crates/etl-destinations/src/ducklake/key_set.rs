@@ -172,6 +172,30 @@ impl DeleteKeySet {
     /// Returns [`None`] when no key was pushed. The key set is reset so the
     /// same accumulator serves the next run of full-row writes.
     pub(super) fn take_clause(&mut self) -> Option<String> {
+        let (keys, predicates) = self.take_parts()?;
+
+        Some(format!(
+            "USING (VALUES {keys}) AS cdc_keys({}) WHERE {predicates}",
+            self.identity_columns.join(",")
+        ))
+    }
+
+    /// Takes the accumulated key set as a `SELECT` join clause.
+    ///
+    /// The clause carries the same `VALUES` list, null-safe join and range
+    /// predicates as [`DeleteKeySet::take_clause`], so a read over the key set
+    /// prunes data files exactly like the batched delete does.
+    pub(super) fn take_join_clause(&mut self) -> Option<String> {
+        let (keys, predicates) = self.take_parts()?;
+
+        Some(format!(
+            ", (VALUES {keys}) AS cdc_keys({}) WHERE {predicates}",
+            self.identity_columns.join(",")
+        ))
+    }
+
+    /// Takes the rendered key list and predicates, resetting the accumulator.
+    fn take_parts(&mut self) -> Option<(String, String)> {
         if self.keys.is_empty() {
             return None;
         }
@@ -192,12 +216,7 @@ impl DeleteKeySet {
             }
         }
 
-        Some(format!(
-            "USING (VALUES {}) AS cdc_keys({}) WHERE {}",
-            keys.join(","),
-            self.identity_columns.join(","),
-            predicates.join(" AND ")
-        ))
+        Some((keys.join(","), predicates.join(" AND ")))
     }
 }
 

@@ -55,9 +55,9 @@ use crate::{
         batches::{
             DuckLakeCopyAccumulator, PreparedDuckLakeCopyBatch, TableMutation,
             TrackedTableMutation, TrackedTruncateEvent, apply_table_batch_with_retry,
-            apply_table_batches_with_retry, ensure_applied_batches_table_exists,
-            ensure_streaming_progress_table_exists, prepare_copy_complete_table_batch,
-            prepare_copy_table_batch, prepare_mutation_table_batches, prepare_truncate_table_batch,
+            ensure_applied_batches_table_exists, ensure_streaming_progress_table_exists,
+            prepare_and_apply_mutation_table_batches, prepare_copy_complete_table_batch,
+            prepare_copy_table_batch, prepare_truncate_table_batch,
             read_table_streaming_progress_sequence_key, retain_mutations_after_sequence_key,
             retain_truncates_after_sequence_key,
         },
@@ -3444,17 +3444,14 @@ where
                                 "ducklake applying streaming mutations"
                             );
 
-                            let prepared_batches = prepare_mutation_table_batches(
+                            prepare_and_apply_mutation_table_batches(
+                                destination.streaming_pool()?,
+                                Arc::clone(&destination.blocking_slots),
                                 destination.embedding.streaming_batch,
                                 &segment.replicated_table_schema,
                                 destination_table_name.clone(),
                                 replay_epoch,
                                 pending_mutations,
-                            )?;
-                            apply_table_batches_with_retry(
-                                destination.streaming_pool()?,
-                                Arc::clone(&destination.blocking_slots),
-                                prepared_batches,
                             )
                             .await?;
                             info!(
