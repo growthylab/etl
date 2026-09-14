@@ -7,6 +7,7 @@ mod embedding;
 mod encoding;
 mod external_maintenance;
 mod inline_size;
+mod key_set;
 mod metrics;
 mod replay_epoch;
 mod schema;
