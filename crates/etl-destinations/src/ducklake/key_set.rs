@@ -418,8 +418,8 @@ mod tests {
     /// Proves the range predicates let DuckLake skip data files.
     ///
     /// The table is written in [`PRUNING_PROOF_FILES`] separate commits with
-    /// disjoint, time-ordered UUIDv7 key ranges, which is the shape of the
-    /// Laplace trace table that stalled in production. `EXPLAIN ANALYZE`
+    /// disjoint, time-ordered UUIDv7 key ranges, the shape of a heavily
+    /// updated CDC table with a UUIDv7 key. `EXPLAIN ANALYZE`
     /// reports `Total Files Read` on the DuckLake table scan; that count is the
     /// deterministic pruning signal asserted here. Without the range predicates
     /// the join against the `VALUES` key list reads every file, which is the
