@@ -19,7 +19,7 @@ use std::{
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use duckdb::types::{TimeUnit, Value};
 use etl::{
-    data::{ArrayCell, Cell, PgNumeric, PgTimeTz},
+    data::{ArrayCell, Cell, PgNumeric, PgTimeTz, SizeHint, TableRow},
     error::{ErrorKind, EtlResult},
     etl_error,
     schema::{ColumnSchema, ReplicatedTableSchema, Type, is_array_type},
@@ -40,6 +40,12 @@ use crate::ducklake::{
 /// `VALUES` list from growing with an unusually large cap. No state outlives
 /// the request.
 const RECOVERY_KEY_BATCH_SIZE: usize = 1024;
+/// Identities read by the first statement of one recovery.
+///
+/// The first statement only measures: one identity is enough to size every
+/// later statement from observed bytes, and a request whose stored rows turn
+/// out to be large then overshoots its byte budget by at most one row.
+const RECOVERY_PROBE_KEY_BATCH_SIZE: usize = 1;
 
 /// Builds the identity predicate shared by deletes and recovered rows.
 ///
@@ -68,6 +74,11 @@ pub(super) struct PartialUpdateRecoveryKey {
     pub(super) predicate: String,
     /// Key-set components of the same identity.
     pub(super) components: Vec<KeyComponent>,
+    /// Index of the first mutation in the batch that needs this identity.
+    ///
+    /// A read that stops at its byte budget leaves the events from this index
+    /// on for the next batch, which reads again after this one commits.
+    pub(super) mutation_index: usize,
 }
 
 /// The single read that completes every coalesced partial update of a batch.
@@ -76,13 +87,19 @@ pub(super) struct PartialUpdateRecoveryRequest {
     keys: Vec<PartialUpdateRecoveryKey>,
     /// Replicated-column indexes missing from at least one partial row.
     columns: Vec<usize>,
+    /// Recovered bytes after which the read stops covering more identities.
+    max_recovered_bytes: usize,
 }
 
 impl PartialUpdateRecoveryRequest {
-    /// Creates a request from identities and the union of their missing
-    /// columns.
-    pub(super) fn new(keys: Vec<PartialUpdateRecoveryKey>, columns: BTreeSet<usize>) -> Self {
-        Self { keys, columns: columns.into_iter().collect() }
+    /// Creates a request from identities, the union of their missing columns,
+    /// and the byte budget the recovered values may add to one batch.
+    pub(super) fn new(
+        keys: Vec<PartialUpdateRecoveryKey>,
+        columns: BTreeSet<usize>,
+        max_recovered_bytes: usize,
+    ) -> Self {
+        Self { keys, columns: columns.into_iter().collect(), max_recovered_bytes }
     }
 
     /// Returns the identities to read.
@@ -103,14 +120,14 @@ impl PartialUpdateRecoveryRequest {
 
 /// Stored rows read back for one recovery request.
 ///
-/// A requested identity always has an entry, so an empty entry means the row
-/// is absent from storage rather than unrequested.
+/// A covered identity always has an entry, so an empty entry means the row is
+/// absent from storage rather than uncovered.
 #[derive(Debug, Default)]
 pub(super) struct RecoveredPartialRows {
     /// Replicated-column indexes each stored row carries, in ascending order.
     columns: Vec<usize>,
-    /// Stored values per requested identity predicate.
-    rows: HashMap<String, Vec<Vec<Cell>>>,
+    /// Stored values per covered identity predicate.
+    rows: HashMap<String, Vec<TableRow>>,
 }
 
 impl RecoveredPartialRows {
@@ -119,15 +136,9 @@ impl RecoveredPartialRows {
         Self::default()
     }
 
-    /// Creates a result for the columns of one request.
-    pub(super) fn for_request(request: &PartialUpdateRecoveryRequest) -> Self {
-        let rows = request
-            .keys()
-            .iter()
-            .map(|key| (key.predicate.clone(), Vec::new()))
-            .collect::<HashMap<_, _>>();
-
-        Self { columns: request.columns().to_vec(), rows }
+    /// Creates an empty result for the columns of one request.
+    fn for_request(request: &PartialUpdateRecoveryRequest) -> Self {
+        Self { columns: request.columns().to_vec(), rows: HashMap::new() }
     }
 
     /// Returns the replicated-column indexes each stored row carries.
@@ -136,8 +147,8 @@ impl RecoveredPartialRows {
     }
 
     /// Returns the stored rows of one identity, or [`None`] when the identity
-    /// was never requested.
-    pub(super) fn rows_for(&self, predicate: &str) -> Option<&[Vec<Cell>]> {
+    /// is not covered by the read.
+    pub(super) fn rows_for(&self, predicate: &str) -> Option<&[TableRow]> {
         self.rows.get(predicate).map(Vec::as_slice)
     }
 
@@ -150,18 +161,38 @@ impl RecoveredPartialRows {
         self.rows.clear();
     }
 
-    /// Records one stored row for an identity that was requested.
-    fn push(&mut self, predicate: &str, values: Vec<Cell>) {
+    /// Marks one identity as covered by the read.
+    fn cover(&mut self, predicate: &str) {
+        self.rows.entry(predicate.to_owned()).or_default();
+    }
+
+    /// Records one stored row for an identity that is covered.
+    fn push(&mut self, predicate: &str, row: TableRow) {
         if let Some(rows) = self.rows.get_mut(predicate) {
-            rows.push(values);
+            rows.push(row);
         }
     }
 }
 
+/// Result of one recovery read.
+#[derive(Debug)]
+pub(super) struct PartialUpdateRecoveryOutcome {
+    /// Stored rows for the identities the read covered.
+    pub(super) recovered: RecoveredPartialRows,
+    /// Number of leading requested identities the read covered.
+    ///
+    /// A read stops early only when the recovered values reach the request's
+    /// byte budget, so the uncovered identities are always a suffix.
+    pub(super) covered_keys: usize,
+}
+
 /// Reads the stored values a batch of partial updates leaves out.
 pub(super) trait PartialUpdateRecovery {
-    /// Returns the stored rows for every requested identity.
-    fn recover(&self, request: &PartialUpdateRecoveryRequest) -> EtlResult<RecoveredPartialRows>;
+    /// Returns the stored rows for the identities the read covers.
+    fn recover(
+        &self,
+        request: &PartialUpdateRecoveryRequest,
+    ) -> EtlResult<PartialUpdateRecoveryOutcome>;
 }
 
 /// Reports every requested identity as absent from storage.
@@ -173,8 +204,16 @@ pub(super) struct AbsentStoredRows;
 
 #[cfg(test)]
 impl PartialUpdateRecovery for AbsentStoredRows {
-    fn recover(&self, request: &PartialUpdateRecoveryRequest) -> EtlResult<RecoveredPartialRows> {
-        Ok(RecoveredPartialRows::for_request(request))
+    fn recover(
+        &self,
+        request: &PartialUpdateRecoveryRequest,
+    ) -> EtlResult<PartialUpdateRecoveryOutcome> {
+        let mut recovered = RecoveredPartialRows::for_request(request);
+        for key in request.keys() {
+            recovered.cover(&key.predicate);
+        }
+
+        Ok(PartialUpdateRecoveryOutcome { recovered, covered_keys: request.keys().len() })
     }
 }
 
@@ -196,19 +235,22 @@ impl<'a> StoredRowRecovery<'a> {
     }
 
     /// Reads one chunk of identities into `recovered`.
+    ///
+    /// Returns the recovered bytes this chunk added.
     fn recover_chunk(
         &self,
         keys: &[PartialUpdateRecoveryKey],
         identity_columns: &[&ColumnSchema],
         recovered_columns: &[&ColumnSchema],
         recovered: &mut RecoveredPartialRows,
-    ) -> EtlResult<()> {
+    ) -> EtlResult<usize> {
         let mut key_set = DeleteKeySet::new(self.replicated_table_schema);
         for key in keys {
             key_set.push(&key.components);
+            recovered.cover(&key.predicate);
         }
         let Some(join_clause) = key_set.take_join_clause() else {
-            return Ok(());
+            return Ok(0);
         };
 
         let select_list = identity_columns
@@ -237,6 +279,7 @@ impl<'a> StoredRowRecovery<'a> {
                 source: source
             )
         })?;
+        let mut recovered_bytes = 0usize;
         while let Some(row) = rows.next().map_err(|source| {
             etl_error!(
                 ErrorKind::DestinationQueryFailed,
@@ -257,20 +300,24 @@ impl<'a> StoredRowRecovery<'a> {
                 })?;
                 cells.push(value_to_cell(&column.typ, value)?);
             }
-            let recovered_values = cells.split_off(identity_columns.len());
+            let recovered_row = TableRow::new(cells.split_off(identity_columns.len()));
+            recovered_bytes = recovered_bytes.saturating_add(recovered_row.size_hint());
             let predicate = identity_predicate(identity_columns.iter().copied().zip(cells.iter()));
-            recovered.push(&predicate, recovered_values);
+            recovered.push(&predicate, recovered_row);
         }
 
-        Ok(())
+        Ok(recovered_bytes)
     }
 }
 
 impl PartialUpdateRecovery for StoredRowRecovery<'_> {
-    fn recover(&self, request: &PartialUpdateRecoveryRequest) -> EtlResult<RecoveredPartialRows> {
+    fn recover(
+        &self,
+        request: &PartialUpdateRecoveryRequest,
+    ) -> EtlResult<PartialUpdateRecoveryOutcome> {
         let mut recovered = RecoveredPartialRows::for_request(request);
         if request.is_empty() {
-            return Ok(recovered);
+            return Ok(PartialUpdateRecoveryOutcome { recovered, covered_keys: 0 });
         }
 
         let started = Instant::now();
@@ -294,20 +341,63 @@ impl PartialUpdateRecovery for StoredRowRecovery<'_> {
             recovered_columns.push(*column);
         }
 
-        for chunk in request.keys().chunks(RECOVERY_KEY_BATCH_SIZE) {
-            self.recover_chunk(chunk, &identity_columns, &recovered_columns, &mut recovered)?;
+        // Recovered values are far larger than the partial events that need
+        // them, so the read stops once it has filled the batch's byte budget
+        // and leaves the remaining identities to the next batch. Chunk sizes
+        // follow the bytes per identity the read has already observed, so the
+        // budget is overshot by at most one chunk.
+        let keys = request.keys();
+        let mut covered_keys = 0usize;
+        let mut recovered_bytes = 0usize;
+        while covered_keys < keys.len() {
+            let chunk_size = next_recovery_chunk_size(
+                request.max_recovered_bytes.saturating_sub(recovered_bytes),
+                covered_keys,
+                recovered_bytes,
+            );
+            let chunk_end = keys.len().min(covered_keys.saturating_add(chunk_size));
+            recovered_bytes = recovered_bytes.saturating_add(self.recover_chunk(
+                &keys[covered_keys..chunk_end],
+                &identity_columns,
+                &recovered_columns,
+                &mut recovered,
+            )?);
+            covered_keys = chunk_end;
+            if recovered_bytes >= request.max_recovered_bytes {
+                break;
+            }
         }
 
         info!(
             table = %self.table_name,
-            keys = request.keys().len(),
+            keys = covered_keys,
+            requested_keys = keys.len(),
             recovered_columns = recovered_columns.len(),
+            recovered_bytes,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "ducklake recovered partial update columns"
         );
 
-        Ok(recovered)
+        Ok(PartialUpdateRecoveryOutcome { recovered, covered_keys })
     }
+}
+
+/// Returns how many further identities one read statement may cover.
+///
+/// The first statement probes with a small chunk; later ones extrapolate the
+/// remaining budget from the bytes per identity observed so far.
+fn next_recovery_chunk_size(
+    remaining_bytes: usize,
+    covered_keys: usize,
+    recovered_bytes: usize,
+) -> usize {
+    if covered_keys == 0 || recovered_bytes == 0 {
+        return RECOVERY_PROBE_KEY_BATCH_SIZE;
+    }
+
+    let bytes_per_key = recovered_bytes.div_ceil(covered_keys);
+
+    (remaining_bytes / bytes_per_key).clamp(1, RECOVERY_KEY_BATCH_SIZE)
 }
 
 /// Returns the `SELECT` expression that reads one column back.
@@ -654,14 +744,16 @@ mod tests {
                     schema.identity_column_schemas().zip(std::iter::once(&key)),
                 ),
                 components: vec![KeyComponent::from_cell(&key, cell_to_sql_literal_ref(&key))],
+                mutation_index: 0,
             }],
             BTreeSet::from([1]),
+            usize::MAX,
         );
-        let recovered = recovery.recover(&request).unwrap();
-        let rows = recovered.rows_for("\"id\" = 1").expect("the identity was requested");
+        let outcome = recovery.recover(&request).unwrap();
+        let rows = outcome.recovered.rows_for("\"id\" = 1").expect("the identity was covered");
 
         assert_eq!(rows.len(), 1);
-        rows[0][0].clone()
+        rows[0].values()[0].clone()
     }
 
     #[test]
@@ -750,13 +842,16 @@ mod tests {
                     schema.identity_column_schemas().zip(std::iter::once(&key)),
                 ),
                 components: vec![KeyComponent::from_cell(&key, cell_to_sql_literal_ref(&key))],
+                mutation_index: 0,
             }],
             BTreeSet::from([1]),
+            usize::MAX,
         );
 
-        let recovered = AbsentStoredRows.recover(&request).unwrap();
+        let outcome = AbsentStoredRows.recover(&request).unwrap();
 
-        assert_eq!(recovered.rows_for("\"id\" = 1"), Some([].as_slice()));
-        assert_eq!(recovered.rows_for("\"id\" = 2"), None);
+        assert_eq!(outcome.covered_keys, 1);
+        assert_eq!(outcome.recovered.rows_for("\"id\" = 1"), Some([].as_slice()));
+        assert_eq!(outcome.recovered.rows_for("\"id\" = 2"), None);
     }
 }
