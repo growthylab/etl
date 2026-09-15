@@ -32,11 +32,10 @@ pub enum DestinationWriteStatus {
     /// [`crate::destination::Destination::write_events`], ETL does not advance
     /// the batch's commit end LSN. It carries that LSN into the next streaming
     /// write and advances the last flush LSN only when a later cumulative
-    /// [`DestinationWriteStatus::Durable`] result covers it. If no later write
-    /// is dispatched before shutdown, ETL normally leaves progress at the last
-    /// persisted checkpoint so restart can replay the accepted write. A
-    /// terminal table-sync catchup may instead issue an empty
-    /// [`WriteEventsDurability::RequireDurable`] write to settle this debt.
+    /// [`DestinationWriteStatus::Durable`] result covers it. An idle accepted
+    /// tail requests an empty [`WriteEventsDurability::RequireDurable`] barrier
+    /// after the batch fill interval. Shutdown before confirmation leaves the
+    /// persisted checkpoint available for replay.
     ///
     /// For table-copy writes through
     /// [`crate::destination::Destination::write_table_rows`], ETL may request

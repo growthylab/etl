@@ -1104,7 +1104,9 @@ impl ApplyLoopState {
     /// Returns `true` when the batch deadline timer may still trigger a flush
     /// for buffered work.
     fn can_wait_for_deadline(&self) -> bool {
-        !self.processing_paused && self.has_pending_batch()
+        !self.processing_paused
+            && (self.has_pending_batch()
+                || (self.pending_durability_interval.is_some() && !self.has_pending_flush_result()))
     }
 
     /// Marks the current pending batch as paused behind an in-flight flush.
@@ -2007,6 +2009,7 @@ where
                     }
 
                     self.state.update_last_commit_end_lsn(metadata.commit_end_lsn);
+                    self.state.set_flush_deadline_if_needed(self.max_batch_fill_duration);
                 }
                 DestinationWriteStatus::Durable => {
                     // A durable result also confirms every earlier accepted
@@ -2087,16 +2090,6 @@ where
         // If processing was paused, there must be a queued batch that still needs to be
         // flushed now that the previous in-flight result has resolved.
         if processing_paused {
-            if let Some(metadata) = metadata.as_ref() {
-                // A required-durability write is terminal, so `Complete` must have
-                // stopped intake before a successor batch could be queued behind it.
-                debug_assert_ne!(
-                    metadata.durability,
-                    WriteEventsDurability::RequireDurable,
-                    "required-durability write must not have a queued successor batch"
-                );
-            }
-
             self.flush_batch("pending flush result received").await?;
         }
 
@@ -2214,8 +2207,14 @@ where
     /// processed. The queued batch is then retried from
     /// [`Self::handle_flush_result`] when that in-flight flush resolves.
     async fn flush_batch(&mut self, reason: &str) -> EtlResult<()> {
-        // If the batch is empty, we don't need to do anything.
+        // An idle Accepted tail still owes cumulative durability. Use the same
+        // bounded fill interval to request a barrier even without another event.
         if !self.state.has_pending_batch() {
+            if self.state.pending_durability_interval.is_some()
+                && !self.state.has_pending_flush_result()
+            {
+                self.dispatch_write_events(EventBatch::default(), reason).await?;
+            }
             return Ok(());
         }
 
@@ -2250,10 +2249,12 @@ where
         // `Complete` is terminal, so no later write is guaranteed to settle an
         // `Accepted` result. Its final batch must confirm cumulative durability
         // before the apply loop can complete.
-        let durability = match self.state.exit_intent {
-            Some(ExitIntent::Complete) => WriteEventsDurability::RequireDurable,
-            Some(ExitIntent::Pause) | None => WriteEventsDurability::MayDefer,
-        };
+        let durability =
+            if event_count == 0 || matches!(self.state.exit_intent, Some(ExitIntent::Complete)) {
+                WriteEventsDurability::RequireDurable
+            } else {
+                WriteEventsDurability::MayDefer
+            };
         debug!(
             worker_type = %self.worker_context.worker_type(),
             event_count,
@@ -4656,6 +4657,38 @@ mod tests {
             ReplicationMask::from_bytes(vec![1]),
             IdentityMask::from_bytes(vec![1]),
         )
+    }
+
+    #[test]
+    fn idle_accepted_tail_arms_a_barrier_without_busy_polling() {
+        let lsn = PgLsn::from(0);
+        let mut state = ApplyLoopState::new(
+            ReplicationProgress::new(lsn),
+            ReplicationLagMetrics::new(lsn),
+            Duration::from_secs(60),
+            SnapshotId::initial(),
+            "idle_test".to_owned(),
+        );
+        assert!(!state.can_wait_for_deadline());
+        let now = Instant::now();
+        state.pending_durability_interval =
+            Some(PendingDurabilityInterval { dispatched_at: now, accepted_at: now });
+        state.set_flush_deadline_if_needed(Duration::from_millis(200));
+        assert!(state.can_wait_for_deadline());
+        assert!(state.flush_deadline.unwrap() >= now + Duration::from_millis(200));
+        let (_, pending) = WriteEventsResult::new(ApplyLoopAsyncResultMetadata {
+            commit_end_lsn: None,
+            durability: WriteEventsDurability::RequireDurable,
+            event_count: 0,
+            relation_table_ids: HashSet::new(),
+            streaming_payload_metadata: StreamingPayloadMetadata::default(),
+            dispatched_at: now,
+        });
+        state.pending_flush_result = Some(pending);
+        assert!(!state.can_wait_for_deadline());
+        state.pending_flush_result = None;
+        state.pending_durability_interval = None;
+        assert!(!state.can_wait_for_deadline());
     }
 
     #[test]

@@ -183,11 +183,10 @@ pub trait Destination {
     /// cumulative: it must mean that later write and all earlier `Accepted`
     /// writes in the same apply-loop stream are durable.
     ///
-    /// If no later streaming write is dispatched before shutdown, ETL normally
-    /// exits without checkpointing accepted-but-not-durable work. Restart then
-    /// replays from the last persisted checkpoint. A terminal table-sync
-    /// catchup may issue the empty required-durability barrier described above
-    /// instead.
+    /// An idle accepted tail triggers an empty required-durability barrier
+    /// after the batch fill interval, so checkpoints and table discovery
+    /// can advance without more source traffic. Shutdown before
+    /// confirmation still replays from the last persisted checkpoint.
     ///
     /// Async implementations that offload work should coordinate `async_result`
     /// with [`Destination::shutdown`]. ETL calls [`Destination::shutdown`]
