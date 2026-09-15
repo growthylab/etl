@@ -666,6 +666,7 @@ pub(super) async fn prepare_and_apply_mutation_table_batches(
     info!(table = %table_name, batch_count = pending_chunks.len(),
         "ducklake table batches prepared");
 
+    let mut known_progress = None;
     while let Some(mut chunk) = pending_chunks.pop_front() {
         let mut recovered = RecoveredPartialRows::empty();
         if has_canonical_identity(replicated_table_schema) {
@@ -710,7 +711,13 @@ pub(super) async fn prepare_and_apply_mutation_table_batches(
         let Some(batch) = prepared_batches.pop() else {
             continue;
         };
-        apply_table_batch_with_retry(Arc::clone(&pool), Arc::clone(&blocking_slots), batch).await?;
+        known_progress = apply_table_batch_with_progress_retry(
+            Arc::clone(&pool),
+            Arc::clone(&blocking_slots),
+            batch,
+            known_progress,
+        )
+        .await?;
     }
 
     Ok(())
@@ -827,6 +834,18 @@ pub(super) async fn apply_table_batch_with_retry(
     blocking_slots: Arc<Semaphore>,
     batch: PreparedDuckLakeTableBatch,
 ) -> EtlResult<()> {
+    apply_table_batch_with_progress_retry(pool, blocking_slots, batch, None).await.map(|_| ())
+}
+
+/// Reuse a cursor only within the caller's held table slot, after a confirmed
+/// successful attempt. Every retry rereads durable progress (ambiguous COMMIT).
+async fn apply_table_batch_with_progress_retry(
+    pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
+    blocking_slots: Arc<Semaphore>,
+    batch: PreparedDuckLakeTableBatch,
+    known_progress: Option<TableStreamingProgress>,
+) -> EtlResult<Option<TableStreamingProgress>> {
+    let first_attempt = AtomicBool::new(true);
     let table_name = batch.table_name.clone();
     let batch_id = batch.batch_id.clone();
     let batch_kind = batch.batch_kind;
@@ -859,6 +878,8 @@ pub(super) async fn apply_table_batch_with_retry(
             );
         },
         move || {
+            let known_progress =
+                first_attempt.swap(false, Ordering::Relaxed).then_some(known_progress).flatten();
             let attempt_batch = Arc::clone(&batch);
             let pool = Arc::clone(&pool);
             let blocking_slots = Arc::clone(&blocking_slots);
@@ -867,19 +888,23 @@ pub(super) async fn apply_table_batch_with_retry(
                     if batch_kind == DuckLakeTableBatchKind::Copy {
                         if applied_batch_marker_exists(conn, attempt_batch.as_ref())? {
                             record_replayed_batch_skip(attempt_batch.as_ref());
-                            return Ok(());
+                            return Ok(None);
                         }
 
                         apply_table_batch(conn, attempt_batch.as_ref(), context)?;
-                        return Ok(());
+                        return Ok(None);
                     }
 
-                    apply_table_batches(
-                        conn,
-                        std::slice::from_ref(attempt_batch.as_ref()),
-                        context,
-                    )?;
-                    Ok(())
+                    let batches = std::slice::from_ref(attempt_batch.as_ref());
+                    match known_progress {
+                        Some(progress) => apply_table_batches_with_progress(
+                            conn,
+                            batches,
+                            context,
+                            Some(progress),
+                        ),
+                        None => apply_table_batches(conn, batches, context),
+                    }
                 })
                 .await
             }
@@ -1092,6 +1117,7 @@ fn read_table_streaming_progress(
     table_name: &DuckLakeTableName,
     replay_epoch: &str,
 ) -> EtlResult<Option<TableStreamingProgress>> {
+    let lookup_started = Instant::now();
     let table_id = table_name.id();
     let sql = format!(
         r#"SELECT last_commit_lsn, last_tx_ordinal
@@ -1120,15 +1146,17 @@ fn read_table_streaming_progress(
         )
     })?;
 
-    let Some(row) = rows.next().map_err(|err| {
+    let row = rows.next().map_err(|err| {
         etl_error!(
             ErrorKind::DestinationQueryFailed,
             "DuckLake streaming progress row fetch failed",
             format_query_error_detail(&sql),
             source: err
         )
-    })?
-    else {
+    })?;
+    info!(table = %table_name, progress_lookup_elapsed_ms = lookup_started.elapsed().as_millis() as u64,
+        "ducklake streaming progress read");
+    let Some(row) = row else {
         return Ok(None);
     };
 
@@ -1255,13 +1283,29 @@ fn apply_table_batches(
     conn: &duckdb::Connection,
     batches: &[PreparedDuckLakeTableBatch],
     operation_context: &DuckLakeBlockingOperationContext,
-) -> EtlResult<()> {
+) -> EtlResult<Option<TableStreamingProgress>> {
+    apply_table_batches_with_progress(conn, batches, operation_context, None)
+}
+
+fn apply_table_batches_with_progress(
+    conn: &duckdb::Connection,
+    batches: &[PreparedDuckLakeTableBatch],
+    operation_context: &DuckLakeBlockingOperationContext,
+    known_progress: Option<TableStreamingProgress>,
+) -> EtlResult<Option<TableStreamingProgress>> {
     if batches.is_empty() {
-        return Ok(());
+        return Ok(known_progress);
     }
 
     let mut streaming_progress = if batches[0].uses_streaming_progress() {
-        read_table_streaming_progress(conn, batches[0].table_name(), &batches[0].replay_epoch)?
+        match known_progress {
+            Some(progress) => Some(progress),
+            None => read_table_streaming_progress(
+                conn,
+                batches[0].table_name(),
+                &batches[0].replay_epoch,
+            )?,
+        }
     } else {
         None
     };
@@ -1320,7 +1364,7 @@ fn apply_table_batches(
             .map(|last_sequence_key| TableStreamingProgress { last_sequence_key });
     }
 
-    Ok(())
+    Ok(streaming_progress)
 }
 
 /// Builds one prepared atomic batch from an ordered slice of tracked mutations.
@@ -2356,8 +2400,16 @@ impl ReusableStagingTable {
         conn: &duckdb::Connection,
         prepared_rows: &PreparedRows,
     ) -> EtlResult<()> {
+        let started = Instant::now();
         self.prepare(conn)?;
+        let staging_prepare_elapsed_ms = started.elapsed().as_millis() as u64;
+        let started = Instant::now();
         self.load_rows(conn, prepared_rows)?;
+        info!(
+            staging_prepare_elapsed_ms,
+            staging_load_elapsed_ms = started.elapsed().as_millis() as u64,
+            "ducklake staging loaded"
+        );
         self.insert_staged_rows(conn)
     }
 
@@ -2799,8 +2851,9 @@ fn apply_table_batch(
                 elapsed_ms = batch_started.elapsed().as_millis() as u64,
                 "ducklake batch committing"
             );
+            let commit_started = Instant::now();
             conn.execute_batch("COMMIT").map_err(|error| {
-                tracing::error!(error = %query_log_detail(&error), "error commit");
+                tracing::error!(error = %query_log_detail(&error), commit_elapsed_ms = commit_started.elapsed().as_millis() as u64, "error commit");
                 reusable_staging_table.cleanup(conn);
                 etl_error!(
                     ErrorKind::DestinationQueryFailed,
@@ -2808,7 +2861,10 @@ fn apply_table_batch(
                     source: error
                 )
             })?;
+            let commit_elapsed_ms = commit_started.elapsed().as_millis() as u64;
+            let cleanup_started = Instant::now();
             reusable_staging_table.cleanup(conn);
+            let staging_cleanup_elapsed_ms = cleanup_started.elapsed().as_millis() as u64;
             histogram!(
                 ETL_DUCKLAKE_BATCH_COMMIT_DURATION_SECONDS,
                 BATCH_KIND_LABEL => batch.batch_kind.as_str(),
@@ -2830,6 +2886,8 @@ fn apply_table_batch(
                 last_commit_lsn = %format_optional_lsn(batch.last_commit_lsn),
                 sub_batch_kind = batch_log_kind(batch),
                 insert_sub_batch_rows = apply_sub_batch_rows(batch),
+                commit_elapsed_ms,
+                staging_cleanup_elapsed_ms,
                 "ducklake batch committed"
             );
 
@@ -3654,7 +3712,7 @@ mod tests {
         )
         .unwrap();
         let context = DuckLakeBlockingOperationContext::for_tests();
-        apply_table_batches(&conn, &batches[..1], &context).unwrap();
+        let cached = apply_table_batches(&conn, &batches[..1], &context).unwrap();
         let progress =
             read_table_streaming_progress(&conn, &ducklake_table_name(), LEGACY_REPLAY_EPOCH)
                 .unwrap()
@@ -3678,7 +3736,7 @@ mod tests {
             Cell::String("invalid-integer".to_owned()),
             Cell::Null,
         ])]));
-        assert!(apply_table_batches(&conn, &[failed], &context).is_err());
+        assert!(apply_table_batches_with_progress(&conn, &[failed], &context, cached).is_err());
         assert_eq!(
             conn.query_row("select count(*) from lake.public.users", [], |row| row
                 .get::<_, i64>(0))
@@ -3695,8 +3753,8 @@ mod tests {
         );
         // Replaying the entire source transaction skips committed work and
         // continues.
-        apply_table_batches(&conn, &batches, &context).unwrap();
-        apply_table_batches(&conn, &batches, &context).unwrap();
+        let reloaded = apply_table_batches(&conn, &batches, &context).unwrap();
+        apply_table_batches_with_progress(&conn, &batches, &context, reloaded).unwrap();
         let rows = conn
             .prepare("select id, name from lake.public.users order by id")
             .unwrap()
@@ -4870,9 +4928,13 @@ mod tests {
         let root = std::env::var("CDC_BENCH_DIR").unwrap();
         let schema = make_replicated_schema();
         for round in 0..3 {
-            for (mode, cap) in
-                [("ordered", 16), ("normalized", 16), ("normalized", 256), ("normalized", 1024)]
-            {
+            for (mode, cap) in [
+                ("ordered", 16),
+                ("normalized", 16),
+                ("normalized", 256),
+                ("normalized", 1024),
+                ("normalized", 4096),
+            ] {
                 let run = tempfile::Builder::new()
                     .prefix(&format!("{mode}-{cap}-{round}-"))
                     .tempdir_in(&root)

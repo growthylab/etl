@@ -41,6 +41,14 @@ pressure. If these are high, maintenance may not be your real bottleneck.
 - `etl_ducklake_failed_batches_total`
 - `etl_ducklake_replayed_batches_total`
 
+For compatibility, `etl_ducklake_batch_commit_duration_seconds` measures the
+whole successful batch, including DML, checkpoint and staging cleanup. It is
+not COMMIT statement latency. The `ducklake batch committed` event preserves
+that total in `elapsed_ms` and separately reports `commit_elapsed_ms` and
+`staging_cleanup_elapsed_ms`. Progress reads report `progress_lookup_elapsed_ms`;
+staging loads report `staging_prepare_elapsed_ms` and `staging_load_elapsed_ms`.
+Failed commits also report their statement duration.
+
 These explain the pressure your writer is putting on DuckLake:
 
 - larger `upsert_rows` usually means fewer, larger files.
