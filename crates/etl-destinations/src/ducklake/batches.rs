@@ -65,8 +65,8 @@ use crate::{
         },
         partial_update::{
             PartialUpdateRecoveryChunk, PartialUpdateRecoveryKey, PartialUpdateRecoveryOutcome,
-            PartialUpdateRecoveryRequest, RecoveredPartialRows, RecoveryChunkPacer,
-            StoredRowRecovery, identity_predicate,
+            PartialUpdateRecoveryRequest, RECOVERY_KEY_BATCH_SIZE, RecoveredPartialRows,
+            RecoveryChunkPacer, StoredRowRecovery, identity_predicate,
         },
         replay_epoch::LEGACY_REPLAY_EPOCH,
         sql::{qualified_lake_table_name, quote_identifier},
@@ -89,7 +89,16 @@ const SQL_DELETE_BATCH_SIZE: usize = 16;
 /// the TOASTed columns. The read those events imply is the expensive part, so
 /// it needs its own cap: without one, a single batch can owe a read of every
 /// identity the row cap allows, on a table where each read statement is slow.
-const MAX_PARTIAL_UPDATE_KEYS_PER_BATCH: usize = 128;
+///
+/// The cap matches [`RECOVERY_KEY_BATCH_SIZE`], the most identities one read
+/// statement may ever cover, so a batch can never owe more than one full-sized
+/// statement's worth of work that it cannot spread over later batches. Cutting
+/// it lower would split batches that coalesce cleanly today into more atomic
+/// commits, and more commits is more small data files — the very condition
+/// that makes each read slow. Bounding the statements is what protects a slow
+/// table; this cap only protects against a deployment whose row cap is far
+/// larger than the read can absorb.
+const MAX_PARTIAL_UPDATE_KEYS_PER_BATCH: usize = RECOVERY_KEY_BATCH_SIZE;
 /// ETL-managed marker table storing per-table applied copy batches.
 const APPLIED_BATCHES_TABLE: &str = "__etl_applied_table_batches";
 /// Data inlining limit for append-only DuckLake helper tables.
