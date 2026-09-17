@@ -147,7 +147,7 @@ impl RecoveryChunkPacer {
     }
 }
 
-/// Identity count above which a recovery statement fails with a timeout.
+/// First identity count at which a recovery statement fails with a timeout.
 ///
 /// A recovery read that outlives the foreground timeout is the production
 /// failure this module's chunking exists for, and it only happens on a table
@@ -158,10 +158,15 @@ static RECOVERY_TIMEOUT_ABOVE_KEYS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Makes every recovery statement covering more than `keys` identities fail as
-/// if it had exceeded the foreground timeout. Zero disarms the hook.
+/// if it had exceeded the foreground timeout.
+///
+/// `keys` of zero fails every statement, which models a table no statement can
+/// read until maintenance has compacted it. The hook is disarmed by
+/// [`reset_partial_update_recovery_timeout_for_tests`], so the stored value is
+/// the first failing size rather than the last passing one.
 #[cfg(feature = "test-utils")]
 pub fn arm_partial_update_recovery_timeout_above_keys_for_tests(keys: usize) {
-    RECOVERY_TIMEOUT_ABOVE_KEYS.store(keys, std::sync::atomic::Ordering::SeqCst);
+    RECOVERY_TIMEOUT_ABOVE_KEYS.store(keys.saturating_add(1), std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Disarms the recovery timeout hook.
@@ -173,8 +178,8 @@ pub fn reset_partial_update_recovery_timeout_for_tests() {
 /// Returns the injected timeout for a statement of `keys` identities, if armed.
 #[cfg(feature = "test-utils")]
 fn injected_recovery_timeout(keys: usize) -> Option<etl::error::EtlError> {
-    let limit = RECOVERY_TIMEOUT_ABOVE_KEYS.load(std::sync::atomic::Ordering::SeqCst);
-    (limit > 0 && keys > limit).then(|| {
+    let first_failing = RECOVERY_TIMEOUT_ABOVE_KEYS.load(std::sync::atomic::Ordering::SeqCst);
+    (first_failing > 0 && keys >= first_failing).then(|| {
         crate::ducklake::client::duckdb_blocking_timeout_error(
             crate::ducklake::client::FOREGROUND_QUERY_TIMEOUT,
             "query_execution",
