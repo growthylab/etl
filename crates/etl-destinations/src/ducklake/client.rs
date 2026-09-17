@@ -469,16 +469,32 @@ const DEFAULT_SLOW_BLOCKING_OPERATION: Duration = Duration::from_secs(1);
 /// redeploying a different constant is a poor way to get them.
 const SLOW_BLOCKING_OPERATION_ENV: &str = "ETL_DUCKLAKE_SLOW_OPERATION_MS";
 
-/// Returns the configured threshold, read once per process.
-fn slow_blocking_operation() -> Duration {
-    static THRESHOLD: LazyLock<Duration> = LazyLock::new(|| {
-        std::env::var(SLOW_BLOCKING_OPERATION_ENV)
-            .ok()
-            .and_then(|raw| raw.parse().ok())
-            .map_or(DEFAULT_SLOW_BLOCKING_OPERATION, Duration::from_millis)
-    });
+/// The resolved threshold in milliseconds, or [`u64::MAX`] before the setting
+/// has been read.
+static SLOW_BLOCKING_OPERATION_MS: AtomicU64 = AtomicU64::new(u64::MAX);
 
-    *THRESHOLD
+/// Returns the configured threshold, reading the setting once per process.
+fn slow_blocking_operation() -> Duration {
+    let resolved = SLOW_BLOCKING_OPERATION_MS.load(Ordering::Relaxed);
+    if resolved != u64::MAX {
+        return Duration::from_millis(resolved);
+    }
+    let configured = std::env::var(SLOW_BLOCKING_OPERATION_ENV)
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or_else(|| DEFAULT_SLOW_BLOCKING_OPERATION.as_millis() as u64);
+    SLOW_BLOCKING_OPERATION_MS.store(configured, Ordering::Relaxed);
+
+    Duration::from_millis(configured)
+}
+
+/// Reports the stages of every operation at least `threshold_ms` long.
+///
+/// Tests use this where production uses [`SLOW_BLOCKING_OPERATION_ENV`]: local
+/// operations are milliseconds, so the production threshold reports nothing.
+#[cfg(feature = "test-utils")]
+pub fn set_slow_blocking_operation_ms_for_tests(threshold_ms: u64) {
+    SLOW_BLOCKING_OPERATION_MS.store(threshold_ms, Ordering::Relaxed);
 }
 
 /// Supplies one managed connection to the shared blocking-operation runner.

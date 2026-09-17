@@ -136,6 +136,8 @@ pub use batches::{
     arm_fail_after_copy_batch_commit_once_for_tests, ducklake_staging_table_creations_for_tests,
     reset_ducklake_test_hooks,
 };
+#[cfg(feature = "test-utils")]
+pub use client::set_slow_blocking_operation_ms_for_tests;
 pub use config::S3Config;
 pub use duckdb::Connection;
 pub use etl_maintenance::ducklake::{
