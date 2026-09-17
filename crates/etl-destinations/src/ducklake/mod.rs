@@ -152,6 +152,11 @@ pub use external_maintenance::{
     ExternalMaintenanceStore, ExternalMaintenanceWatcherConfig, PostgresExternalMaintenanceStore,
     run_external_maintenance_watcher,
 };
+#[cfg(feature = "test-utils")]
+pub use partial_update::{
+    arm_partial_update_recovery_timeout_above_keys_for_tests,
+    reset_partial_update_recovery_timeout_for_tests,
+};
 
 /// Bounds one atomic streaming transaction without delaying source delivery.
 #[derive(Clone, Copy, Debug)]

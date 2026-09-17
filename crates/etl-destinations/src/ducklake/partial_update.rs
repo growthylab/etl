@@ -147,6 +147,41 @@ impl RecoveryChunkPacer {
     }
 }
 
+/// Identity count above which a recovery statement fails with a timeout.
+///
+/// A recovery read that outlives the foreground timeout is the production
+/// failure this module's chunking exists for, and it only happens on a table
+/// with tens of thousands of active data files. Tests arm this threshold to
+/// reproduce the failure deterministically, in milliseconds, on a small lake.
+#[cfg(feature = "test-utils")]
+static RECOVERY_TIMEOUT_ABOVE_KEYS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Makes every recovery statement covering more than `keys` identities fail as
+/// if it had exceeded the foreground timeout. Zero disarms the hook.
+#[cfg(feature = "test-utils")]
+pub fn arm_partial_update_recovery_timeout_above_keys_for_tests(keys: usize) {
+    RECOVERY_TIMEOUT_ABOVE_KEYS.store(keys, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Disarms the recovery timeout hook.
+#[cfg(feature = "test-utils")]
+pub fn reset_partial_update_recovery_timeout_for_tests() {
+    RECOVERY_TIMEOUT_ABOVE_KEYS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Returns the injected timeout for a statement of `keys` identities, if armed.
+#[cfg(feature = "test-utils")]
+fn injected_recovery_timeout(keys: usize) -> Option<etl::error::EtlError> {
+    let limit = RECOVERY_TIMEOUT_ABOVE_KEYS.load(std::sync::atomic::Ordering::SeqCst);
+    (limit > 0 && keys > limit).then(|| {
+        crate::ducklake::client::duckdb_blocking_timeout_error(
+            crate::ducklake::client::FOREGROUND_QUERY_TIMEOUT,
+            "query_execution",
+        )
+    })
+}
+
 /// Builds the identity predicate shared by deletes and recovered rows.
 ///
 /// Both the normalizer and the recovery read derive their key from the same
@@ -475,6 +510,10 @@ impl StoredRowRecovery<'_> {
         let recovered_columns = self.recovered_column_schemas(request, &replicated_columns)?;
 
         let keys = &request.keys()[range];
+        #[cfg(feature = "test-utils")]
+        if let Some(error) = injected_recovery_timeout(keys.len()) {
+            return Err(error);
+        }
         let mut recovered = RecoveredPartialRows::for_request(request);
         let recovered_bytes =
             self.recover_chunk(keys, &identity_columns, &recovered_columns, &mut recovered)?;

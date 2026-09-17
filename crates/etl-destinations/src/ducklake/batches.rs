@@ -886,6 +886,9 @@ async fn recover_partial_update_chunk(
                 requested_keys,
                 recovered_bytes = chunk.recovered_bytes,
                 elapsed_ms = elapsed.as_millis() as u64,
+                // Each statement is submitted with its own full budget, so a
+                // request of many statements is never bounded as a whole.
+                timeout_ms = FOREGROUND_QUERY_TIMEOUT.as_millis() as u64,
                 "ducklake partial update recovery chunk completed"
             );
 
@@ -3353,6 +3356,7 @@ pub fn reset_ducklake_test_hooks() {
     *FAIL_AFTER_ATOMIC_BATCH_COMMIT_TABLE.lock() = None;
     *FAIL_AFTER_COPY_BATCH_COMMIT_TABLE.lock() = None;
     STAGING_TABLE_CREATIONS_BY_TABLE.lock().clear();
+    crate::ducklake::partial_update::reset_partial_update_recovery_timeout_for_tests();
 }
 
 /// Returns the number of staging-table creations performed for one table since
