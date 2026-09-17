@@ -727,7 +727,9 @@ impl StoredRowRecovery<'_> {
         // One statement per adjacency group: the range predicate brackets a
         // whole statement, so keys that sit far apart are read as everything
         // in between unless they are asked for separately.
-        for group in adjacency_groups(keys) {
+        let groups = adjacency_groups(keys);
+        let statements = groups.len();
+        for group in groups {
             recovered_bytes = recovered_bytes.saturating_add(self.recover_chunk(
                 &group,
                 &identity_columns,
@@ -736,7 +738,7 @@ impl StoredRowRecovery<'_> {
             )?);
         }
 
-        Ok(PartialUpdateRecoveryChunk { recovered, recovered_bytes, keys: keys.len() })
+        Ok(PartialUpdateRecoveryChunk { recovered, recovered_bytes, keys: keys.len(), statements })
     }
 }
 
@@ -749,6 +751,8 @@ pub(super) struct PartialUpdateRecoveryChunk {
     pub(super) recovered_bytes: usize,
     /// Identities this statement covered.
     pub(super) keys: usize,
+    /// Statements the identities were read with, one per adjacency group.
+    pub(super) statements: usize,
 }
 
 #[cfg(test)]

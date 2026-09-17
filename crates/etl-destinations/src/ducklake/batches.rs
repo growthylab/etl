@@ -947,6 +947,9 @@ async fn recover_partial_update_chunk(
                 keys = chunk.keys,
                 requested_keys,
                 recovered_bytes = chunk.recovered_bytes,
+                // One statement per adjacency group: keys that sit far apart
+                // are read separately so neither range covers the gap.
+                statements = chunk.statements,
                 elapsed_ms = elapsed.as_millis() as u64,
                 query_execution_ms = query_elapsed.as_millis() as u64,
                 // Each statement is submitted with its own full budget, so a
@@ -5807,6 +5810,7 @@ mod tests {
             recovered: RecoveredPartialRows::empty(),
             recovered_bytes: 0,
             keys,
+            statements: 1,
         }
     }
 
