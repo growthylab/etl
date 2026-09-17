@@ -76,6 +76,10 @@ pub enum FaultAction {
     /// The inner destination does the work; its response is delayed by the
     /// duration and then passes through unchanged.
     RespondSlowly(Duration),
+    /// The call itself blocks for the duration before the inner destination
+    /// runs, which is what a destination that applies backpressure inside
+    /// `write_events` does to the apply loop.
+    DispatchSlowly(Duration),
 }
 
 impl FaultAction {
@@ -88,6 +92,11 @@ impl FaultAction {
     /// message.
     pub fn fail_after_write(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self::FailAfterWrite(InjectedError::new(kind, message))
+    }
+
+    /// Creates an action that blocks the call itself for `delay`.
+    pub fn dispatch_slowly(delay: Duration) -> Self {
+        Self::DispatchSlowly(delay)
     }
 
     /// Creates a hold action and the handle that releases it.
@@ -178,6 +187,19 @@ impl HoldHandle {
     }
 }
 
+/// Applies a fault that blocks the destination call before the work starts.
+///
+/// Returns the fault that still applies to the response, if any.
+pub async fn apply_dispatch_fault(fault: Option<FaultAction>) -> Option<FaultAction> {
+    match fault {
+        Some(FaultAction::DispatchSlowly(delay)) => {
+            tokio::time::sleep(delay).await;
+            None
+        }
+        other => other,
+    }
+}
+
 /// Applies a consumed fault to an operation's response.
 ///
 /// [`FaultAction::Reject`] is normally handled before the inner destination
@@ -196,6 +218,10 @@ pub async fn apply_response_fault<T>(
             sleep(duration).await;
             inner_result
         }
+        // A dispatch fault is consumed before the work starts, so it can only
+        // reach this point for an operation that does not apply dispatch
+        // faults at all; passing the result through keeps that harmless.
+        Some(FaultAction::DispatchSlowly(_)) => inner_result,
     }
 }
 

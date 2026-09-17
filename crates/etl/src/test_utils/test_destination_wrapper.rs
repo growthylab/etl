@@ -22,7 +22,10 @@ use crate::{
     schema::{ReplicatedTableSchema, TableId},
     test_utils::{
         event::{EventCondition, check_all_event_conditions, check_event_conditions},
-        faults::{FaultAction, FaultInjector, FaultyOp, HoldHandle, apply_response_fault},
+        faults::{
+            FaultAction, FaultInjector, FaultyOp, HoldHandle, apply_dispatch_fault,
+            apply_response_fault,
+        },
         notify::TimedNotify,
     },
 };
@@ -374,6 +377,9 @@ where
         self.tasks.try_reap().await?;
 
         let fault = self.take_fault(FaultyOp::WriteEvents).await?;
+        // A dispatch fault blocks this call, exactly like a destination that
+        // applies backpressure before accepting the batch.
+        let fault = apply_dispatch_fault(fault).await;
 
         let destination = {
             let inner = self.inner.read().await;

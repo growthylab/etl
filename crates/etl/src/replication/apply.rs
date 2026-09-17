@@ -101,14 +101,17 @@ const DEFAULT_KEEP_ALIVE_DURATION: Duration = Duration::from_secs(60);
 /// Fraction of `wal_sender_timeout` used for the proactive keep alive deadline.
 ///
 /// PostgreSQL normally emits an idle keep alive around `wal_sender_timeout /
-/// 2`. We wait a bit longer than that, using `60%` of the full timeout, so
-/// normal server keep alives still win most of the time while the client still
-/// has room to send its own status update if that keep alive is delayed by
-/// network, scheduling, or local processing latency. This is intentionally a
-/// last-resort fallback: in normal operation, progress should still be driven
-/// by PostgreSQL's primary keep alive messages rather than by the client
-/// timeout path.
-const KEEP_ALIVE_DEADLINE_FRACTION: f64 = 0.6;
+/// 2`, and this is the client's own fallback for when that keep alive is
+/// delayed by network, scheduling, or local processing latency. In normal
+/// operation progress is still driven by the server's keep alives.
+///
+/// A third of the timeout gives the window three chances instead of one: at
+/// `60%` a single late update was already a dropped connection, and the
+/// updates that matter are exactly the ones sent while the loop is busy.
+/// A deployment whose destination regularly took tens of seconds per write lost
+/// its replication connection every few minutes, each time replaying a batch
+/// and waiting out the restart backoff on a large backlog.
+const KEEP_ALIVE_DEADLINE_FRACTION: f64 = 1.0 / 3.0;
 /// Minimum client-side deadline for proactive keep alive retries.
 ///
 /// PostgreSQL exposes `wal_sender_timeout` in millisecond units and `0`
@@ -1400,7 +1403,8 @@ where
     ) -> EtlResult<Option<ApplyLoopResult>> {
         // Process quiescent coordination before waiting for another signal. The
         // next loop iteration observes progress made by whichever branch runs below.
-        self.maybe_process_syncing_tables_when_quiescent().await?;
+        self.maybe_process_syncing_tables_when_quiescent(replication_message_stream.as_mut())
+            .await?;
 
         // We try to finish the active iteration even before starting it, since we might
         // be able to finish earlier, without having to process any signal from
@@ -1427,7 +1431,7 @@ where
             // PRIORITY 3: Handle the pending destination write result.
             // Finishing an in-flight flush may advance progress and unblock a queued batch.
             apply_result = Self::wait_for_flush_result(self.state.pending_flush_result.as_mut()), if self.state.pending_flush_result.is_some() => {
-                self.handle_flush_result(apply_result)
+                self.handle_flush_result(replication_message_stream.as_mut(), apply_result)
                     .await?;
             }
 
@@ -1436,7 +1440,13 @@ where
             // so pausing source intake cannot prevent retained batches from draining.
             backpressure_active = Self::wait_for_memory_update(batch_memory_subscription.as_mut()), if batch_memory_subscription.is_some() => {
                 match backpressure_active {
-                    Some(true) => self.flush_batch("memory backpressure activated").await?,
+                    Some(true) => {
+                        self.flush_batch(
+                            replication_message_stream.as_mut(),
+                            "memory backpressure activated",
+                        )
+                        .await?;
+                    }
                     Some(false) => {}
                     None => *batch_memory_subscription = None,
                 }
@@ -1445,7 +1455,8 @@ where
             // PRIORITY 5: Handle batch flush timer expiry.
             // This prevents buffered work from waiting forever when traffic is low.
             _ = Self::wait_for_batch_deadline(self.state.flush_deadline), if self.state.can_wait_for_deadline() => {
-                self.flush_batch("flush deadline reached").await?;
+                self.flush_batch(replication_message_stream.as_mut(), "flush deadline reached")
+                    .await?;
             }
 
             // PRIORITY 6: Process incoming replication messages from PostgreSQL.
@@ -1527,7 +1538,7 @@ where
 
             // PRIORITY 2: Handle the pending destination write result.
             apply_result = Self::wait_for_flush_result(self.state.pending_flush_result.as_mut()), if self.state.pending_flush_result.is_some() => {
-                self.handle_flush_result(apply_result)
+                self.handle_flush_result(replication_message_stream.as_mut(), apply_result)
                     .await?;
             }
 
@@ -1535,7 +1546,13 @@ where
             // the activation race and moves the loop into its draining state first.
             backpressure_active = Self::wait_for_memory_update(batch_memory_subscription.as_mut()), if batch_memory_subscription.is_some() => {
                 match backpressure_active {
-                    Some(true) => self.flush_batch("memory backpressure activated during shutdown drain").await?,
+                    Some(true) => {
+                        self.flush_batch(
+                            replication_message_stream.as_mut(),
+                            "memory backpressure activated during shutdown drain",
+                        )
+                        .await?;
+                    }
                     Some(false) => {}
                     None => *batch_memory_subscription = None,
                 }
@@ -1543,7 +1560,11 @@ where
 
             // PRIORITY 4: Handle batch flush timer expiry.
             _ = Self::wait_for_batch_deadline(self.state.flush_deadline), if self.state.can_wait_for_deadline() => {
-                self.flush_batch("flush deadline reached during shutdown drain").await?;
+                self.flush_batch(
+                    replication_message_stream.as_mut(),
+                    "flush deadline reached during shutdown drain",
+                )
+                .await?;
             }
 
             // PRIORITY 5: Emit a periodic status update while shutdown is draining.
@@ -1937,6 +1958,7 @@ where
     /// Handles a completed batch flush result.
     async fn handle_flush_result(
         &mut self,
+        replication_message_stream: Pin<&mut MemoryBackpressureStream<ReplicationMessageStream>>,
         flush_result: CompletedWriteEventsResult,
     ) -> EtlResult<()> {
         // We clear the state up front because this flush is no longer in flight.
@@ -2090,7 +2112,7 @@ where
         // If processing was paused, there must be a queued batch that still needs to be
         // flushed now that the previous in-flight result has resolved.
         if processing_paused {
-            self.flush_batch("pending flush result received").await?;
+            self.flush_batch(replication_message_stream, "pending flush result received").await?;
         }
 
         Ok(())
@@ -2194,7 +2216,7 @@ where
                 "early flush requested"
             };
 
-            self.flush_batch(reason).await?;
+            self.flush_batch(replication_message_stream.as_mut(), reason).await?;
         }
 
         Ok(())
@@ -2206,14 +2228,25 @@ where
     /// current batch queued until the pending flush result has been
     /// processed. The queued batch is then retried from
     /// [`Self::handle_flush_result`] when that in-flight flush resolves.
-    async fn flush_batch(&mut self, reason: &str) -> EtlResult<()> {
+    async fn flush_batch(
+        &mut self,
+        mut replication_message_stream: Pin<
+            &mut MemoryBackpressureStream<ReplicationMessageStream>,
+        >,
+        reason: &str,
+    ) -> EtlResult<()> {
         // An idle Accepted tail still owes cumulative durability. Use the same
         // bounded fill interval to request a barrier even without another event.
         if !self.state.has_pending_batch() {
             if self.state.pending_durability_interval.is_some()
                 && !self.state.has_pending_flush_result()
             {
-                self.dispatch_write_events(EventBatch::default(), reason).await?;
+                self.dispatch_write_events(
+                    replication_message_stream.as_mut(),
+                    EventBatch::default(),
+                    reason,
+                )
+                .await?;
             }
             return Ok(());
         }
@@ -2227,12 +2260,15 @@ where
 
         let event_batch = self.state.event_batch.take();
 
-        self.dispatch_write_events(event_batch, reason).await
+        self.dispatch_write_events(replication_message_stream, event_batch, reason).await
     }
 
     /// Dispatches one streaming write through the shared async-result path.
     async fn dispatch_write_events(
         &mut self,
+        mut replication_message_stream: Pin<
+            &mut MemoryBackpressureStream<ReplicationMessageStream>,
+        >,
         event_batch: EventBatch,
         reason: &str,
     ) -> EtlResult<()> {
@@ -2277,7 +2313,37 @@ where
         // the pending receiver is stored on the loop state until the
         // destination signals completion.
         let (flush_result, pending_flush_result) = WriteEventsResult::new(metadata);
-        self.destination.write_events(events, durability, flush_result).await?;
+        // A destination is free to apply backpressure inside this call: it is
+        // how a slow lake stops the loop from reading more WAL. What it must
+        // not do is stop the standby status updates, because PostgreSQL drops
+        // the replication connection after `wal_sender_timeout` without one.
+        // A destination call of two minutes has been observed to cost the
+        // connection, each time followed by a restart and a replay.
+        let destination = self.destination.clone();
+        let write = destination.write_events(events, durability, flush_result);
+        tokio::pin!(write);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut write => {
+                    result?;
+                    break;
+                }
+                _ = Self::wait_for_keep_alive_deadline(self.state.keep_alive_deadline) => {
+                    // The reported positions cannot have advanced while this
+                    // write is in flight, so this resends the last durable
+                    // checkpoint, exactly like the loop's own keepalive branch.
+                    self.send_status_update(
+                        replication_message_stream.as_mut(),
+                        true,
+                        StatusUpdateType::PeriodicKeepAlive,
+                    )
+                    .await?;
+                    self.state
+                        .reset_keep_alive_deadline(self.keep_alive_deadline_duration);
+                }
+            }
+        }
         self.state.pending_flush_result = Some(pending_flush_result);
 
         // Reset only after dispatch. A batch deferred behind an in-flight write
@@ -3481,7 +3547,12 @@ where
     /// Once an exit has already been requested we intentionally skip this class
     /// of work so draining stays focused on already-started flushes and
     /// shutdown barriers.
-    async fn maybe_process_syncing_tables_when_quiescent(&mut self) -> EtlResult<()> {
+    async fn maybe_process_syncing_tables_when_quiescent(
+        &mut self,
+        mut replication_message_stream: Pin<
+            &mut MemoryBackpressureStream<ReplicationMessageStream>,
+        >,
+    ) -> EtlResult<()> {
         if self.state.exit_intent.is_some() {
             return Ok(());
         }
@@ -3499,6 +3570,7 @@ where
             // requires durability.
             self.state.record_exit_intent(Some(ExitIntent::Complete));
             self.dispatch_write_events(
+                replication_message_stream.as_mut(),
                 EventBatch::default(),
                 "table sync catchup reached without a terminal event batch",
             )
