@@ -59,6 +59,14 @@ const RECOVERY_PROBE_KEY_BATCH_SIZE: usize = 1;
 /// instead of one read that never returns.
 const RECOVERY_CHUNK_TARGET_ELAPSED: Duration = Duration::from_secs(30);
 
+/// Factor by which one statement may grow over the previous one.
+///
+/// Growth is geometric rather than a jump to whatever the cost model allows:
+/// each step re-measures at the larger size, so a request finds its workable
+/// statement size in a few statements without repeating a size that has
+/// already timed out.
+const RECOVERY_CHUNK_GROWTH: usize = 4;
+
 /// Sizes the statements of one recovery from what the earlier ones cost.
 ///
 /// The pacer carries the observed bytes and elapsed time per identity plus an
@@ -75,6 +83,13 @@ pub(super) struct RecoveryChunkPacer {
     recovered_bytes: usize,
     /// Time those statements took.
     elapsed: Duration,
+    /// How many statements that time covers.
+    statements: usize,
+    /// Identities the last statement covered, which bounds the next one's
+    /// growth.
+    last_chunk_keys: usize,
+    /// Cheapest statement seen, taken as the per-statement overhead.
+    overhead: Duration,
 }
 
 impl Default for RecoveryChunkPacer {
@@ -84,6 +99,9 @@ impl Default for RecoveryChunkPacer {
             covered_keys: 0,
             recovered_bytes: 0,
             elapsed: Duration::ZERO,
+            statements: 0,
+            last_chunk_keys: 0,
+            overhead: Duration::ZERO,
         }
     }
 }
@@ -91,9 +109,15 @@ impl Default for RecoveryChunkPacer {
 impl RecoveryChunkPacer {
     /// Returns how many further identities the next statement may cover.
     ///
-    /// The first statement probes with a single identity; later ones take the
-    /// smaller of what the remaining byte budget and the elapsed-time target
-    /// allow, and never more than the current limit.
+    /// The first statement probes with a single identity. Later ones are sized
+    /// from what the earlier ones cost, with the per-statement overhead kept
+    /// out of the estimate: prod 2026-09-17 measured 4–12 s per recovery
+    /// statement almost independently of how many identities it covered, so an
+    /// average that folds that overhead into every identity keeps planning
+    /// three-identity statements forever — 187 identities would take sixty of
+    /// them. The size also grows by at most [`RECOVERY_CHUNK_GROWTH`] per
+    /// statement, so the estimate is re-measured on the way up instead of
+    /// jumping straight back to a size that has already timed out.
     pub(super) fn next_chunk_size(&self, remaining_bytes: usize) -> usize {
         if self.covered_keys == 0 {
             return RECOVERY_PROBE_KEY_BATCH_SIZE.min(self.limit);
@@ -103,16 +127,36 @@ impl RecoveryChunkPacer {
             0 => RECOVERY_KEY_BATCH_SIZE,
             recovered_bytes => remaining_bytes / recovered_bytes.div_ceil(self.covered_keys),
         };
-        let by_elapsed = match self.elapsed {
-            Duration::ZERO => RECOVERY_KEY_BATCH_SIZE,
-            elapsed => {
-                let per_key = elapsed.as_nanos().div_ceil(self.covered_keys as u128).max(1);
-                usize::try_from(RECOVERY_CHUNK_TARGET_ELAPSED.as_nanos() / per_key)
-                    .unwrap_or(RECOVERY_KEY_BATCH_SIZE)
-            }
-        };
+        let growth = self.last_chunk_keys.saturating_mul(RECOVERY_CHUNK_GROWTH).max(1);
 
-        by_bytes.min(by_elapsed).clamp(1, self.limit)
+        by_bytes.min(self.keys_within_target_elapsed()).min(growth).clamp(1, self.limit)
+    }
+
+    /// Returns how many identities fit the elapsed target at the marginal cost
+    /// observed so far.
+    ///
+    /// The cheapest statement seen is taken as the per-statement overhead; what
+    /// every statement spends beyond it is attributed to its identities. A
+    /// request whose statements all cost the same regardless of size therefore
+    /// has no marginal cost and is limited only by the byte budget and growth.
+    fn keys_within_target_elapsed(&self) -> usize {
+        let Some(marginal) = self.marginal_nanos_per_key() else {
+            return RECOVERY_KEY_BATCH_SIZE;
+        };
+        let budget =
+            RECOVERY_CHUNK_TARGET_ELAPSED.as_nanos().saturating_sub(self.overhead.as_nanos());
+
+        usize::try_from(budget / marginal).unwrap_or(RECOVERY_KEY_BATCH_SIZE)
+    }
+
+    /// Returns the observed nanoseconds each identity adds to one statement.
+    fn marginal_nanos_per_key(&self) -> Option<u128> {
+        let statements = u128::try_from(self.statements).unwrap_or(1).max(1);
+        let overhead = self.overhead.as_nanos().saturating_mul(statements);
+        let marginal = self.elapsed.as_nanos().saturating_sub(overhead);
+        let per_key = marginal / u128::try_from(self.covered_keys).unwrap_or(1).max(1);
+
+        (per_key > 0).then_some(per_key)
     }
 
     /// Records what one completed statement covered and cost.
@@ -120,6 +164,12 @@ impl RecoveryChunkPacer {
         self.covered_keys = self.covered_keys.saturating_add(keys);
         self.recovered_bytes = self.recovered_bytes.saturating_add(recovered_bytes);
         self.elapsed = self.elapsed.saturating_add(elapsed);
+        self.statements = self.statements.saturating_add(1);
+        self.last_chunk_keys = keys;
+        self.overhead = match self.statements {
+            1 => elapsed,
+            _ => self.overhead.min(elapsed),
+        };
     }
 
     /// Halves the statement limit after a timeout.
@@ -137,6 +187,9 @@ impl RecoveryChunkPacer {
         self.covered_keys = 0;
         self.recovered_bytes = 0;
         self.elapsed = Duration::ZERO;
+        self.statements = 0;
+        self.last_chunk_keys = 0;
+        self.overhead = Duration::ZERO;
 
         true
     }
@@ -396,6 +449,33 @@ impl<'a> StoredRowRecovery<'a> {
         Self { conn, table_name, replicated_table_schema }
     }
 
+    /// Renders the statement that reads one chunk of identities back.
+    ///
+    /// Returns [`None`] when the chunk covers no identity, which reads nothing.
+    fn recovery_sql(
+        &self,
+        keys: &[PartialUpdateRecoveryKey],
+        identity_columns: &[&ColumnSchema],
+        recovered_columns: &[&ColumnSchema],
+    ) -> Option<String> {
+        let mut key_set = DeleteKeySet::new(self.replicated_table_schema);
+        for key in keys {
+            key_set.push(&key.components);
+        }
+        let join_clause = key_set.take_join_clause()?;
+        let select_list = identity_columns
+            .iter()
+            .chain(recovered_columns.iter())
+            .map(|column| read_expression(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        Some(format!(
+            "SELECT {select_list} FROM {} AS cdc_target{join_clause};",
+            qualified_lake_table_name(self.table_name)
+        ))
+    }
+
     /// Reads one chunk of identities into `recovered`.
     ///
     /// Returns the recovered bytes this chunk added.
@@ -406,25 +486,12 @@ impl<'a> StoredRowRecovery<'a> {
         recovered_columns: &[&ColumnSchema],
         recovered: &mut RecoveredPartialRows,
     ) -> EtlResult<usize> {
-        let mut key_set = DeleteKeySet::new(self.replicated_table_schema);
         for key in keys {
-            key_set.push(&key.components);
             recovered.cover(&key.predicate);
         }
-        let Some(join_clause) = key_set.take_join_clause() else {
+        let Some(sql) = self.recovery_sql(keys, identity_columns, recovered_columns) else {
             return Ok(0);
         };
-
-        let select_list = identity_columns
-            .iter()
-            .chain(recovered_columns.iter())
-            .map(|column| read_expression(column))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT {select_list} FROM {} AS cdc_target{join_clause};",
-            qualified_lake_table_name(self.table_name)
-        );
 
         let mut statement = self.conn.prepare(&sql).map_err(|source| {
             etl_error!(
@@ -496,6 +563,50 @@ impl StoredRowRecovery<'_> {
         }
 
         Ok(recovered_columns)
+    }
+
+    /// Returns the query plan of one range's statement, without running it.
+    ///
+    /// `EXPLAIN` does not execute, so this stays cheap even for the statement
+    /// that has just exhausted a three-minute budget — and the plan is what
+    /// says whether the read pruned data files or scanned the table.
+    pub(super) fn explain_range(
+        &self,
+        request: &PartialUpdateRecoveryRequest,
+        range: std::ops::Range<usize>,
+    ) -> EtlResult<String> {
+        let identity_columns: Vec<&ColumnSchema> =
+            self.replicated_table_schema.identity_column_schemas().collect();
+        let replicated_columns: Vec<&ColumnSchema> =
+            self.replicated_table_schema.column_schemas().collect();
+        let recovered_columns = self.recovered_column_schemas(request, &replicated_columns)?;
+        let Some(sql) =
+            self.recovery_sql(&request.keys()[range], &identity_columns, &recovered_columns)
+        else {
+            return Ok(String::new());
+        };
+
+        let mut statement = self.conn.prepare(&format!("EXPLAIN {sql}")).map_err(|source| {
+            etl_error!(
+                ErrorKind::DestinationQueryFailed,
+                "DuckLake partial update recovery plan failed",
+                source: source
+            )
+        })?;
+        let plan = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|source| {
+                etl_error!(
+                    ErrorKind::DestinationQueryFailed,
+                    "DuckLake partial update recovery plan failed",
+                    source: source
+                )
+            })?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Ok(plan)
     }
 
     /// Reads one range of a request's identities with a single statement.
@@ -955,23 +1066,56 @@ mod tests {
             "the first statement measures one identity"
         );
 
-        // 1 KiB and 10 ms per identity: the elapsed target allows 3000, the
-        // limit caps it, and a small byte budget cuts it further.
+        // 1 KiB and 10 ms for one identity: with nothing to separate overhead
+        // from marginal cost yet, growth is what bounds the next statement.
         pacer.observe(1, 1024, Duration::from_millis(10));
-        assert_eq!(pacer.next_chunk_size(usize::MAX), RECOVERY_KEY_BATCH_SIZE);
-        assert_eq!(pacer.next_chunk_size(16 * 1024), 16);
+        assert_eq!(pacer.next_chunk_size(usize::MAX), RECOVERY_CHUNK_GROWTH);
 
-        // 6 s per identity on a table whose files are not compacted: five
-        // identities already fill the 30 s target.
-        let mut slow = RecoveryChunkPacer::default();
-        slow.observe(1, 16, Duration::from_secs(6));
-        assert_eq!(slow.next_chunk_size(usize::MAX), 5);
+        // The byte budget still binds when it is the smaller of the two: four
+        // more identities of 1 KiB do not fit a 2 KiB budget.
+        pacer.observe(4, 4 * 1024, Duration::from_millis(40));
+        assert_eq!(pacer.next_chunk_size(2 * 1024), 2);
+        assert_eq!(pacer.next_chunk_size(usize::MAX), 16, "growth compounds");
 
         // A statement is never planned with zero identities, however small the
         // remaining budget is.
         let mut large_rows = RecoveryChunkPacer::default();
         large_rows.observe(1, 8 * 1024 * 1024, Duration::from_millis(1));
         assert_eq!(large_rows.next_chunk_size(1), 1);
+    }
+
+    /// Statement cost that barely moves with size must not keep the statements
+    /// tiny.
+    ///
+    /// Prod 2026-09-17 measured 4–12 s per recovery statement for one to five
+    /// identities. Averaging that over the identities makes every later
+    /// statement look like it can afford three of them, so a 187-identity
+    /// request would take sixty statements and five minutes.
+    #[test]
+    fn a_fixed_per_statement_cost_does_not_cap_the_next_statement() {
+        let mut pacer = RecoveryChunkPacer::default();
+        pacer.observe(1, 1024, Duration::from_millis(9_500));
+        pacer.observe(3, 3 * 1024, Duration::from_millis(6_000));
+        pacer.observe(12, 12 * 1024, Duration::from_millis(5_900));
+
+        assert_eq!(
+            pacer.next_chunk_size(usize::MAX),
+            48,
+            "statements whose cost is mostly fixed must grow geometrically"
+        );
+    }
+
+    /// A cost that really does scale with size still bounds the statement.
+    #[test]
+    fn a_marginal_cost_per_identity_bounds_the_next_statement() {
+        let mut pacer = RecoveryChunkPacer::default();
+        // 2 s of overhead and ~1.8 s per identity: the 30 s target leaves 28 s
+        // for identities, which is fifteen of them — well below what geometric
+        // growth alone would allow.
+        pacer.observe(1, 1024, Duration::from_secs(2));
+        pacer.observe(8, 8 * 1024, Duration::from_secs(18));
+
+        assert_eq!(pacer.next_chunk_size(usize::MAX), 15);
     }
 
     #[test]

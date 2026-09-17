@@ -405,6 +405,64 @@ impl DuckLakeDedicatedConnection {
     }
 }
 
+/// Elapsed time one foreground operation spent before its query even started.
+///
+/// A blocking operation waits for a blocking slot, then for a pooled
+/// connection, and only then runs its query. All three are inside one timeout
+/// budget, and until they were measured separately a slow operation could not
+/// be told apart from a queued one: prod 2026-09-16 reported
+/// `stage=query_execution, timeout_ms=180000` for reads whose actual query time
+/// was unknown.
+#[derive(Debug, Default)]
+pub(super) struct BlockingStageTimings {
+    slot_wait_ms: AtomicU64,
+    checkout_ms: AtomicU64,
+    execute_ms: AtomicU64,
+}
+
+impl BlockingStageTimings {
+    fn record_slot_wait(&self, elapsed: Duration) {
+        self.slot_wait_ms.store(elapsed.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn record_checkout(&self, elapsed: Duration) {
+        self.checkout_ms.store(elapsed.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn record_execute(&self, elapsed: Duration) {
+        self.execute_ms.store(elapsed.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn slot_wait_ms(&self) -> u64 {
+        self.slot_wait_ms.load(Ordering::Relaxed)
+    }
+
+    fn checkout_ms(&self) -> u64 {
+        self.checkout_ms.load(Ordering::Relaxed)
+    }
+
+    fn execute_ms(&self) -> u64 {
+        self.execute_ms.load(Ordering::Relaxed)
+    }
+
+    /// Renders the stages for an error detail.
+    fn detail(&self) -> String {
+        format!(
+            "slot_wait_ms={}, pool_checkout_ms={}, query_execution_ms={}",
+            self.slot_wait_ms(),
+            self.checkout_ms(),
+            self.execute_ms()
+        )
+    }
+}
+
+/// Elapsed time above which one foreground operation reports its stages.
+///
+/// Healthy operations are milliseconds; anything approaching a second is worth
+/// a line, and the line is what tells an operator whether the time went into
+/// the query or into waiting for a slot or a connection.
+const SLOW_BLOCKING_OPERATION: Duration = Duration::from_secs(1);
+
 /// Supplies one managed connection to the shared blocking-operation runner.
 ///
 /// Implementations differ only in connection lifetime: ordinary operations
@@ -416,6 +474,7 @@ trait DuckLakeConnectionProvider: Send + 'static {
         self,
         deadline: Instant,
         timeout: Duration,
+        stages: &BlockingStageTimings,
         operation: F,
     ) -> EtlResult<R>
     where
@@ -427,6 +486,7 @@ impl DuckLakeConnectionProvider for Arc<r2d2::Pool<DuckLakeConnectionManager>> {
         self,
         deadline: Instant,
         timeout: Duration,
+        stages: &BlockingStageTimings,
         operation: F,
     ) -> EtlResult<R>
     where
@@ -449,6 +509,7 @@ impl DuckLakeConnectionProvider for Arc<r2d2::Pool<DuckLakeConnectionManager>> {
                 )
             }
         })?;
+        stages.record_checkout(checkout_started.elapsed());
         histogram!(ETL_DUCKLAKE_POOL_CHECKOUT_WAIT_SECONDS)
             .record(checkout_started.elapsed().as_secs_f64());
         trace!(
@@ -465,6 +526,7 @@ impl DuckLakeConnectionProvider for DuckLakeDedicatedConnection {
         self,
         deadline: Instant,
         timeout: Duration,
+        stages: &BlockingStageTimings,
         operation: F,
     ) -> EtlResult<R>
     where
@@ -492,6 +554,7 @@ impl DuckLakeConnectionProvider for DuckLakeDedicatedConnection {
                     )
                 }
             })?;
+            stages.record_checkout(checkout_started.elapsed());
             histogram!(ETL_DUCKLAKE_POOL_CHECKOUT_WAIT_SECONDS)
                 .record(checkout_started.elapsed().as_secs_f64());
             trace!(
@@ -888,6 +951,30 @@ pub(super) fn duckdb_blocking_timeout_error(timeout: Duration, stage: &'static s
     )
 }
 
+/// Builds a timeout error that also reports where the budget went.
+///
+/// The stage name alone says which step was running when the deadline passed,
+/// not how the budget was spent getting there: a query that never started
+/// because the pool was busy and one that ran for the whole budget both report
+/// `query_execution`.
+#[inline]
+fn duckdb_blocking_timeout_error_with_stages(
+    timeout: Duration,
+    stage: &'static str,
+    stages: &BlockingStageTimings,
+) -> EtlError {
+    etl_error!(
+        ErrorKind::DestinationQueryFailed,
+        "DuckLake blocking operation timed out",
+        format!(
+            "Operation kind={}, stage={stage}, timeout_ms={}, {}",
+            DUCKDB_BLOCKING_OPERATION_KIND,
+            timeout.as_millis(),
+            stages.detail()
+        )
+    )
+}
+
 /// Returns whether an error is one of the blocking-operation timeouts above.
 ///
 /// A timeout says the work itself did not fit the budget, so a caller that can
@@ -1021,6 +1108,8 @@ where
     let abort_deadline = deadline.checked_add(BLOCKING_ABORT_GRACE).ok_or_else(|| {
         etl_error!(ErrorKind::ConfigError, "DuckLake operation timeout leaves no abort grace")
     })?;
+    let stages = Arc::new(BlockingStageTimings::default());
+    let operation_started = Instant::now();
     let slot_wait_started = Instant::now();
     let permit = tokio::time::timeout_at(deadline, Arc::clone(&blocking_slots).acquire_owned())
         .await
@@ -1028,6 +1117,7 @@ where
         .map_err(|_| {
             etl_error!(ErrorKind::ApplyWorkerPanic, "DuckLake blocking slot acquisition failed")
         })?;
+    stages.record_slot_wait(slot_wait_started.elapsed());
     histogram!(ETL_DUCKLAKE_BLOCKING_SLOT_WAIT_SECONDS)
         .record(slot_wait_started.elapsed().as_secs_f64());
     trace!(
@@ -1041,11 +1131,15 @@ where
     let mut watchdog = DuckDbQueryWatchdog::spawn(deadline);
     let watchdog_task = watchdog.async_task_handle()?;
 
+    let blocking_stages = Arc::clone(&stages);
     let blocking_task = tokio::task::spawn_blocking(move || -> EtlResult<R> {
         // Please if you modify the code inside this blocking task do not add any
         // blocking operations that could delay other tasks waiting on this slot.
         let _permit = permit;
-        provider.with_connection(deadline, timeout, move |pooled_conn| {
+        let stages = blocking_stages;
+        let operation_stages = Arc::clone(&stages);
+        provider.with_connection(deadline, timeout, &stages, move |pooled_conn| {
+            let stages = operation_stages;
             if pooled_conn.broken {
                 return Err(etl_error!(
                     ErrorKind::DestinationConnectionFailed,
@@ -1064,7 +1158,13 @@ where
             let operation_timeout =
                 deadline.checked_duration_since(Instant::now()).unwrap_or(Duration::ZERO);
             if operation_timeout.is_zero() {
-                return Err(duckdb_blocking_timeout_error(timeout, "query_execution"));
+                // The budget was spent before the query started: the stage
+                // timings are what separates this from a slow query.
+                return Err(duckdb_blocking_timeout_error_with_stages(
+                    timeout,
+                    "query_admission",
+                    &stages,
+                ));
             }
             pooled_conn.interrupt_handle.clear_reason();
             let operation_context = DuckLakeBlockingOperationContext::new(
@@ -1079,20 +1179,29 @@ where
             watchdog.publish_interrupt_handle(interrupt_handle);
             if watchdog.timed_out() {
                 pooled_conn.broken = true;
-                return Err(duckdb_blocking_timeout_error(timeout, "query_execution"));
+                return Err(duckdb_blocking_timeout_error_with_stages(
+                    timeout,
+                    "query_admission",
+                    &stages,
+                ));
             }
-            let operation_started = Instant::now();
+            let query_started = Instant::now();
             let result = operation(&pooled_conn.conn, &operation_context);
+            stages.record_execute(query_started.elapsed());
             watchdog.finish();
             histogram!(ETL_DUCKLAKE_BLOCKING_OPERATION_DURATION_SECONDS)
-                .record(operation_started.elapsed().as_secs_f64());
+                .record(query_started.elapsed().as_secs_f64());
             trace!(
-                duration_ms = operation_started.elapsed().as_millis() as u64,
+                duration_ms = query_started.elapsed().as_millis() as u64,
                 "ducklake blocking operation finished"
             );
             if watchdog.timed_out() {
                 pooled_conn.broken = true;
-                return Err(duckdb_blocking_timeout_error(timeout, "query_execution"));
+                return Err(duckdb_blocking_timeout_error_with_stages(
+                    timeout,
+                    "query_execution",
+                    &stages,
+                ));
             }
             if result.is_err() {
                 pooled_conn.broken = true;
@@ -1122,9 +1231,27 @@ where
         etl_error!(ErrorKind::ApplyWorkerPanic, "DuckLake query watchdog task panicked")
     })?;
 
-    blocking_result.map_err(|_| {
+    let result = blocking_result.map_err(|_| {
         etl_error!(ErrorKind::ApplyWorkerPanic, "DuckLake blocking operation task panicked")
-    })?
+    })?;
+    let elapsed = operation_started.elapsed();
+    if elapsed >= SLOW_BLOCKING_OPERATION {
+        // The one line an operator needs to tell a slow query apart from a
+        // queued one, without a debug build or a tracing filter change.
+        info!(
+            operation_id,
+            operation_kind,
+            elapsed_ms = elapsed.as_millis() as u64,
+            slot_wait_ms = stages.slot_wait_ms(),
+            pool_checkout_ms = stages.checkout_ms(),
+            query_execution_ms = stages.execute_ms(),
+            timeout_ms = timeout.as_millis() as u64,
+            failed = result.is_err(),
+            "ducklake blocking operation stage timings"
+        );
+    }
+
+    result
 }
 
 #[cfg(test)]

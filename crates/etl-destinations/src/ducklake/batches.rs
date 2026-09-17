@@ -877,16 +877,39 @@ async fn recover_partial_update_chunk(
             let range = covered_keys..chunk_end;
             let logged_table_name = attempt_table_name.clone();
             let started = Instant::now();
-            let chunk = run_duckdb_blocking_with_timeout(
-                pool,
-                blocking_slots,
+            let chunk = match run_duckdb_blocking_with_timeout(
+                Arc::clone(&pool),
+                Arc::clone(&blocking_slots),
                 FOREGROUND_QUERY_TIMEOUT,
-                move |conn| {
-                    StoredRowRecovery::new(conn, &attempt_table_name, &attempt_schema)
-                        .recover_range(&attempt_request, range)
+                {
+                    let attempt_table_name = attempt_table_name.clone();
+                    let attempt_schema = attempt_schema.clone();
+                    let attempt_request = Arc::clone(&attempt_request);
+                    let range = range.clone();
+                    move |conn| {
+                        StoredRowRecovery::new(conn, &attempt_table_name, &attempt_schema)
+                            .recover_range(&attempt_request, range)
+                    }
                 },
             )
-            .await?;
+            .await
+            {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    if is_duckdb_blocking_timeout_error(&error) {
+                        log_recovery_plan_after_timeout(
+                            pool,
+                            blocking_slots,
+                            attempt_schema,
+                            attempt_table_name,
+                            attempt_request,
+                            range,
+                        )
+                        .await;
+                    }
+                    return Err(error);
+                }
+            };
             let elapsed = started.elapsed();
             lock_pacer(&attempt_pacer).observe(chunk.keys, chunk.recovered_bytes, elapsed);
             info!(
@@ -905,6 +928,57 @@ async fn recover_partial_update_chunk(
         }
     })
     .await
+}
+
+/// Budget for the plan lookup after a timed-out recovery statement.
+///
+/// `EXPLAIN` does not execute the statement, so this only has to cover
+/// planning: catalog metadata, file lists and statistics. It is deliberately
+/// far smaller than the foreground budget the statement just exhausted.
+const RECOVERY_PLAN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Logs the plan of the statement that just timed out.
+///
+/// Prod 2026-09-16 spent 20 hours on `stage=query_execution, timeout_ms=180000`
+/// with nothing to say where the time went. The plan says whether the read
+/// pruned data files, how many it reads, and how the key set is joined — which
+/// is what the next investigation needs and what no amount of retrying
+/// produces. A failure here is itself only diagnostic, so it is logged and
+/// dropped.
+async fn log_recovery_plan_after_timeout(
+    pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
+    blocking_slots: Arc<Semaphore>,
+    replicated_table_schema: ReplicatedTableSchema,
+    table_name: DuckLakeTableName,
+    request: Arc<PartialUpdateRecoveryRequest>,
+    range: std::ops::Range<usize>,
+) {
+    let keys = range.len();
+    let explain_table_name = table_name.clone();
+    let plan = run_duckdb_blocking_with_timeout(
+        pool,
+        blocking_slots,
+        RECOVERY_PLAN_TIMEOUT,
+        move |conn| {
+            StoredRowRecovery::new(conn, &explain_table_name, &replicated_table_schema)
+                .explain_range(&request, range)
+        },
+    )
+    .await;
+    match plan {
+        Ok(plan) => warn!(
+            table = %table_name,
+            keys,
+            plan = %plan,
+            "ducklake partial update recovery plan after timeout"
+        ),
+        Err(error) => warn!(
+            table = %table_name,
+            keys,
+            error = %query_log_detail(&error),
+            "ducklake partial update recovery plan could not be read"
+        ),
+    }
 }
 
 /// Locks the shared pacer, recovering a poisoned lock.
