@@ -14,7 +14,7 @@ use std::{
     error, fmt,
     hash::{Hash, Hasher},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -37,14 +37,17 @@ use tokio::{sync::Semaphore, time::Instant};
 use tokio_postgres::types::PgLsn;
 use tracing::{debug, info, trace, warn};
 
+#[cfg(test)]
+use crate::ducklake::partial_update::PartialUpdateRecovery;
 use crate::{
     ducklake::{
         DUCKLAKE_COLUMN_NAME_MAPPING, DuckLakeStreamingBatchConfig, DuckLakeTableName,
         LAKE_CATALOG,
         client::{
-            DuckLakeBlockingOperationContext, DuckLakeConnectionManager, format_query_error_detail,
+            DuckLakeBlockingOperationContext, DuckLakeConnectionManager, FOREGROUND_QUERY_TIMEOUT,
+            format_query_error_detail, is_duckdb_blocking_timeout_error,
             is_ducklake_shutdown_requested_error, run_duckdb_blocking,
-            run_duckdb_blocking_with_context,
+            run_duckdb_blocking_with_context, run_duckdb_blocking_with_timeout,
         },
         core::is_create_table_conflict,
         diagnostics::query_log_detail,
@@ -61,9 +64,9 @@ use crate::{
             RETRY_SCOPE_LABEL, SUB_BATCH_KIND_LABEL,
         },
         partial_update::{
-            PartialUpdateRecovery, PartialUpdateRecoveryKey, PartialUpdateRecoveryOutcome,
-            PartialUpdateRecoveryRequest, RecoveredPartialRows, StoredRowRecovery,
-            identity_predicate,
+            PartialUpdateRecoveryChunk, PartialUpdateRecoveryKey, PartialUpdateRecoveryOutcome,
+            PartialUpdateRecoveryRequest, RecoveredPartialRows, RecoveryChunkPacer,
+            StoredRowRecovery, identity_predicate,
         },
         replay_epoch::LEGACY_REPLAY_EPOCH,
         sql::{qualified_lake_table_name, quote_identifier},
@@ -79,6 +82,14 @@ const SQL_INSERT_BATCH_SIZE: usize = 128;
 /// Keep this small so each delete statement remains cheap while still avoiding
 /// one round-trip per deleted row.
 const SQL_DELETE_BATCH_SIZE: usize = 16;
+/// Identities one atomic batch may have to read back for its partial updates.
+///
+/// The streaming row and byte caps bound the events of a batch, and a batch of
+/// partial updates carries almost no bytes precisely because Postgres omitted
+/// the TOASTed columns. The read those events imply is the expensive part, so
+/// it needs its own cap: without one, a single batch can owe a read of every
+/// identity the row cap allows, on a table where each read statement is slow.
+const MAX_PARTIAL_UPDATE_KEYS_PER_BATCH: usize = 128;
 /// ETL-managed marker table storing per-table applied copy batches.
 const APPLIED_BATCHES_TABLE: &str = "__etl_applied_table_batches";
 /// Data inlining limit for append-only DuckLake helper tables.
@@ -754,11 +765,19 @@ fn covered_mutation_count(
     request.keys().get(covered_keys).map_or(chunk_len, |key| key.mutation_index.min(chunk_len))
 }
 
-/// Reads one batch's missing partial-update columns, retrying read failures.
+/// Reads one batch's missing partial-update columns, one statement at a time.
 ///
-/// A recovery read fails for the same transient reasons a commit does, so it
-/// shares the commit retry budget instead of surfacing one catalog or storage
-/// blip as a table-level failure.
+/// Each statement covers a range of the request's identities, runs under its
+/// own foreground timeout, and is sized from the bytes and elapsed time the
+/// earlier statements of the same request cost. A statement that times out
+/// halves the size of the next one instead of being repeated unchanged: the
+/// production incident this guards against is a table whose active data files
+/// grew into the tens of thousands, where one read of a whole batch's
+/// identities cannot finish inside any fixed timeout and every retry repeats
+/// exactly the work that already failed.
+///
+/// Every other read failure keeps the commit retry budget, because a recovery
+/// read fails for the same transient reasons a commit does.
 async fn recover_partial_update_rows_with_retry(
     pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
     blocking_slots: Arc<Semaphore>,
@@ -767,35 +786,133 @@ async fn recover_partial_update_rows_with_retry(
     request: Arc<PartialUpdateRecoveryRequest>,
 ) -> EtlResult<PartialUpdateRecoveryOutcome> {
     let requested_keys = request.keys().len();
-    let retry_table_name = table_name.clone();
+    let started = Instant::now();
+    let pacer = Arc::new(StdMutex::new(RecoveryChunkPacer::default()));
+    let mut recovered = RecoveredPartialRows::empty();
+    let mut covered_keys = 0usize;
+    let mut recovered_bytes = 0usize;
 
-    retry_recovery_read(retry_table_name, requested_keys, move || {
+    while covered_keys < requested_keys {
+        let remaining_bytes = request.max_recovered_bytes().saturating_sub(recovered_bytes);
+        let chunk = recover_partial_update_chunk(
+            Arc::clone(&pool),
+            Arc::clone(&blocking_slots),
+            replicated_table_schema.clone(),
+            table_name.clone(),
+            Arc::clone(&request),
+            Arc::clone(&pacer),
+            covered_keys,
+            remaining_bytes,
+        )
+        .await?;
+
+        covered_keys = covered_keys.saturating_add(chunk.keys);
+        recovered_bytes = recovered_bytes.saturating_add(chunk.recovered_bytes);
+        recovered.merge(chunk.recovered);
+        if recovered_bytes >= request.max_recovered_bytes() {
+            break;
+        }
+    }
+
+    info!(
+        table = %table_name,
+        keys = covered_keys,
+        requested_keys,
+        recovered_columns = request.columns().len(),
+        recovered_bytes,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "ducklake recovered partial update columns"
+    );
+
+    Ok(PartialUpdateRecoveryOutcome { recovered, covered_keys })
+}
+
+/// Reads one statement's worth of identities, retrying read failures.
+///
+/// The pacer is shared with the other statements of the same request, so a
+/// timeout shrinks the statement this call retries as well as every later one.
+#[expect(clippy::too_many_arguments, reason = "One recovery statement's full context")]
+async fn recover_partial_update_chunk(
+    pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
+    blocking_slots: Arc<Semaphore>,
+    replicated_table_schema: ReplicatedTableSchema,
+    table_name: DuckLakeTableName,
+    request: Arc<PartialUpdateRecoveryRequest>,
+    pacer: Arc<StdMutex<RecoveryChunkPacer>>,
+    covered_keys: usize,
+    remaining_bytes: usize,
+) -> EtlResult<PartialUpdateRecoveryChunk> {
+    let requested_keys = request.keys().len();
+    let retry_table_name = table_name.clone();
+    let retry_pacer = Arc::clone(&pacer);
+
+    retry_recovery_read(retry_table_name, requested_keys, retry_pacer, move || {
         let pool = Arc::clone(&pool);
         let blocking_slots = Arc::clone(&blocking_slots);
         let attempt_schema = replicated_table_schema.clone();
         let attempt_table_name = table_name.clone();
         let attempt_request = Arc::clone(&request);
+        let attempt_pacer = Arc::clone(&pacer);
         async move {
-            run_duckdb_blocking(pool, blocking_slots, move |conn| {
-                StoredRowRecovery::new(conn, &attempt_table_name, &attempt_schema)
-                    .recover(&attempt_request)
-            })
-            .await
+            let chunk_size = lock_pacer(&attempt_pacer).next_chunk_size(remaining_bytes);
+            let chunk_end = requested_keys.min(covered_keys.saturating_add(chunk_size));
+            let range = covered_keys..chunk_end;
+            let logged_table_name = attempt_table_name.clone();
+            let started = Instant::now();
+            let chunk = run_duckdb_blocking_with_timeout(
+                pool,
+                blocking_slots,
+                FOREGROUND_QUERY_TIMEOUT,
+                move |conn| {
+                    StoredRowRecovery::new(conn, &attempt_table_name, &attempt_schema)
+                        .recover_range(&attempt_request, range)
+                },
+            )
+            .await?;
+            let elapsed = started.elapsed();
+            lock_pacer(&attempt_pacer).observe(chunk.keys, chunk.recovered_bytes, elapsed);
+            info!(
+                table = %logged_table_name,
+                keys = chunk.keys,
+                requested_keys,
+                recovered_bytes = chunk.recovered_bytes,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "ducklake partial update recovery chunk completed"
+            );
+
+            Ok(chunk)
         }
     })
     .await
 }
 
-/// Retries one recovery read with the batch commit retry budget.
+/// Locks the shared pacer, recovering a poisoned lock.
+///
+/// The pacer only carries sizing hints, so a panic in another statement of the
+/// same request must not turn into a failed batch.
+fn lock_pacer(
+    pacer: &StdMutex<RecoveryChunkPacer>,
+) -> std::sync::MutexGuard<'_, RecoveryChunkPacer> {
+    pacer.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Retries one recovery statement with the batch commit retry budget.
+///
+/// A timeout halves the statement before the retry, and a statement that has
+/// already shrunk to a single identity stops retrying: repeating it cannot
+/// succeed, and holding the write path for ten more timeouts is what kept the
+/// incident's replication slot from advancing.
 async fn retry_recovery_read<AttemptFn, AttemptFut>(
     table_name: DuckLakeTableName,
     requested_keys: usize,
+    pacer: Arc<StdMutex<RecoveryChunkPacer>>,
     attempt: AttemptFn,
-) -> EtlResult<PartialUpdateRecoveryOutcome>
+) -> EtlResult<PartialUpdateRecoveryChunk>
 where
     AttemptFn: FnMut() -> AttemptFut,
-    AttemptFut: std::future::Future<Output = EtlResult<PartialUpdateRecoveryOutcome>>,
+    AttemptFut: std::future::Future<Output = EtlResult<PartialUpdateRecoveryChunk>>,
 {
+    let decision_pacer = Arc::clone(&pacer);
     retry_with_backoff(
         RetryPolicy {
             max_retries: MAX_COMMIT_RETRIES,
@@ -804,7 +921,16 @@ where
                 MAX_RETRY_DELAY_MS.max(TRANSIENT_DELETE_FILE_RETRY_DELAY_MS),
             ),
         },
-        ducklake_retry_decision,
+        move |error: &etl::error::EtlError| {
+            if !is_duckdb_blocking_timeout_error(error) {
+                return ducklake_retry_decision(error);
+            }
+            if lock_pacer(&decision_pacer).shrink() {
+                RetryDecision::Retry
+            } else {
+                RetryDecision::Stop
+            }
+        },
         jitter_ducklake_retry_delay,
         |attempt: RetryAttempt<'_, etl::error::EtlError>| {
             counter!(
@@ -818,6 +944,7 @@ where
                 max = attempt.max_retries,
                 table = %table_name,
                 keys = requested_keys,
+                chunk_limit = lock_pacer(&pacer).limit(),
                 error = %query_log_detail(attempt.error),
                 "ducklake partial update recovery attempt failed, retrying"
             );
@@ -955,20 +1082,27 @@ fn split_tracked_mutations(
     let mut chunks = Vec::new();
     let mut pending_mutations = Vec::new();
     let mut pending_bytes = 0usize;
+    let mut pending_recovery_keys = 0usize;
 
     for tracked_mutation in tracked_mutations {
         let mutation_bytes = mutation_size_hint(&tracked_mutation.mutation);
+        let recovery_keys = usize::from(needs_partial_update_recovery(&tracked_mutation.mutation));
         if !pending_mutations.is_empty()
-            && pending_bytes.saturating_add(mutation_bytes) > config.max_bytes
+            && (pending_bytes.saturating_add(mutation_bytes) > config.max_bytes
+                || pending_recovery_keys.saturating_add(recovery_keys)
+                    > MAX_PARTIAL_UPDATE_KEYS_PER_BATCH)
         {
             chunks.push(std::mem::take(&mut pending_mutations));
             pending_bytes = 0;
+            pending_recovery_keys = 0;
         }
         pending_bytes = pending_bytes.saturating_add(mutation_bytes);
+        pending_recovery_keys = pending_recovery_keys.saturating_add(recovery_keys);
         pending_mutations.push(tracked_mutation);
         if pending_mutations.len() >= config.max_rows {
             chunks.push(std::mem::take(&mut pending_mutations));
             pending_bytes = 0;
+            pending_recovery_keys = 0;
         }
     }
 
@@ -977,6 +1111,19 @@ fn split_tracked_mutations(
     }
 
     chunks
+}
+
+/// Returns whether one mutation may owe a recovery read.
+///
+/// The count is deliberately an upper bound: repeated identities and updates
+/// the normalizer completes in memory are counted once each, which splits a
+/// batch slightly earlier instead of planning a read the batch cannot afford.
+fn needs_partial_update_recovery(mutation: &TableMutation) -> bool {
+    matches!(
+        mutation,
+        TableMutation::Update { new_row: UpdatedTableRow::Partial(partial_row), .. }
+            if !partial_row.missing_column_indexes().is_empty()
+    )
 }
 
 /// Prepares every atomic batch of one table's CDC mutations up front.
@@ -3269,7 +3416,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::ducklake::partial_update::AbsentStoredRows;
+    use crate::ducklake::{
+        client::duckdb_blocking_timeout_error, partial_update::AbsentStoredRows,
+    };
 
     #[test]
     fn sequence_key_format_preserves_fixed_width_hex_encoding() {
@@ -5481,10 +5630,24 @@ mod tests {
         );
     }
 
+    /// Builds a pacer handle for the retry tests.
+    fn test_pacer() -> Arc<StdMutex<RecoveryChunkPacer>> {
+        Arc::new(StdMutex::new(RecoveryChunkPacer::default()))
+    }
+
+    /// Builds one recovery chunk result of `keys` identities.
+    fn test_chunk(keys: usize) -> PartialUpdateRecoveryChunk {
+        PartialUpdateRecoveryChunk {
+            recovered: RecoveredPartialRows::empty(),
+            recovered_bytes: 0,
+            keys,
+        }
+    }
+
     #[tokio::test]
     async fn recovery_read_retries_a_transient_failure() {
         let attempts = std::cell::Cell::new(0usize);
-        let outcome = retry_recovery_read(ducklake_table_name(), 3, || {
+        let chunk = retry_recovery_read(ducklake_table_name(), 3, test_pacer(), || {
             let attempt = attempts.get() + 1;
             attempts.set(attempt);
             async move {
@@ -5495,26 +5658,23 @@ mod tests {
                     ));
                 }
 
-                Ok(PartialUpdateRecoveryOutcome {
-                    recovered: RecoveredPartialRows::empty(),
-                    covered_keys: 3,
-                })
+                Ok(test_chunk(3))
             }
         })
         .await
         .unwrap();
 
         assert_eq!(attempts.get(), 2);
-        assert_eq!(outcome.covered_keys, 3);
+        assert_eq!(chunk.keys, 3);
     }
 
     #[tokio::test]
     async fn recovery_read_stops_retrying_on_shutdown() {
         let attempts = std::cell::Cell::new(0usize);
-        let error = retry_recovery_read(ducklake_table_name(), 1, || {
+        let error = retry_recovery_read(ducklake_table_name(), 1, test_pacer(), || {
             attempts.set(attempts.get() + 1);
             async move {
-                Err::<PartialUpdateRecoveryOutcome, _>(etl_error!(
+                Err::<PartialUpdateRecoveryChunk, _>(etl_error!(
                     ErrorKind::DestinationConnectionFailed,
                     "DuckLake shutdown requested"
                 ))
@@ -5525,5 +5685,117 @@ mod tests {
 
         assert_eq!(attempts.get(), 1);
         assert_eq!(error.kind(), ErrorKind::DestinationConnectionFailed);
+    }
+
+    /// A timed-out read must come back smaller, not identical.
+    ///
+    /// The incident this guards against retried the same 187-identity read ten
+    /// times, each one hitting the same three-minute timeout, so the batch
+    /// spent half an hour without reading a single identity.
+    #[tokio::test]
+    async fn a_timed_out_recovery_read_halves_the_next_statement() {
+        let pacer = test_pacer();
+        let attempts = std::cell::Cell::new(0usize);
+        let limits = Arc::new(StdMutex::new(Vec::new()));
+        let attempt_pacer = Arc::clone(&pacer);
+        let attempt_limits = Arc::clone(&limits);
+        let chunk = retry_recovery_read(ducklake_table_name(), 1024, Arc::clone(&pacer), || {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            let attempt_pacer = Arc::clone(&attempt_pacer);
+            let attempt_limits = Arc::clone(&attempt_limits);
+            async move {
+                attempt_limits.lock().unwrap().push(lock_pacer(&attempt_pacer).limit());
+                if attempt <= 3 {
+                    return Err(duckdb_blocking_timeout_error(
+                        Duration::from_secs(180),
+                        "query_execution",
+                    ));
+                }
+
+                Ok(test_chunk(8))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(chunk.keys, 8);
+        assert_eq!(
+            limits.lock().unwrap().as_slice(),
+            [1024, 512, 256, 128],
+            "every retry after a timeout must plan a strictly smaller statement"
+        );
+    }
+
+    /// A single identity that still times out cannot be made smaller, so the
+    /// read must fail instead of holding the write path for ten more timeouts.
+    #[tokio::test]
+    async fn a_recovery_read_that_cannot_shrink_further_stops_retrying() {
+        let pacer = Arc::new(StdMutex::new(RecoveryChunkPacer::default()));
+        while lock_pacer(&pacer).shrink() {}
+        assert_eq!(lock_pacer(&pacer).limit(), 1);
+
+        let attempts = std::cell::Cell::new(0usize);
+        let error = retry_recovery_read(ducklake_table_name(), 1, pacer, || {
+            attempts.set(attempts.get() + 1);
+            async move {
+                Err::<PartialUpdateRecoveryChunk, _>(duckdb_blocking_timeout_error(
+                    Duration::from_secs(180),
+                    "query_execution",
+                ))
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(attempts.get(), 1);
+        assert!(is_duckdb_blocking_timeout_error(&error));
+    }
+
+    /// The identities a batch owes a read for are their own cost, so they cap
+    /// the batch independently of its rows and bytes.
+    #[test]
+    fn partial_updates_split_a_batch_by_the_identities_they_read_back() {
+        let schema = toast_replicated_schema();
+        let config = DuckLakeStreamingBatchConfig::new(100_000, 100 * 1024 * 1024).unwrap();
+        let mutations: Vec<TrackedTableMutation> = (0..MAX_PARTIAL_UPDATE_KEYS_PER_BATCH * 2 + 1)
+            .map(|id| {
+                TrackedTableMutation::new(
+                    EventSequenceKey::new(PgLsn::from(100), u64::try_from(id).unwrap()),
+                    toast_partial_update(i32::try_from(id).unwrap(), "after"),
+                )
+            })
+            .collect();
+        let total = mutations.len();
+
+        let chunks = split_tracked_mutations(config, mutations);
+
+        assert_eq!(chunks.len(), 3, "the row and byte caps alone would keep one batch");
+        for chunk in &chunks {
+            assert!(
+                chunk
+                    .iter()
+                    .filter(|tracked| needs_partial_update_recovery(&tracked.mutation))
+                    .count()
+                    <= MAX_PARTIAL_UPDATE_KEYS_PER_BATCH,
+                "a batch may not owe more than {MAX_PARTIAL_UPDATE_KEYS_PER_BATCH} recovery keys"
+            );
+        }
+        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), total, "no event may be dropped");
+        // Full-row events carry their own values, so they never split a batch.
+        let full_rows: Vec<TrackedTableMutation> = (0..MAX_PARTIAL_UPDATE_KEYS_PER_BATCH * 2)
+            .map(|id| {
+                TrackedTableMutation::new(
+                    EventSequenceKey::new(PgLsn::from(200), u64::try_from(id).unwrap()),
+                    TableMutation::Insert(TableRow::new(vec![
+                        Cell::I32(i32::try_from(id).unwrap()),
+                        Cell::String("state".to_owned()),
+                        Cell::String("payload".to_owned()),
+                    ])),
+                )
+            })
+            .collect();
+        assert_eq!(split_tracked_mutations(config, full_rows).len(), 1);
+        let _ = &schema;
     }
 }
