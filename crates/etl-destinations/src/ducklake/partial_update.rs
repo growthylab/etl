@@ -660,6 +660,7 @@ impl StoredRowRecovery<'_> {
         request: &PartialUpdateRecoveryRequest,
         range: std::ops::Range<usize>,
         analyze: bool,
+        key_ordered_storage: bool,
     ) -> EtlResult<String> {
         let identity_columns: Vec<&ColumnSchema> =
             self.replicated_table_schema.identity_column_schemas().collect();
@@ -670,7 +671,7 @@ impl StoredRowRecovery<'_> {
         // analyzed plan of the unsplit range would re-run exactly the wide scan
         // the grouping exists to avoid.
         let mut shapes = Vec::new();
-        for group in adjacency_groups(&request.keys()[range]) {
+        for group in adjacency_groups(&request.keys()[range], key_ordered_storage) {
             let Some(sql) = self.recovery_sql(&group, &identity_columns, &recovered_columns) else {
                 continue;
             };
@@ -720,6 +721,7 @@ impl StoredRowRecovery<'_> {
         &self,
         request: &PartialUpdateRecoveryRequest,
         range: std::ops::Range<usize>,
+        key_ordered_storage: bool,
     ) -> EtlResult<PartialUpdateRecoveryChunk> {
         let identity_columns: Vec<&ColumnSchema> =
             self.replicated_table_schema.identity_column_schemas().collect();
@@ -733,7 +735,7 @@ impl StoredRowRecovery<'_> {
         // One statement per adjacency group: the range predicate brackets a
         // whole statement, so keys that sit far apart are read as everything
         // in between unless they are asked for separately.
-        let groups = adjacency_groups(keys);
+        let groups = adjacency_groups(keys, key_ordered_storage);
         let statements = groups.len();
         for group in groups {
             // Each group is its own statement, so the injected timeout applies
@@ -793,7 +795,9 @@ impl PartialUpdateRecovery for StoredRowRecovery<'_> {
                 .next_chunk_size(request.max_recovered_bytes().saturating_sub(recovered_bytes));
             let chunk_end = keys.len().min(covered_keys.saturating_add(chunk_size));
             let chunk_started = Instant::now();
-            let chunk = self.recover_range(request, covered_keys..chunk_end)?;
+            // The synchronous driver is the test-facing one; it groups keys so
+            // its statements match what production emits on sorted storage.
+            let chunk = self.recover_range(request, covered_keys..chunk_end, true)?;
             pacer.observe(chunk.keys, chunk.recovered_bytes, chunk_started.elapsed());
             recovered_bytes = recovered_bytes.saturating_add(chunk.recovered_bytes);
             recovered.merge(chunk.recovered);
@@ -824,9 +828,16 @@ impl PartialUpdateRecovery for StoredRowRecovery<'_> {
 /// for themselves only when each one reads a much smaller part of the table.
 /// A composite or non-canonical identity has no distance to measure, so it
 /// stays one group.
-fn adjacency_groups(keys: &[PartialUpdateRecoveryKey]) -> Vec<Vec<&PartialUpdateRecoveryKey>> {
+fn adjacency_groups(
+    keys: &[PartialUpdateRecoveryKey],
+    key_ordered_storage: bool,
+) -> Vec<Vec<&PartialUpdateRecoveryKey>> {
     let whole = || vec![keys.iter().collect::<Vec<_>>()];
-    if keys.len() < 2 {
+    // On storage that is not ordered by the identity, a narrow key range is not
+    // a narrow range of the files: every statement would read the same payload
+    // again and only add its own fixed cost. The caller knows whether the table
+    // has a sort order; without one, the read stays a single statement.
+    if !key_ordered_storage || keys.len() < 2 {
         return whole();
     }
     let mut ordered: Vec<(u128, &PartialUpdateRecoveryKey)> = Vec::with_capacity(keys.len());
@@ -1341,7 +1352,7 @@ mod tests {
 
     /// Returns the identities of each group, in the group's own order.
     fn grouped_predicates(keys: &[PartialUpdateRecoveryKey]) -> Vec<Vec<String>> {
-        adjacency_groups(keys)
+        adjacency_groups(keys, true)
             .into_iter()
             .map(|group| group.iter().map(|key| key.predicate.clone()).collect())
             .collect()
@@ -1390,6 +1401,19 @@ mod tests {
         );
     }
 
+    /// Unordered storage gets one statement, however scattered the keys are.
+    ///
+    /// A narrow key range is only a narrow range of the files when the files
+    /// are ordered by that key. Without the order, extra statements read the
+    /// same payload again and add nothing but their own fixed cost.
+    #[test]
+    fn storage_that_is_not_key_ordered_is_never_split() {
+        let keys = integer_keys(&[100, 101, 102, 5_000_000]);
+
+        assert_eq!(adjacency_groups(&keys, false).len(), 1);
+        assert_eq!(adjacency_groups(&keys, true).len(), 2);
+    }
+
     /// An identity with no distance to measure stays one statement.
     #[test]
     fn a_non_canonical_identity_is_not_grouped() {
@@ -1412,7 +1436,7 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(adjacency_groups(&keys).len(), 1);
+        assert_eq!(adjacency_groups(&keys, true).len(), 1);
     }
 
     /// The pacer's whole job: never plan a statement whose observed cost would
@@ -1560,7 +1584,7 @@ mod tests {
 
         for analyze in [false, true] {
             let plan = recovery
-                .explain_range(&request, 0..1, analyze)
+                .explain_range(&request, 0..1, analyze, true)
                 .unwrap_or_else(|error| panic!("analyze={analyze} plan failed: {error}"));
 
             assert!(

@@ -683,6 +683,7 @@ pub(super) async fn prepare_and_apply_mutation_table_batches(
     replay_epoch: String,
     tracked_mutations: Vec<TrackedTableMutation>,
     checkpoint_lease: &mut CheckpointLease,
+    key_ordered_storage: bool,
 ) -> EtlResult<()> {
     let mut pending_chunks: VecDeque<Vec<TrackedTableMutation>> =
         split_tracked_mutations(config, tracked_mutations).into();
@@ -713,6 +714,7 @@ pub(super) async fn prepare_and_apply_mutation_table_batches(
                     replicated_table_schema.clone(),
                     table_name.clone(),
                     Arc::clone(&request),
+                    key_ordered_storage,
                 )
                 .await?;
                 // A read that stopped at its byte budget leaves the events
@@ -803,6 +805,7 @@ async fn recover_partial_update_rows_with_retry(
     replicated_table_schema: ReplicatedTableSchema,
     table_name: DuckLakeTableName,
     request: Arc<PartialUpdateRecoveryRequest>,
+    key_ordered_storage: bool,
 ) -> EtlResult<PartialUpdateRecoveryOutcome> {
     let requested_keys = request.keys().len();
     let started = Instant::now();
@@ -826,6 +829,7 @@ async fn recover_partial_update_rows_with_retry(
             Arc::clone(&explained),
             covered_keys,
             remaining_bytes,
+            key_ordered_storage,
         )
         .await?;
 
@@ -865,6 +869,7 @@ async fn recover_partial_update_chunk(
     explained: Arc<AtomicBool>,
     covered_keys: usize,
     remaining_bytes: usize,
+    key_ordered_storage: bool,
 ) -> EtlResult<PartialUpdateRecoveryChunk> {
     let requested_keys = request.keys().len();
     let retry_table_name = table_name.clone();
@@ -895,7 +900,7 @@ async fn recover_partial_update_chunk(
                     let range = range.clone();
                     move |conn| {
                         StoredRowRecovery::new(conn, &attempt_table_name, &attempt_schema)
-                            .recover_range(&attempt_request, range)
+                            .recover_range(&attempt_request, range, key_ordered_storage)
                     }
                 },
             )
@@ -915,6 +920,7 @@ async fn recover_partial_update_chunk(
                             range,
                             false,
                             "timeout",
+                            key_ordered_storage,
                         )
                         .await;
                     }
@@ -939,6 +945,7 @@ async fn recover_partial_update_chunk(
                     range,
                     true,
                     "slow_statement",
+                    key_ordered_storage,
                 )
                 .await;
             }
@@ -1019,6 +1026,7 @@ async fn log_recovery_plan(
     range: std::ops::Range<usize>,
     analyze: bool,
     reason: &'static str,
+    key_ordered_storage: bool,
 ) {
     let keys = range.len();
     let explain_table_name = table_name.clone();
@@ -1028,11 +1036,12 @@ async fn log_recovery_plan(
         true => FOREGROUND_QUERY_TIMEOUT,
         false => RECOVERY_PLAN_TIMEOUT,
     };
-    let plan = run_duckdb_blocking_with_timeout(pool, blocking_slots, budget, move |conn| {
-        StoredRowRecovery::new(conn, &explain_table_name, &replicated_table_schema)
-            .explain_range(&request, range, analyze)
-    })
-    .await;
+    let plan =
+        run_duckdb_blocking_with_timeout(pool, blocking_slots, budget, move |conn| {
+            StoredRowRecovery::new(conn, &explain_table_name, &replicated_table_schema)
+                .explain_range(&request, range, analyze, key_ordered_storage)
+        })
+        .await;
     match plan {
         Ok(plan) => warn!(
             table = %table_name,
