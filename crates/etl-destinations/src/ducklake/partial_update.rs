@@ -53,19 +53,29 @@ const RECOVERY_PROBE_KEY_BATCH_SIZE: usize = 1;
 ///
 /// The byte budget alone says nothing about how long a statement runs: the
 /// same identities cost milliseconds on a compacted table and minutes on one
-/// with tens of thousands of small data files. Sizing later statements from
-/// the seconds per identity already observed keeps one statement well inside
-/// the caller's timeout, so a slow table degrades into more, smaller reads
-/// instead of one read that never returns.
-const RECOVERY_CHUNK_TARGET_ELAPSED: Duration = Duration::from_secs(30);
+/// whose reads are slow for any other reason. Sizing later statements from the
+/// seconds per identity already observed keeps one statement inside the
+/// caller's timeout, so a slow table degrades into more, smaller reads instead
+/// of one read that never returns.
+///
+/// Half the foreground budget: prod 2026-09-17 spent an hour on one batch
+/// because statements that took 30 s were capped at a 30 s target and never
+/// grew. Aiming at half the budget leaves room for a statement that turns out
+/// more expensive than the previous one while still leaving the timeout as the
+/// real boundary.
+const RECOVERY_CHUNK_TARGET_ELAPSED: Duration = Duration::from_secs(90);
 
-/// Factor by which one statement may grow over the previous one.
+/// Factor by which one statement may grow when the last one was well inside
+/// the target.
 ///
 /// Growth is geometric rather than a jump to whatever the cost model allows:
 /// each step re-measures at the larger size, so a request finds its workable
 /// statement size in a few statements without repeating a size that has
-/// already timed out.
+/// already timed out. A request of 187 identities reaches them in five
+/// statements instead of sixty.
 const RECOVERY_CHUNK_GROWTH: usize = 4;
+/// Factor used when the last statement was already close to the target.
+const RECOVERY_CHUNK_CAUTIOUS_GROWTH: usize = 2;
 
 /// Sizes the statements of one recovery from what the earlier ones cost.
 ///
@@ -88,8 +98,12 @@ pub(super) struct RecoveryChunkPacer {
     /// Identities the last statement covered, which bounds the next one's
     /// growth.
     last_chunk_keys: usize,
-    /// Cheapest statement seen, taken as the per-statement overhead.
-    overhead: Duration,
+    /// Elapsed time of the last statement, which sets how fast it may grow.
+    last_chunk_elapsed: Duration,
+    /// Sum of identities squared, for the least-squares cost fit.
+    keys_squared: u128,
+    /// Sum of identities times elapsed nanoseconds, for the same fit.
+    keys_elapsed_product: f64,
 }
 
 impl Default for RecoveryChunkPacer {
@@ -101,7 +115,9 @@ impl Default for RecoveryChunkPacer {
             elapsed: Duration::ZERO,
             statements: 0,
             last_chunk_keys: 0,
-            overhead: Duration::ZERO,
+            last_chunk_elapsed: Duration::ZERO,
+            keys_squared: 0,
+            keys_elapsed_product: 0.0,
         }
     }
 }
@@ -127,9 +143,24 @@ impl RecoveryChunkPacer {
             0 => RECOVERY_KEY_BATCH_SIZE,
             recovered_bytes => remaining_bytes / recovered_bytes.div_ceil(self.covered_keys),
         };
-        let growth = self.last_chunk_keys.saturating_mul(RECOVERY_CHUNK_GROWTH).max(1);
+        let growth = self.last_chunk_keys.saturating_mul(self.growth_factor()).max(1);
 
         by_bytes.min(self.keys_within_target_elapsed()).min(growth).clamp(1, self.limit)
+    }
+
+    /// Returns how aggressively the next statement may grow.
+    ///
+    /// A statement that finished in well under the target has room to grow
+    /// fast; one that came close to it grows carefully, and one that passed it
+    /// does not grow at all. The timeout still halves the limit if a statement
+    /// exceeds the whole budget.
+    fn growth_factor(&self) -> usize {
+        let target = RECOVERY_CHUNK_TARGET_ELAPSED;
+        match self.last_chunk_elapsed {
+            elapsed if elapsed.saturating_mul(2) <= target => RECOVERY_CHUNK_GROWTH,
+            elapsed if elapsed <= target => RECOVERY_CHUNK_CAUTIOUS_GROWTH,
+            _ => 1,
+        }
     }
 
     /// Returns how many identities fit the elapsed target at the marginal cost
@@ -144,19 +175,50 @@ impl RecoveryChunkPacer {
             return RECOVERY_KEY_BATCH_SIZE;
         };
         let budget =
-            RECOVERY_CHUNK_TARGET_ELAPSED.as_nanos().saturating_sub(self.overhead.as_nanos());
+            RECOVERY_CHUNK_TARGET_ELAPSED.as_nanos().saturating_sub(self.fitted_overhead_nanos());
 
         usize::try_from(budget / marginal).unwrap_or(RECOVERY_KEY_BATCH_SIZE)
     }
 
     /// Returns the observed nanoseconds each identity adds to one statement.
+    ///
+    /// A least-squares fit over the observed (identities, elapsed) pairs, which
+    /// separates the per-statement overhead from the per-identity cost instead
+    /// of assuming the cheapest statement was all overhead: that assumption
+    /// charges the cheapest statement's own identities to overhead and
+    /// underestimates the marginal cost exactly where it matters — a workload
+    /// whose runtime really does scale with the number of identities.
+    ///
+    /// Returns [`None`] until two statements of different sizes have been
+    /// observed, or when the fitted slope is not positive, in which case the
+    /// elapsed target cannot bound anything and growth does the bounding.
     fn marginal_nanos_per_key(&self) -> Option<u128> {
-        let statements = u128::try_from(self.statements).unwrap_or(1).max(1);
-        let overhead = self.overhead.as_nanos().saturating_mul(statements);
-        let marginal = self.elapsed.as_nanos().saturating_sub(overhead);
-        let per_key = marginal / u128::try_from(self.covered_keys).unwrap_or(1).max(1);
+        let statements = self.statements as f64;
+        if self.statements < 2 {
+            return None;
+        }
+        let mean_keys = self.covered_keys as f64 / statements;
+        let mean_elapsed = self.elapsed.as_nanos() as f64 / statements;
+        let covariance = self.keys_elapsed_product - statements * mean_keys * mean_elapsed;
+        let variance = self.keys_squared as f64 - statements * mean_keys * mean_keys;
+        if variance <= f64::EPSILON {
+            return None;
+        }
+        let slope = covariance / variance;
+        (slope > 0.0).then(|| slope.round().max(1.0) as u128)
+    }
 
-        (per_key > 0).then_some(per_key)
+    /// Returns the fitted per-statement overhead.
+    fn fitted_overhead_nanos(&self) -> u128 {
+        let Some(marginal) = self.marginal_nanos_per_key() else {
+            return 0;
+        };
+        let statements = self.statements.max(1) as f64;
+        let mean_keys = self.covered_keys as f64 / statements;
+        let mean_elapsed = self.elapsed.as_nanos() as f64 / statements;
+        let overhead = mean_elapsed - marginal as f64 * mean_keys;
+
+        overhead.max(0.0) as u128
     }
 
     /// Records what one completed statement covered and cost.
@@ -166,10 +228,10 @@ impl RecoveryChunkPacer {
         self.elapsed = self.elapsed.saturating_add(elapsed);
         self.statements = self.statements.saturating_add(1);
         self.last_chunk_keys = keys;
-        self.overhead = match self.statements {
-            1 => elapsed,
-            _ => self.overhead.min(elapsed),
-        };
+        self.last_chunk_elapsed = elapsed;
+        let keys_observed = keys as u128;
+        self.keys_squared = self.keys_squared.saturating_add(keys_observed * keys_observed);
+        self.keys_elapsed_product += keys as f64 * elapsed.as_nanos() as f64;
     }
 
     /// Halves the statement limit after a timeout.
@@ -189,7 +251,9 @@ impl RecoveryChunkPacer {
         self.elapsed = Duration::ZERO;
         self.statements = 0;
         self.last_chunk_keys = 0;
-        self.overhead = Duration::ZERO;
+        self.last_chunk_elapsed = Duration::ZERO;
+        self.keys_squared = 0;
+        self.keys_elapsed_product = 0.0;
 
         true
     }
@@ -565,15 +629,21 @@ impl StoredRowRecovery<'_> {
         Ok(recovered_columns)
     }
 
-    /// Returns the query plan of one range's statement, without running it.
+    /// Returns the structure of one range's plan, without its literals.
     ///
-    /// `EXPLAIN` does not execute, so this stays cheap even for the statement
-    /// that has just exhausted a three-minute budget — and the plan is what
-    /// says whether the read pruned data files or scanned the table.
+    /// `analyze` runs the statement and returns the plan with its measured
+    /// rows, files and timings; without it the statement is only planned.
+    ///
+    /// The plan is reduced to operator names and numeric metrics before it is
+    /// returned. DuckDB renders filters and the inline key list into the plan,
+    /// and those carry source identity values — on `http_request_traces` the
+    /// same row also carries credential columns — so the text itself must
+    /// never reach a log.
     pub(super) fn explain_range(
         &self,
         request: &PartialUpdateRecoveryRequest,
         range: std::ops::Range<usize>,
+        analyze: bool,
     ) -> EtlResult<String> {
         let identity_columns: Vec<&ColumnSchema> =
             self.replicated_table_schema.identity_column_schemas().collect();
@@ -585,28 +655,28 @@ impl StoredRowRecovery<'_> {
         else {
             return Ok(String::new());
         };
+        let explain = match analyze {
+            true => format!("EXPLAIN ANALYZE (FORMAT JSON) {sql}"),
+            false => format!("EXPLAIN (FORMAT JSON) {sql}"),
+        };
 
-        let mut statement = self.conn.prepare(&format!("EXPLAIN {sql}")).map_err(|source| {
+        let plan_error = |source: duckdb::Error| {
             etl_error!(
                 ErrorKind::DestinationQueryFailed,
                 "DuckLake partial update recovery plan failed",
                 source: source
             )
-        })?;
-        let plan = statement
+        };
+        let mut statement = self.conn.prepare(&explain).map_err(plan_error)?;
+        let plans = statement
             .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|source| {
-                etl_error!(
-                    ErrorKind::DestinationQueryFailed,
-                    "DuckLake partial update recovery plan failed",
-                    source: source
-                )
-            })?
-            .filter_map(Result::ok)
-            .collect::<Vec<_>>()
-            .join("\n");
+            .map_err(plan_error)?
+            // A row that cannot be decoded is a diagnostic failure of its own:
+            // returning a partial plan as a success hides it.
+            .collect::<Result<Vec<String>, duckdb::Error>>()
+            .map_err(plan_error)?;
 
-        Ok(plan)
+        Ok(plans.iter().map(|plan| plan_shape(plan)).collect::<Vec<_>>().join("\n"))
     }
 
     /// Reads one range of a request's identities with a single statement.
@@ -696,6 +766,73 @@ impl PartialUpdateRecovery for StoredRowRecovery<'_> {
         );
 
         Ok(PartialUpdateRecoveryOutcome { recovered, covered_keys })
+    }
+}
+
+/// Reduces one JSON plan to operator names and numeric metrics.
+///
+/// Anything that is not a number is dropped, which removes filters, the inline
+/// key list and every other rendering of a source value while keeping what a
+/// slow read has to be diagnosed with: which operators ran, how many rows and
+/// files they touched, and how long they took.
+fn plan_shape(plan: &str) -> String {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(plan) else {
+        return "<unparsable plan>".to_owned();
+    };
+    let mut shape = String::new();
+    push_plan_shape(&parsed, 0, &mut shape);
+
+    shape
+}
+
+/// Appends one plan node and its children to `shape`.
+fn push_plan_shape(node: &serde_json::Value, depth: usize, shape: &mut String) {
+    if let Some(nodes) = node.as_array() {
+        for node in nodes {
+            push_plan_shape(node, depth, shape);
+        }
+        return;
+    }
+    let Some(node) = node.as_object() else {
+        return;
+    };
+    let name = node
+        .get("operator_type")
+        .or_else(|| node.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("UNKNOWN");
+    shape.push_str(&"  ".repeat(depth));
+    shape.push_str(name);
+    for key in ["operator_cardinality", "operator_rows_scanned", "operator_timing", "cardinality"] {
+        if let Some(value) = node.get(key).and_then(numeric_plan_value) {
+            shape.push_str(&format!(" {key}={value}"));
+        }
+    }
+    if let Some(extra) = node.get("extra_info").and_then(serde_json::Value::as_object) {
+        for (key, value) in extra {
+            if let Some(value) = numeric_plan_value(value) {
+                shape.push_str(&format!(" {key}={value}"));
+            }
+        }
+    }
+    shape.push('\n');
+    if let Some(children) = node.get("children") {
+        push_plan_shape(children, depth + 1, shape);
+    }
+}
+
+/// Returns a plan value only when it is a number, or a string holding one.
+///
+/// DuckDB reports some metrics as strings; a value that is not a number is a
+/// rendering of the query and never leaves this function.
+fn numeric_plan_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::String(text) => {
+            let cleaned: String = text.chars().filter(|character| *character != ',').collect();
+            cleaned.parse::<f64>().ok().map(|_| cleaned)
+        }
+        _ => None,
     }
 }
 
@@ -1066,8 +1203,8 @@ mod tests {
             "the first statement measures one identity"
         );
 
-        // 1 KiB and 10 ms for one identity: with nothing to separate overhead
-        // from marginal cost yet, growth is what bounds the next statement.
+        // One fast identity: nothing to fit a cost model to yet, so growth is
+        // what bounds the next statement.
         pacer.observe(1, 1024, Duration::from_millis(10));
         assert_eq!(pacer.next_chunk_size(usize::MAX), RECOVERY_CHUNK_GROWTH);
 
@@ -1088,34 +1225,57 @@ mod tests {
     /// tiny.
     ///
     /// Prod 2026-09-17 measured 4–12 s per recovery statement for one to five
-    /// identities. Averaging that over the identities makes every later
-    /// statement look like it can afford three of them, so a 187-identity
-    /// request would take sixty statements and five minutes.
+    /// identities, and later 29–34 s for one identity each. Averaging that over
+    /// the identities makes every later statement look like it can afford three
+    /// of them: one batch of 187 identities took an hour that way, while the
+    /// backlog grew by 190 MB per hour.
     #[test]
     fn a_fixed_per_statement_cost_does_not_cap_the_next_statement() {
         let mut pacer = RecoveryChunkPacer::default();
-        pacer.observe(1, 1024, Duration::from_millis(9_500));
-        pacer.observe(3, 3 * 1024, Duration::from_millis(6_000));
-        pacer.observe(12, 12 * 1024, Duration::from_millis(5_900));
+        pacer.observe(1, 1024, Duration::from_millis(30_000));
+        assert_eq!(
+            pacer.next_chunk_size(usize::MAX),
+            RECOVERY_CHUNK_GROWTH,
+            "a 30 s statement is inside half the 90 s target, so it may still grow fast"
+        );
+        pacer.observe(4, 4 * 1024, Duration::from_millis(31_000));
+        pacer.observe(16, 16 * 1024, Duration::from_millis(32_000));
 
         assert_eq!(
             pacer.next_chunk_size(usize::MAX),
-            48,
+            64,
             "statements whose cost is mostly fixed must grow geometrically"
         );
     }
 
     /// A cost that really does scale with size still bounds the statement.
+    ///
+    /// The fit must not charge the cheapest statement's own identities to
+    /// overhead: with a real 2 s fixed cost plus 4 s per identity, 1 identity
+    /// in 6 s and 4 in 18 s must yield 4 s per identity, not 2.4.
     #[test]
     fn a_marginal_cost_per_identity_bounds_the_next_statement() {
         let mut pacer = RecoveryChunkPacer::default();
-        // 2 s of overhead and ~1.8 s per identity: the 30 s target leaves 28 s
-        // for identities, which is fifteen of them — well below what geometric
-        // growth alone would allow.
-        pacer.observe(1, 1024, Duration::from_secs(2));
-        pacer.observe(8, 8 * 1024, Duration::from_secs(18));
+        pacer.observe(1, 1024, Duration::from_secs(6));
+        pacer.observe(4, 4 * 1024, Duration::from_secs(18));
 
-        assert_eq!(pacer.next_chunk_size(usize::MAX), 15);
+        assert_eq!(
+            pacer.next_chunk_size(usize::MAX),
+            16,
+            "four times the last statement, still under the fitted twenty-two"
+        );
+        pacer.observe(8, 8 * 1024, Duration::from_secs(34));
+        assert_eq!(
+            pacer.next_chunk_size(usize::MAX),
+            22,
+            "88 s of identity budget at the fitted 4 s each, not the 36 growth would allow"
+        );
+        pacer.observe(16, 16 * 1024, Duration::from_secs(66));
+        assert_eq!(
+            pacer.next_chunk_size(usize::MAX),
+            22,
+            "a statement past half the target grows carefully, and the fit still binds"
+        );
     }
 
     #[test]

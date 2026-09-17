@@ -46,8 +46,9 @@ use crate::{
         client::{
             DuckLakeBlockingOperationContext, DuckLakeConnectionManager, FOREGROUND_QUERY_TIMEOUT,
             format_query_error_detail, is_duckdb_blocking_timeout_error,
-            is_ducklake_shutdown_requested_error, run_duckdb_blocking,
-            run_duckdb_blocking_with_context, run_duckdb_blocking_with_timeout,
+            is_duckdb_query_execution_timeout, is_ducklake_shutdown_requested_error,
+            run_duckdb_blocking, run_duckdb_blocking_with_context,
+            run_duckdb_blocking_with_timeout,
         },
         core::{CheckpointLease, is_create_table_conflict},
         diagnostics::query_log_detail,
@@ -806,6 +807,9 @@ async fn recover_partial_update_rows_with_retry(
     let requested_keys = request.keys().len();
     let started = Instant::now();
     let pacer = Arc::new(StdMutex::new(RecoveryChunkPacer::default()));
+    // One analyzed plan per request: running the statement again to measure it
+    // costs what the statement costs.
+    let explained = Arc::new(AtomicBool::new(false));
     let mut recovered = RecoveredPartialRows::empty();
     let mut covered_keys = 0usize;
     let mut recovered_bytes = 0usize;
@@ -819,6 +823,7 @@ async fn recover_partial_update_rows_with_retry(
             table_name.clone(),
             Arc::clone(&request),
             Arc::clone(&pacer),
+            Arc::clone(&explained),
             covered_keys,
             remaining_bytes,
         )
@@ -857,6 +862,7 @@ async fn recover_partial_update_chunk(
     table_name: DuckLakeTableName,
     request: Arc<PartialUpdateRecoveryRequest>,
     pacer: Arc<StdMutex<RecoveryChunkPacer>>,
+    explained: Arc<AtomicBool>,
     covered_keys: usize,
     remaining_bytes: usize,
 ) -> EtlResult<PartialUpdateRecoveryChunk> {
@@ -871,6 +877,7 @@ async fn recover_partial_update_chunk(
         let attempt_table_name = table_name.clone();
         let attempt_request = Arc::clone(&request);
         let attempt_pacer = Arc::clone(&pacer);
+        let attempt_explained = Arc::clone(&explained);
         async move {
             let chunk_size = lock_pacer(&attempt_pacer).next_chunk_size(remaining_bytes);
             let chunk_end = requested_keys.min(covered_keys.saturating_add(chunk_size));
@@ -896,14 +903,18 @@ async fn recover_partial_update_chunk(
             {
                 Ok(chunk) => chunk,
                 Err(error) => {
-                    if is_duckdb_blocking_timeout_error(&error) {
-                        log_recovery_plan_after_timeout(
+                    // Only a statement that reached DuckDB has a plan worth
+                    // asking for; a capacity timeout would just queue again.
+                    if is_duckdb_query_execution_timeout(&error) {
+                        log_recovery_plan(
                             pool,
                             blocking_slots,
                             attempt_schema,
                             attempt_table_name,
                             attempt_request,
                             range,
+                            false,
+                            "timeout",
                         )
                         .await;
                     }
@@ -912,6 +923,21 @@ async fn recover_partial_update_chunk(
             };
             let elapsed = started.elapsed();
             lock_pacer(&attempt_pacer).observe(chunk.keys, chunk.recovered_bytes, elapsed);
+            if elapsed >= SLOW_RECOVERY_STATEMENT
+                && !attempt_explained.swap(true, Ordering::Relaxed)
+            {
+                log_recovery_plan(
+                    pool,
+                    blocking_slots,
+                    attempt_schema,
+                    logged_table_name.clone(),
+                    attempt_request,
+                    range,
+                    true,
+                    "slow_statement",
+                )
+                .await;
+            }
             info!(
                 table = %logged_table_name,
                 keys = chunk.keys,
@@ -937,44 +963,62 @@ async fn recover_partial_update_chunk(
 /// far smaller than the foreground budget the statement just exhausted.
 const RECOVERY_PLAN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Logs the plan of the statement that just timed out.
+/// Elapsed time above which a successful recovery statement is explained.
+///
+/// Prod 2026-09-17 measured 29–34 s for statements covering a single identity.
+/// A statement that slow is the one worth measuring, and `EXPLAIN ANALYZE`
+/// costs about as much as the statement it repeats, so it is done once per
+/// request rather than per statement.
+const SLOW_RECOVERY_STATEMENT: Duration = Duration::from_secs(20);
+
+/// Logs the plan of a recovery statement that timed out or ran slowly.
 ///
 /// Prod 2026-09-16 spent 20 hours on `stage=query_execution, timeout_ms=180000`
-/// with nothing to say where the time went. The plan says whether the read
-/// pruned data files, how many it reads, and how the key set is joined — which
-/// is what the next investigation needs and what no amount of retrying
-/// produces. A failure here is itself only diagnostic, so it is logged and
-/// dropped.
-async fn log_recovery_plan_after_timeout(
+/// with nothing to say where the time went. The plan says how many rows and
+/// data files the read actually touched, which is what separates a scan that
+/// pruned nothing from an overhead that is not in the scan at all. The plan is
+/// reduced to operator names and numeric metrics before it is logged: the
+/// statement embeds source identity values, and those never reach a log.
+///
+/// A failure here is itself only diagnostic, so it is logged and dropped.
+#[expect(clippy::too_many_arguments, reason = "One recovery statement's full context")]
+async fn log_recovery_plan(
     pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
     blocking_slots: Arc<Semaphore>,
     replicated_table_schema: ReplicatedTableSchema,
     table_name: DuckLakeTableName,
     request: Arc<PartialUpdateRecoveryRequest>,
     range: std::ops::Range<usize>,
+    analyze: bool,
+    reason: &'static str,
 ) {
     let keys = range.len();
     let explain_table_name = table_name.clone();
-    let plan = run_duckdb_blocking_with_timeout(
-        pool,
-        blocking_slots,
-        RECOVERY_PLAN_TIMEOUT,
-        move |conn| {
-            StoredRowRecovery::new(conn, &explain_table_name, &replicated_table_schema)
-                .explain_range(&request, range)
-        },
-    )
+    // Planning is cheap; running the statement again costs what the statement
+    // costs, so an analyzed plan gets the same budget the statement had.
+    let budget = match analyze {
+        true => FOREGROUND_QUERY_TIMEOUT,
+        false => RECOVERY_PLAN_TIMEOUT,
+    };
+    let plan = run_duckdb_blocking_with_timeout(pool, blocking_slots, budget, move |conn| {
+        StoredRowRecovery::new(conn, &explain_table_name, &replicated_table_schema)
+            .explain_range(&request, range, analyze)
+    })
     .await;
     match plan {
         Ok(plan) => warn!(
             table = %table_name,
             keys,
+            reason,
+            analyzed = analyze,
             plan = %plan,
-            "ducklake partial update recovery plan after timeout"
+            "ducklake partial update recovery plan"
         ),
         Err(error) => warn!(
             table = %table_name,
             keys,
+            reason,
+            analyzed = analyze,
             error = %query_log_detail(&error),
             "ducklake partial update recovery plan could not be read"
         ),
