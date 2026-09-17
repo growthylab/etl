@@ -101,14 +101,17 @@ const DEFAULT_KEEP_ALIVE_DURATION: Duration = Duration::from_secs(60);
 /// Fraction of `wal_sender_timeout` used for the proactive keep alive deadline.
 ///
 /// PostgreSQL normally emits an idle keep alive around `wal_sender_timeout /
-/// 2`. We wait a bit longer than that, using `60%` of the full timeout, so
-/// normal server keep alives still win most of the time while the client still
-/// has room to send its own status update if that keep alive is delayed by
-/// network, scheduling, or local processing latency. This is intentionally a
-/// last-resort fallback: in normal operation, progress should still be driven
-/// by PostgreSQL's primary keep alive messages rather than by the client
-/// timeout path.
-const KEEP_ALIVE_DEADLINE_FRACTION: f64 = 0.6;
+/// 2`, and this is the client's own fallback for when that keep alive is
+/// delayed by network, scheduling, or local processing latency. In normal
+/// operation progress is still driven by the server's keep alives.
+///
+/// A third of the timeout gives the window three chances instead of one: at
+/// `60%` a single late update was already a dropped connection, and the
+/// updates that matter are exactly the ones sent while the loop is busy.
+/// growthylab prod 2026-09-17 lost the replication connection every two to
+/// seven minutes, each time replaying a batch and waiting out a 30 s backoff
+/// on a 1.4 GB backlog.
+const KEEP_ALIVE_DEADLINE_FRACTION: f64 = 1.0 / 3.0;
 /// Minimum client-side deadline for proactive keep alive retries.
 ///
 /// PostgreSQL exposes `wal_sender_timeout` in millisecond units and `0`
