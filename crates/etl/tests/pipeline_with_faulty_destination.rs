@@ -26,6 +26,7 @@ use etl::{
 };
 use etl_postgres::{slots::EtlReplicationSlot, tokio::test_utils::PgDatabase};
 use etl_telemetry::tracing::init_test_tracing;
+use pg_escape::quote_identifier;
 use proptest::prelude::*;
 use rand::random;
 use tokio_postgres::{Client, types::PgLsn};
@@ -1042,4 +1043,86 @@ async fn apply_disconnect_at_randomized_positions_converges_without_loss() {
     run_expensive_property("walsender roulette", &strategy, |case| {
         block_on(run_walsender_roulette_case(*case))
     });
+}
+
+/// A destination call that blocks longer than `wal_sender_timeout` must not
+/// cost the replication connection.
+///
+/// PostgreSQL drops a standby that stops answering for `wal_sender_timeout`
+/// (60 s by default, and on Aurora). The apply loop's own keepalive branch
+/// cannot run while the loop is awaiting the destination, so a destination that
+/// applies backpressure inside `write_events` — which is how a lake tells the
+/// loop to stop reading WAL — silently trades one slow write for a dropped
+/// connection, a restart and a replay. growthylab prod 2026-09-17 lost the
+/// connection twice in fifteen minutes that way, each time behind a write that
+/// took 85–111 s.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_destination_write_keeps_the_replication_connection_alive() {
+    init_test_tracing();
+
+    // GIVEN: a source that drops a silent standby after two seconds
+    let mut database = spawn_source_database().await;
+    let alter = format!(
+        "ALTER DATABASE {} SET wal_sender_timeout = '2s'",
+        quote_identifier(database.config.name.as_str())
+    );
+    database.client.as_ref().unwrap().simple_query(&alter).await.unwrap();
+
+    let database_schema = setup_test_database_schema(&database, TableSelection::UsersOnly).await;
+    let table_id = database_schema.users_schema().id;
+
+    let store = NotifyingStore::new();
+    let memory_destination = MemoryDestination::new(store.clone());
+    let destination = TestDestinationWrapper::wrap(memory_destination.clone());
+
+    let pipeline_id: PipelineId = random();
+    let apply_slot_name: String =
+        EtlReplicationSlot::for_apply_worker(pipeline_id).try_into().unwrap();
+    let mut pipeline = create_pipeline(
+        &database.config,
+        pipeline_id,
+        database_schema.publication_name(),
+        store.clone(),
+        destination.clone(),
+    );
+
+    let users_sync_complete_notify = store.notify_on_table_sync_complete(table_id).await;
+    pipeline.start().await.unwrap();
+    users_sync_complete_notify.notified().await;
+
+    let (_, walsender_before) =
+        replication_slot_state(database.client.as_ref().unwrap(), &apply_slot_name).await;
+    let walsender_before = walsender_before.expect("the apply worker holds its slot");
+
+    // WHEN: the next write blocks for several keepalive periods
+    destination
+        .inject_fault(FaultyOp::WriteEvents, FaultAction::dispatch_slowly(Duration::from_secs(8)))
+        .await;
+
+    let insert_notify = destination
+        .wait_for_events(vec![EventCondition::TableCount(EventType::Insert, table_id, 1)])
+        .await;
+    insert_users_data(&mut database, &database_schema.users_schema().name, 1..=1).await;
+    insert_notify.notified().await;
+
+    // THEN: the same walsender is still serving the slot, so the loop kept
+    // answering while it was blocked
+    let (_, walsender_after) =
+        replication_slot_state(database.client.as_ref().unwrap(), &apply_slot_name).await;
+    assert_eq!(
+        walsender_after,
+        Some(walsender_before),
+        "the replication connection must survive a destination write longer than \
+         wal_sender_timeout"
+    );
+
+    pipeline.shutdown_and_wait().await.unwrap();
+
+    let events = destination.get_events().await;
+    let grouped_events = group_events_by_type_and_table_id(&events);
+    assert_eq!(
+        grouped_events.get(&(EventType::Insert, table_id)).map_or(0, Vec::len),
+        1,
+        "a surviving connection must not replay the batch"
+    );
 }
