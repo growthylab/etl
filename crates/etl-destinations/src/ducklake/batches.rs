@@ -970,7 +970,7 @@ const RECOVERY_PLAN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Elapsed time above which a successful recovery statement is explained.
 ///
-/// Prod 2026-09-17 measured 29–34 s for statements covering a single identity.
+/// Statements covering a single identity have been measured at half a minute.
 /// A statement that slow is the one worth measuring, and `EXPLAIN ANALYZE`
 /// costs about as much as the statement it repeats, so it is done once per
 /// request rather than per statement.
@@ -998,7 +998,7 @@ pub fn set_slow_recovery_statement_ms_for_tests(threshold_ms: u64) {
 
 /// Logs the plan of a recovery statement that timed out or ran slowly.
 ///
-/// Prod 2026-09-16 spent 20 hours on `stage=query_execution, timeout_ms=180000`
+/// A deployment once spent twenty hours on `stage=query_execution`
 /// with nothing to say where the time went. The plan says how many rows and
 /// data files the read actually touched, which is what separates a scan that
 /// pruned nothing from an overhead that is not in the scan at all. The plan is
