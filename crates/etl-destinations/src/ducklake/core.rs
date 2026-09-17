@@ -4541,6 +4541,9 @@ pub fn table_name_to_ducklake_table_name(table_name: &TableName) -> EtlResult<Du
     Ok(DuckLakeTableName::from_source(table_name))
 }
 
+/// Gate wait above which one maintenance operation reports it.
+const MAINTENANCE_GATE_WAIT_REPORT: Duration = Duration::from_secs(1);
+
 impl<S: DestinationStore> DuckLakeDestination<S> {
     /// Runs host maintenance on the writer instance while mutations are paused.
     ///
@@ -4555,7 +4558,20 @@ impl<S: DestinationStore> DuckLakeDestination<S> {
         R: Send + 'static,
         F: FnOnce(&duckdb::Connection) -> EtlResult<R> + Send + 'static,
     {
+        // The exclusive gate is queued behind every foreground write in flight,
+        // so an operation's elapsed time says nothing about what it cost until
+        // the wait is reported separately: prod 2026-09-17 read 57 inline
+        // flushes of 170–180 s each as slow flushes, when all but one of them
+        // were waiting for their turn.
+        let gate_wait_started = tokio::time::Instant::now();
         let pause = self.acquire_external_maintenance_pause().await;
+        let gate_wait = gate_wait_started.elapsed();
+        if gate_wait >= MAINTENANCE_GATE_WAIT_REPORT {
+            info!(
+                waited_ms = gate_wait.as_millis() as u64,
+                "ducklake maintenance waited for the writer gate"
+            );
+        }
         crate::ducklake::client::run_duckdb_blocking_with_timeout(
             self.streaming_pool()?,
             Arc::clone(&self.blocking_slots),
