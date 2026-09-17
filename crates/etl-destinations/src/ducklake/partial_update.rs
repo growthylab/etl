@@ -42,7 +42,7 @@ use crate::ducklake::{
 /// streaming batch row and byte caps, so this only keeps one statement's
 /// `VALUES` list from growing with an unusually large cap. No state outlives
 /// the request.
-const RECOVERY_KEY_BATCH_SIZE: usize = 1024;
+pub(super) const RECOVERY_KEY_BATCH_SIZE: usize = 1024;
 /// Identities read by the first statement of one recovery.
 ///
 /// The first statement only measures: one identity is enough to size every
