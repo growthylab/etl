@@ -655,8 +655,13 @@ impl StoredRowRecovery<'_> {
         else {
             return Ok(String::new());
         };
+        // `EXPLAIN ANALYZE (FORMAT JSON)` is a syntax error: DuckDB takes
+        // `ANALYZE` as one of the parenthesised options, not as a keyword
+        // before them. Prod 2026-09-17 logged
+        // `Parser Error: syntax error at or near "FORMAT"` for every plan the
+        // diagnostic tried to read.
         let explain = match analyze {
-            true => format!("EXPLAIN ANALYZE (FORMAT JSON) {sql}"),
+            true => format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"),
             false => format!("EXPLAIN (FORMAT JSON) {sql}"),
         };
 
@@ -1297,6 +1302,61 @@ mod tests {
         assert_eq!(pacer.limit(), 1);
         assert_eq!(shrinks, RECOVERY_KEY_BATCH_SIZE.ilog2() as usize);
         assert!(!pacer.shrink(), "a single-identity statement cannot shrink further");
+    }
+
+    /// Both plan forms must parse and come back as a readable shape.
+    ///
+    /// The plan is only ever read when something is already wrong, so a syntax
+    /// error in it is invisible until the day it is needed — which is what
+    /// happened on prod 2026-09-17, where every plan lookup logged
+    /// `Parser Error: syntax error at or near "FORMAT"`.
+    #[test]
+    fn recovery_plans_are_readable_in_both_explain_forms() {
+        let lake_dir = tempfile::tempdir().unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("install ducklake; load ducklake;").unwrap();
+        conn.execute_batch(&format!(
+            "attach 'ducklake:{catalog}' as lake (data_path '{data}'); create schema lake.public; \
+             create table lake.public.rows (id bigint, value varchar); insert into \
+             lake.public.rows values (1, 'stored');",
+            catalog = lake_dir.path().join("meta.ducklake").display(),
+            data = lake_dir.path().join("data").display(),
+        ))
+        .unwrap();
+
+        let (schema, _) = key_schema(Type::TEXT, "varchar");
+        let table_name = DuckLakeTableName::new("public", "rows");
+        let key = Cell::I64(1);
+        let request = PartialUpdateRecoveryRequest::new(
+            vec![PartialUpdateRecoveryKey {
+                predicate: identity_predicate(
+                    schema.identity_column_schemas().zip(std::iter::once(&key)),
+                ),
+                components: vec![KeyComponent::from_cell(&key, cell_to_sql_literal_ref(&key))],
+                mutation_index: 0,
+            }],
+            BTreeSet::from([1]),
+            usize::MAX,
+        );
+        let recovery = StoredRowRecovery::new(&conn, &table_name, &schema);
+
+        for analyze in [false, true] {
+            let plan = recovery
+                .explain_range(&request, 0..1, analyze)
+                .unwrap_or_else(|error| panic!("analyze={analyze} plan failed: {error}"));
+
+            assert!(
+                !plan.contains("<unparsable plan>"),
+                "analyze={analyze} produced a plan the shape reader could not parse: {plan}"
+            );
+            assert!(
+                plan.lines().any(|line| line.contains("SCAN") || line.contains("JOIN")),
+                "analyze={analyze} produced no operator: {plan}"
+            );
+            // The shape must never carry the statement's own literals.
+            assert!(!plan.contains("stored"), "analyze={analyze} leaked a value: {plan}");
+            assert!(!plan.contains('\''), "analyze={analyze} leaked a literal: {plan}");
+        }
     }
 
     #[test]
