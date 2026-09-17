@@ -58,7 +58,7 @@ const RECOVERY_PROBE_KEY_BATCH_SIZE: usize = 1;
 /// caller's timeout, so a slow table degrades into more, smaller reads instead
 /// of one read that never returns.
 ///
-/// Half the foreground budget: prod 2026-09-17 spent an hour on one batch
+/// Half the foreground budget: a deployment once spent an hour on one batch
 /// because statements that took 30 s were capped at a 30 s target and never
 /// grew. Aiming at half the budget leaves room for a statement that turns out
 /// more expensive than the previous one while still leaving the timeout as the
@@ -71,8 +71,8 @@ const RECOVERY_CHUNK_TARGET_ELAPSED: Duration = Duration::from_secs(90);
 /// Growth is geometric rather than a jump to whatever the cost model allows:
 /// each step re-measures at the larger size, so a request finds its workable
 /// statement size in a few statements without repeating a size that has
-/// already timed out. A request of 187 identities reaches them in five
-/// statements instead of sixty.
+/// already timed out. A request of a couple of hundred identities reaches
+/// them in a handful of statements instead of dozens.
 const RECOVERY_CHUNK_GROWTH: usize = 4;
 /// Factor used when the last statement was already close to the target.
 const RECOVERY_CHUNK_CAUTIOUS_GROWTH: usize = 2;
@@ -127,13 +127,14 @@ impl RecoveryChunkPacer {
     ///
     /// The first statement probes with a single identity. Later ones are sized
     /// from what the earlier ones cost, with the per-statement overhead kept
-    /// out of the estimate: prod 2026-09-17 measured 4–12 s per recovery
+    /// out of the estimate: a deployment measured seconds per recovery
     /// statement almost independently of how many identities it covered, so an
     /// average that folds that overhead into every identity keeps planning
-    /// three-identity statements forever — 187 identities would take sixty of
-    /// them. The size also grows by at most [`RECOVERY_CHUNK_GROWTH`] per
-    /// statement, so the estimate is re-measured on the way up instead of
-    /// jumping straight back to a size that has already timed out.
+    /// three-identity statements forever — a couple of hundred identities would
+    /// take dozens of them. The size also grows by at most
+    /// [`RECOVERY_CHUNK_GROWTH`] per statement, so the estimate is
+    /// re-measured on the way up instead of jumping straight back to a size
+    /// that has already timed out.
     pub(super) fn next_chunk_size(&self, remaining_bytes: usize) -> usize {
         if self.covered_keys == 0 {
             return RECOVERY_PROBE_KEY_BATCH_SIZE.min(self.limit);
@@ -636,9 +637,8 @@ impl StoredRowRecovery<'_> {
     ///
     /// The plan is reduced to operator names and numeric metrics before it is
     /// returned. DuckDB renders filters and the inline key list into the plan,
-    /// and those carry source identity values — on `http_request_traces` the
-    /// same row also carries credential columns — so the text itself must
-    /// never reach a log.
+    /// and those carry source identity values — and the same rows can carry
+    /// credential columns — so the text itself must never reach a log.
     pub(super) fn explain_range(
         &self,
         request: &PartialUpdateRecoveryRequest,
@@ -655,8 +655,13 @@ impl StoredRowRecovery<'_> {
         else {
             return Ok(String::new());
         };
+        // `EXPLAIN ANALYZE (FORMAT JSON)` is a syntax error: DuckDB takes
+        // `ANALYZE` as one of the parenthesised options, not as a keyword
+        // before them, so the other spelling logs
+        // `Parser Error: syntax error at or near "FORMAT"` for every plan the
+        // diagnostic tries to read.
         let explain = match analyze {
-            true => format!("EXPLAIN ANALYZE (FORMAT JSON) {sql}"),
+            true => format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"),
             false => format!("EXPLAIN (FORMAT JSON) {sql}"),
         };
 
@@ -1224,11 +1229,11 @@ mod tests {
     /// Statement cost that barely moves with size must not keep the statements
     /// tiny.
     ///
-    /// Prod 2026-09-17 measured 4–12 s per recovery statement for one to five
-    /// identities, and later 29–34 s for one identity each. Averaging that over
-    /// the identities makes every later statement look like it can afford three
-    /// of them: one batch of 187 identities took an hour that way, while the
-    /// backlog grew by 190 MB per hour.
+    /// A deployment measured seconds per recovery statement for one to five
+    /// identities, and later half a minute for one identity each. Averaging
+    /// that over the identities makes every later statement look like it can
+    /// afford three of them: one batch of a couple of hundred identities took
+    /// an hour that way, while its backlog kept growing.
     #[test]
     fn a_fixed_per_statement_cost_does_not_cap_the_next_statement() {
         let mut pacer = RecoveryChunkPacer::default();
@@ -1297,6 +1302,61 @@ mod tests {
         assert_eq!(pacer.limit(), 1);
         assert_eq!(shrinks, RECOVERY_KEY_BATCH_SIZE.ilog2() as usize);
         assert!(!pacer.shrink(), "a single-identity statement cannot shrink further");
+    }
+
+    /// Both plan forms must parse and come back as a readable shape.
+    ///
+    /// The plan is only ever read when something is already wrong, so a syntax
+    /// error in it stays invisible until the day it is needed: a deployment
+    /// once found every plan lookup replaced by
+    /// `Parser Error: syntax error at or near "FORMAT"`.
+    #[test]
+    fn recovery_plans_are_readable_in_both_explain_forms() {
+        let lake_dir = tempfile::tempdir().unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("install ducklake; load ducklake;").unwrap();
+        conn.execute_batch(&format!(
+            "attach 'ducklake:{catalog}' as lake (data_path '{data}'); create schema lake.public; \
+             create table lake.public.rows (id bigint, value varchar); insert into \
+             lake.public.rows values (1, 'stored');",
+            catalog = lake_dir.path().join("meta.ducklake").display(),
+            data = lake_dir.path().join("data").display(),
+        ))
+        .unwrap();
+
+        let (schema, _) = key_schema(Type::TEXT, "varchar");
+        let table_name = DuckLakeTableName::new("public", "rows");
+        let key = Cell::I64(1);
+        let request = PartialUpdateRecoveryRequest::new(
+            vec![PartialUpdateRecoveryKey {
+                predicate: identity_predicate(
+                    schema.identity_column_schemas().zip(std::iter::once(&key)),
+                ),
+                components: vec![KeyComponent::from_cell(&key, cell_to_sql_literal_ref(&key))],
+                mutation_index: 0,
+            }],
+            BTreeSet::from([1]),
+            usize::MAX,
+        );
+        let recovery = StoredRowRecovery::new(&conn, &table_name, &schema);
+
+        for analyze in [false, true] {
+            let plan = recovery
+                .explain_range(&request, 0..1, analyze)
+                .unwrap_or_else(|error| panic!("analyze={analyze} plan failed: {error}"));
+
+            assert!(
+                !plan.contains("<unparsable plan>"),
+                "analyze={analyze} produced a plan the shape reader could not parse: {plan}"
+            );
+            assert!(
+                plan.lines().any(|line| line.contains("SCAN") || line.contains("JOIN")),
+                "analyze={analyze} produced no operator: {plan}"
+            );
+            // The shape must never carry the statement's own literals.
+            assert!(!plan.contains("stored"), "analyze={analyze} leaked a value: {plan}");
+            assert!(!plan.contains('\''), "analyze={analyze} leaked a literal: {plan}");
+        }
     }
 
     #[test]

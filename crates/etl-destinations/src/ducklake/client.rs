@@ -410,7 +410,7 @@ impl DuckLakeDedicatedConnection {
 /// A blocking operation waits for a blocking slot, then for a pooled
 /// connection, and only then runs its query. All three are inside one timeout
 /// budget, and until they were measured separately a slow operation could not
-/// be told apart from a queued one: prod 2026-09-16 reported
+/// be told apart from a queued one: a deployment once reported
 /// `stage=query_execution, timeout_ms=180000` for reads whose actual query time
 /// was unknown.
 #[derive(Debug, Default)]
