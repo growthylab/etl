@@ -49,7 +49,7 @@ use crate::{
             is_ducklake_shutdown_requested_error, run_duckdb_blocking,
             run_duckdb_blocking_with_context, run_duckdb_blocking_with_timeout,
         },
-        core::is_create_table_conflict,
+        core::{CheckpointLease, is_create_table_conflict},
         diagnostics::query_log_detail,
         encoding::{
             PreparedRows, cell_to_sql_literal_ref, prepare_copy_rows, prepare_rows,
@@ -672,6 +672,7 @@ fn helper_table_has_column(
 /// updates reads stored values. A batch must observe the rows every earlier
 /// batch of the same call already wrote, so its recovery read runs only once
 /// the previous batch has committed.
+#[expect(clippy::too_many_arguments, reason = "One table's full streaming write context")]
 pub(super) async fn prepare_and_apply_mutation_table_batches(
     pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
     blocking_slots: Arc<Semaphore>,
@@ -680,6 +681,7 @@ pub(super) async fn prepare_and_apply_mutation_table_batches(
     table_name: DuckLakeTableName,
     replay_epoch: String,
     tracked_mutations: Vec<TrackedTableMutation>,
+    checkpoint_lease: &mut CheckpointLease,
 ) -> EtlResult<()> {
     let mut pending_chunks: VecDeque<Vec<TrackedTableMutation>> =
         split_tracked_mutations(config, tracked_mutations).into();
@@ -688,6 +690,13 @@ pub(super) async fn prepare_and_apply_mutation_table_batches(
 
     let mut known_progress = None;
     while let Some(mut chunk) = pending_chunks.pop_front() {
+        // The previous batch has committed and the next one has not started,
+        // so a maintenance unit may run here. A long sequence of batches on a
+        // fragmented table is exactly when maintenance is most needed and
+        // least able to start.
+        if checkpoint_lease.yield_to_waiting_maintenance(&table_name).await {
+            known_progress = None;
+        }
         let mut recovered = RecoveredPartialRows::empty();
         if has_canonical_identity(replicated_table_schema) {
             let request = plan_partial_update_recovery(

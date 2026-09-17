@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -589,6 +589,16 @@ pub struct DuckLakeDestination<S> {
     /// Gate held by connection-pinned copy sessions and acquired exclusively
     /// by maintenance before it queues on [`Self::checkpoint_gate`].
     copy_session_gate: Arc<RwLock<()>>,
+    /// Maintenance runs waiting for [`Self::checkpoint_gate`].
+    ///
+    /// A foreground write holds the gate for as long as one table's whole CDC
+    /// batch sequence takes, and maintenance can only queue behind it. On a
+    /// table whose data files have grown past what a batch can process, that
+    /// sequence takes longer than the maintenance interval, so the maintenance
+    /// that would fix the table never starts. The counter lets the write path
+    /// see a waiting maintenance run and release the gate at a point where
+    /// releasing it is safe.
+    checkpoint_waiters: Arc<AtomicUsize>,
     tasks: TaskSet,
     metrics_sampler: Arc<Option<DuckLakeMetricsSampler>>,
     metadata_schema: Arc<str>,
@@ -2165,6 +2175,7 @@ where
             blocking_slots: Arc::clone(&blocking_slots),
             checkpoint_gate: Arc::clone(&checkpoint_gate),
             copy_session_gate,
+            checkpoint_waiters: Arc::default(),
             tasks: TaskSet::new(),
             metrics_sampler: Arc::new(None),
             metadata_schema: Arc::clone(&metadata_schema),
@@ -3426,8 +3437,7 @@ where
                                 .acquire_table_write_slot(&destination_table_name)
                                 .await?;
                             let checkpoint_wait_started = tokio::time::Instant::now();
-                            let _checkpoint_guard =
-                                Arc::clone(&destination.checkpoint_gate).read_owned().await;
+                            let mut checkpoint_lease = destination.acquire_checkpoint_lease().await;
                             let checkpoint_wait = checkpoint_wait_started.elapsed();
                             if checkpoint_wait > Duration::from_secs(1) {
                                 info!(
@@ -3452,6 +3462,7 @@ where
                                 destination_table_name.clone(),
                                 replay_epoch,
                                 pending_mutations,
+                                &mut checkpoint_lease,
                             )
                             .await?;
                             info!(
@@ -4045,6 +4056,16 @@ where
         Arc::clone(&self.checkpoint_gate).read_owned().await
     }
 
+    /// Acquires shared mutation access that can be handed to maintenance at
+    /// points the caller declares safe.
+    async fn acquire_checkpoint_lease(&self) -> CheckpointLease {
+        CheckpointLease {
+            guard: Some(self.acquire_mutation_guard().await),
+            gate: Arc::clone(&self.checkpoint_gate),
+            waiters: Arc::clone(&self.checkpoint_waiters),
+        }
+    }
+
     /// Reads one table's durable replay cursor while retaining table-local
     /// ordering through the pending-work decision.
     async fn read_table_replay_cursor(
@@ -4117,7 +4138,11 @@ where
         // writer queued directly on `checkpoint_gate` would prevent unrelated
         // readers from entering while a long-lived COPY session drains.
         let copy_session_guard = Arc::clone(&self.copy_session_gate).write_owned().await;
+        // Announced before queueing so a foreground write in progress can hand
+        // the gate over instead of holding it for its whole batch sequence.
+        self.checkpoint_waiters.fetch_add(1, Ordering::SeqCst);
         let checkpoint_guard = Arc::clone(&self.checkpoint_gate).write_owned().await;
+        self.checkpoint_waiters.fetch_sub(1, Ordering::SeqCst);
         DuckLakeExternalMaintenancePause {
             _copy_session_guard: copy_session_guard,
             _checkpoint_guard: checkpoint_guard,
@@ -4465,6 +4490,46 @@ fn wait_if_copy_append_paused_for_tests() {
     let mut resumed = resumed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     while !*resumed {
         resumed = resume_ready.wait(resumed).unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
+/// Shared mutation access a foreground write can hand over mid-sequence.
+///
+/// Maintenance needs the gate exclusively, and a write sequence that holds it
+/// from its first batch to its last starves maintenance for as long as the
+/// sequence takes. The lease keeps the same guard, but lets the write release
+/// and re-take it wherever the previous batch has committed, which is where a
+/// maintenance unit may safely run. Re-taking queues behind the waiting
+/// writer, so maintenance gets its turn before the write continues.
+pub(super) struct CheckpointLease {
+    guard: Option<OwnedRwLockReadGuard<()>>,
+    gate: Arc<RwLock<()>>,
+    waiters: Arc<AtomicUsize>,
+}
+
+impl CheckpointLease {
+    /// Hands the gate to a waiting maintenance run, then takes it back.
+    ///
+    /// Returns whether the gate was actually handed over. Nothing happens when
+    /// no maintenance is waiting, so the common path costs one atomic load.
+    pub(super) async fn yield_to_waiting_maintenance(
+        &mut self,
+        table_name: &DuckLakeTableName,
+    ) -> bool {
+        if self.waiters.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+
+        let started = tokio::time::Instant::now();
+        self.guard = None;
+        self.guard = Some(Arc::clone(&self.gate).read_owned().await);
+        info!(
+            table = %table_name,
+            waited_ms = started.elapsed().as_millis() as u64,
+            "ducklake yielded the writer gate to waiting maintenance"
+        );
+
+        true
     }
 }
 
