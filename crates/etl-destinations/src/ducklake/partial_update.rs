@@ -82,16 +82,15 @@ const RECOVERY_CHUNK_CAUTIOUS_GROWTH: usize = 2;
 /// The range predicate that lets DuckLake skip data files (and row groups
 /// inside them) brackets a statement's whole key set, so one far-away key
 /// makes the statement read everything between it and the rest. Prod
-/// 2026-09-17, measured with `EXPLAIN ANALYZE` on a lake of the same shape:
-/// 187 keys taken from one place emitted 187 rows from the scan, and 187 keys
-/// spread over the same table emitted 298,345 rows and peaked at 1.9 GB of
-/// buffers — the whole payload, for the same 187 rows of output.
+/// measured with `EXPLAIN ANALYZE` on a lake of that shape: 187 keys taken
+/// from one place emitted 187 rows from the scan, and 187 keys spread over the
+/// same table emitted 298,345 rows and peaked at 1.9 GB of buffers — the whole
+/// payload, for the same 187 rows of output.
 const MAX_RECOVERY_KEY_GROUPS: usize = 4;
 /// Fraction of a key set's span a cut has to remove to be worth a statement.
 ///
-/// Every statement costs a fixed amount — 4–12 s on the production lake,
-/// almost regardless of how many keys it covers — so splitting only pays when
-/// it takes most of the span away with it.
+/// Every statement costs a fixed amount, almost regardless of how many keys it
+/// covers, so splitting only pays when it takes most of the span away with it.
 const RECOVERY_KEY_GROUP_GAIN: f64 = 0.5;
 
 /// Sizes the statements of one recovery from what the earlier ones cost.
@@ -667,21 +666,32 @@ impl StoredRowRecovery<'_> {
         let replicated_columns: Vec<&ColumnSchema> =
             self.replicated_table_schema.column_schemas().collect();
         let recovered_columns = self.recovered_column_schemas(request, &replicated_columns)?;
-        let explained_keys: Vec<&PartialUpdateRecoveryKey> = request.keys()[range].iter().collect();
-        let Some(sql) = self.recovery_sql(&explained_keys, &identity_columns, &recovered_columns)
-        else {
-            return Ok(String::new());
-        };
-        // `EXPLAIN ANALYZE (FORMAT JSON)` is a syntax error: DuckDB takes
-        // `ANALYZE` as one of the parenthesised options, not as a keyword
-        // before them, so the other spelling logs
-        // `Parser Error: syntax error at or near "FORMAT"` for every plan the
-        // diagnostic tries to read.
+        // The statements that ran are the adjacency groups, not the range: an
+        // analyzed plan of the unsplit range would re-run exactly the wide scan
+        // the grouping exists to avoid.
+        let mut shapes = Vec::new();
+        for group in adjacency_groups(&request.keys()[range]) {
+            let Some(sql) = self.recovery_sql(&group, &identity_columns, &recovered_columns) else {
+                continue;
+            };
+            shapes.push(self.plan_of(&sql, analyze)?);
+        }
+
+        Ok(shapes.join("\n"))
+    }
+
+    /// Returns the shape of one statement's plan.
+    ///
+    /// `EXPLAIN ANALYZE (FORMAT JSON)` is a syntax error: DuckDB takes
+    /// `ANALYZE` as one of the parenthesised options, not as a keyword before
+    /// them, so the other spelling logs
+    /// `Parser Error: syntax error at or near "FORMAT"` for every plan the
+    /// diagnostic tries to read.
+    fn plan_of(&self, sql: &str, analyze: bool) -> EtlResult<String> {
         let explain = match analyze {
             true => format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"),
             false => format!("EXPLAIN (FORMAT JSON) {sql}"),
         };
-
         let plan_error = |source: duckdb::Error| {
             etl_error!(
                 ErrorKind::DestinationQueryFailed,
@@ -718,10 +728,6 @@ impl StoredRowRecovery<'_> {
         let recovered_columns = self.recovered_column_schemas(request, &replicated_columns)?;
 
         let keys = &request.keys()[range];
-        #[cfg(feature = "test-utils")]
-        if let Some(error) = injected_recovery_timeout(keys.len()) {
-            return Err(error);
-        }
         let mut recovered = RecoveredPartialRows::for_request(request);
         let mut recovered_bytes = 0usize;
         // One statement per adjacency group: the range predicate brackets a
@@ -730,6 +736,12 @@ impl StoredRowRecovery<'_> {
         let groups = adjacency_groups(keys);
         let statements = groups.len();
         for group in groups {
+            // Each group is its own statement, so the injected timeout applies
+            // to what actually runs rather than to the range they came from.
+            #[cfg(feature = "test-utils")]
+            if let Some(error) = injected_recovery_timeout(group.len()) {
+                return Err(error);
+            }
             recovered_bytes = recovered_bytes.saturating_add(self.recover_chunk(
                 &group,
                 &identity_columns,
@@ -1337,8 +1349,8 @@ mod tests {
 
     /// Keys that sit together stay in one statement.
     ///
-    /// Splitting costs a whole statement's fixed overhead — 4–12 s on the
-    /// production lake — so a key set that is already narrow must not pay it.
+    /// Splitting costs a whole statement's fixed overhead, so a key set that is
+    /// already narrow must not pay it.
     #[test]
     fn keys_that_sit_together_stay_in_one_statement() {
         let keys = integer_keys(&[100, 101, 102, 103, 104]);
@@ -1348,10 +1360,10 @@ mod tests {
 
     /// A far-away key is read by itself instead of dragging the whole range in.
     ///
-    /// Measured on a lake of the production shape: 187 keys from one place
-    /// scan 187 rows, and 187 keys spread over the same table scan 298,345
-    /// rows and peak at 1.9 GB of buffers, because the range predicate
-    /// brackets the whole key set.
+    /// Measured on a lake of that shape: 187 keys from one place scan 187
+    /// rows, and 187 keys spread over the same table scan 298,345 rows and
+    /// peak at 1.9 GB of buffers, because the range predicate brackets the
+    /// whole key set.
     #[test]
     fn a_distant_key_is_read_on_its_own() {
         let keys = integer_keys(&[100, 101, 102, 5_000_000]);
