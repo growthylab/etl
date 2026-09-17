@@ -47,7 +47,7 @@ use crate::{
             DuckLakeBlockingOperationContext, DuckLakeConnectionManager, FOREGROUND_QUERY_TIMEOUT,
             format_query_error_detail, is_duckdb_blocking_timeout_error,
             is_duckdb_query_execution_timeout, is_ducklake_shutdown_requested_error,
-            run_duckdb_blocking, run_duckdb_blocking_with_context,
+            run_duckdb_blocking, run_duckdb_blocking_timed, run_duckdb_blocking_with_context,
             run_duckdb_blocking_with_timeout,
         },
         core::{CheckpointLease, is_create_table_conflict},
@@ -884,7 +884,7 @@ async fn recover_partial_update_chunk(
             let range = covered_keys..chunk_end;
             let logged_table_name = attempt_table_name.clone();
             let started = Instant::now();
-            let chunk = match run_duckdb_blocking_with_timeout(
+            let (chunk, query_elapsed) = match run_duckdb_blocking_timed(
                 Arc::clone(&pool),
                 Arc::clone(&blocking_slots),
                 FOREGROUND_QUERY_TIMEOUT,
@@ -901,7 +901,7 @@ async fn recover_partial_update_chunk(
             )
             .await
             {
-                Ok(chunk) => chunk,
+                Ok(timed) => timed,
                 Err(error) => {
                     // Only a statement that reached DuckDB has a plan worth
                     // asking for; a capacity timeout would just queue again.
@@ -923,7 +923,11 @@ async fn recover_partial_update_chunk(
             };
             let elapsed = started.elapsed();
             lock_pacer(&attempt_pacer).observe(chunk.keys, chunk.recovered_bytes, elapsed);
-            if elapsed >= SLOW_RECOVERY_STATEMENT
+            // Gated on the query's own time: an operation that spent its
+            // twenty seconds waiting for a slot or a connection has nothing to
+            // explain, and repeating the read would add load to the shortage
+            // that delayed it.
+            if query_elapsed >= SLOW_RECOVERY_STATEMENT
                 && !attempt_explained.swap(true, Ordering::Relaxed)
             {
                 log_recovery_plan(
@@ -944,6 +948,7 @@ async fn recover_partial_update_chunk(
                 requested_keys,
                 recovered_bytes = chunk.recovered_bytes,
                 elapsed_ms = elapsed.as_millis() as u64,
+                query_execution_ms = query_elapsed.as_millis() as u64,
                 // Each statement is submitted with its own full budget, so a
                 // request of many statements is never bounded as a whole.
                 timeout_ms = FOREGROUND_QUERY_TIMEOUT.as_millis() as u64,

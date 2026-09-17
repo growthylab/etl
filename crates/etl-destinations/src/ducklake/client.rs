@@ -1123,6 +1123,35 @@ where
     .await
 }
 
+/// Runs one DuckDB operation with an explicit timeout, reporting how long the
+/// query itself took.
+///
+/// The returned duration excludes the wait for a blocking slot and for a
+/// pooled connection, so a caller can tell a slow query apart from a queued
+/// one without re-deriving it from the logs.
+pub(super) async fn run_duckdb_blocking_timed<R, F>(
+    pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
+    blocking_slots: Arc<Semaphore>,
+    timeout: Duration,
+    operation: F,
+) -> EtlResult<(R, Duration)>
+where
+    R: Send + 'static,
+    F: FnOnce(&duckdb::Connection) -> EtlResult<R> + Send + 'static,
+{
+    let stages = Arc::new(BlockingStageTimings::default());
+    let value = run_reported_duckdb_blocking(
+        pool,
+        blocking_slots,
+        timeout,
+        Arc::clone(&stages),
+        move |conn, _| operation(conn),
+    )
+    .await?;
+
+    Ok((value, Duration::from_millis(stages.execute_ms())))
+}
+
 /// Runs one DuckDB operation with an explicit timeout budget.
 pub(super) async fn run_duckdb_blocking_with_timeout<R, F>(
     pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
@@ -1158,7 +1187,32 @@ where
         + Send
         + 'static,
 {
-    let stages = Arc::new(BlockingStageTimings::default());
+    run_reported_duckdb_blocking(
+        provider,
+        blocking_slots,
+        timeout,
+        Arc::new(BlockingStageTimings::default()),
+        operation,
+    )
+    .await
+}
+
+/// Runs one blocking operation into the caller's stage timings, reporting them
+/// once the operation is slow enough.
+async fn run_reported_duckdb_blocking<P, R, F>(
+    provider: P,
+    blocking_slots: Arc<Semaphore>,
+    timeout: Duration,
+    stages: Arc<BlockingStageTimings>,
+    operation: F,
+) -> EtlResult<R>
+where
+    P: DuckLakeConnectionProvider,
+    R: Send + 'static,
+    F: FnOnce(&duckdb::Connection, &DuckLakeBlockingOperationContext) -> EtlResult<R>
+        + Send
+        + 'static,
+{
     let started = Instant::now();
     let operation_id = NEXT_DUCKDB_BLOCKING_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
     let result = run_staged_duckdb_blocking(
