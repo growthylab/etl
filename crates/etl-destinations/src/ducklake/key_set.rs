@@ -66,6 +66,21 @@ impl KeyComponent {
         Self { literal, ordinal: KeyOrdinal::from_cell(cell) }
     }
 
+    /// Returns an order-preserving image of this component's value.
+    ///
+    /// The image orders exactly as DuckDB orders the column, so the distance
+    /// between two images is the distance a range predicate has to cover.
+    /// Returns [`None`] for `NULL` and for values outside the canonical
+    /// integer and UUID identity domain, which have no such image.
+    pub(super) fn sort_image(&self) -> Option<u128> {
+        match self.ordinal? {
+            // Shifted into the unsigned domain so the ordering is preserved
+            // and the distance between two values stays meaningful.
+            KeyOrdinal::Integer(value) => Some((i128::from(value) - i128::from(i64::MIN)) as u128),
+            KeyOrdinal::Uuid(image) => Some(image),
+        }
+    }
+
     /// Returns the SQL literal for this component.
     pub(super) fn literal(&self) -> &str {
         &self.literal

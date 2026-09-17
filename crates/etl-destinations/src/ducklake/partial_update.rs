@@ -77,6 +77,22 @@ const RECOVERY_CHUNK_GROWTH: usize = 4;
 /// Factor used when the last statement was already close to the target.
 const RECOVERY_CHUNK_CAUTIOUS_GROWTH: usize = 2;
 
+/// Statements one chunk may be split into by key adjacency.
+///
+/// The range predicate that lets DuckLake skip data files (and row groups
+/// inside them) brackets a statement's whole key set, so one far-away key
+/// makes the statement read everything between it and the rest. Prod
+/// measured with `EXPLAIN ANALYZE` on a lake of that shape: 187 keys taken
+/// from one place emitted 187 rows from the scan, and 187 keys spread over the
+/// same table emitted 298,345 rows and peaked at 1.9 GB of buffers — the whole
+/// payload, for the same 187 rows of output.
+const MAX_RECOVERY_KEY_GROUPS: usize = 4;
+/// Fraction of a key set's span a cut has to remove to be worth a statement.
+///
+/// Every statement costs a fixed amount, almost regardless of how many keys it
+/// covers, so splitting only pays when it takes most of the span away with it.
+const RECOVERY_KEY_GROUP_GAIN: f64 = 0.5;
+
 /// Sizes the statements of one recovery from what the earlier ones cost.
 ///
 /// The pacer carries the observed bytes and elapsed time per identity plus an
@@ -519,7 +535,7 @@ impl<'a> StoredRowRecovery<'a> {
     /// Returns [`None`] when the chunk covers no identity, which reads nothing.
     fn recovery_sql(
         &self,
-        keys: &[PartialUpdateRecoveryKey],
+        keys: &[&PartialUpdateRecoveryKey],
         identity_columns: &[&ColumnSchema],
         recovered_columns: &[&ColumnSchema],
     ) -> Option<String> {
@@ -546,7 +562,7 @@ impl<'a> StoredRowRecovery<'a> {
     /// Returns the recovered bytes this chunk added.
     fn recover_chunk(
         &self,
-        keys: &[PartialUpdateRecoveryKey],
+        keys: &[&PartialUpdateRecoveryKey],
         identity_columns: &[&ColumnSchema],
         recovered_columns: &[&ColumnSchema],
         recovered: &mut RecoveredPartialRows,
@@ -644,27 +660,39 @@ impl StoredRowRecovery<'_> {
         request: &PartialUpdateRecoveryRequest,
         range: std::ops::Range<usize>,
         analyze: bool,
+        key_ordered_storage: bool,
     ) -> EtlResult<String> {
         let identity_columns: Vec<&ColumnSchema> =
             self.replicated_table_schema.identity_column_schemas().collect();
         let replicated_columns: Vec<&ColumnSchema> =
             self.replicated_table_schema.column_schemas().collect();
         let recovered_columns = self.recovered_column_schemas(request, &replicated_columns)?;
-        let Some(sql) =
-            self.recovery_sql(&request.keys()[range], &identity_columns, &recovered_columns)
-        else {
-            return Ok(String::new());
-        };
-        // `EXPLAIN ANALYZE (FORMAT JSON)` is a syntax error: DuckDB takes
-        // `ANALYZE` as one of the parenthesised options, not as a keyword
-        // before them, so the other spelling logs
-        // `Parser Error: syntax error at or near "FORMAT"` for every plan the
-        // diagnostic tries to read.
+        // The statements that ran are the adjacency groups, not the range: an
+        // analyzed plan of the unsplit range would re-run exactly the wide scan
+        // the grouping exists to avoid.
+        let mut shapes = Vec::new();
+        for group in adjacency_groups(&request.keys()[range], key_ordered_storage) {
+            let Some(sql) = self.recovery_sql(&group, &identity_columns, &recovered_columns) else {
+                continue;
+            };
+            shapes.push(self.plan_of(&sql, analyze)?);
+        }
+
+        Ok(shapes.join("\n"))
+    }
+
+    /// Returns the shape of one statement's plan.
+    ///
+    /// `EXPLAIN ANALYZE (FORMAT JSON)` is a syntax error: DuckDB takes
+    /// `ANALYZE` as one of the parenthesised options, not as a keyword before
+    /// them, so the other spelling logs
+    /// `Parser Error: syntax error at or near "FORMAT"` for every plan the
+    /// diagnostic tries to read.
+    fn plan_of(&self, sql: &str, analyze: bool) -> EtlResult<String> {
         let explain = match analyze {
             true => format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"),
             false => format!("EXPLAIN (FORMAT JSON) {sql}"),
         };
-
         let plan_error = |source: duckdb::Error| {
             etl_error!(
                 ErrorKind::DestinationQueryFailed,
@@ -693,6 +721,7 @@ impl StoredRowRecovery<'_> {
         &self,
         request: &PartialUpdateRecoveryRequest,
         range: std::ops::Range<usize>,
+        key_ordered_storage: bool,
     ) -> EtlResult<PartialUpdateRecoveryChunk> {
         let identity_columns: Vec<&ColumnSchema> =
             self.replicated_table_schema.identity_column_schemas().collect();
@@ -701,15 +730,29 @@ impl StoredRowRecovery<'_> {
         let recovered_columns = self.recovered_column_schemas(request, &replicated_columns)?;
 
         let keys = &request.keys()[range];
-        #[cfg(feature = "test-utils")]
-        if let Some(error) = injected_recovery_timeout(keys.len()) {
-            return Err(error);
-        }
         let mut recovered = RecoveredPartialRows::for_request(request);
-        let recovered_bytes =
-            self.recover_chunk(keys, &identity_columns, &recovered_columns, &mut recovered)?;
+        let mut recovered_bytes = 0usize;
+        // One statement per adjacency group: the range predicate brackets a
+        // whole statement, so keys that sit far apart are read as everything
+        // in between unless they are asked for separately.
+        let groups = adjacency_groups(keys, key_ordered_storage);
+        let statements = groups.len();
+        for group in groups {
+            // Each group is its own statement, so the injected timeout applies
+            // to what actually runs rather than to the range they came from.
+            #[cfg(feature = "test-utils")]
+            if let Some(error) = injected_recovery_timeout(group.len()) {
+                return Err(error);
+            }
+            recovered_bytes = recovered_bytes.saturating_add(self.recover_chunk(
+                &group,
+                &identity_columns,
+                &recovered_columns,
+                &mut recovered,
+            )?);
+        }
 
-        Ok(PartialUpdateRecoveryChunk { recovered, recovered_bytes, keys: keys.len() })
+        Ok(PartialUpdateRecoveryChunk { recovered, recovered_bytes, keys: keys.len(), statements })
     }
 }
 
@@ -722,6 +765,8 @@ pub(super) struct PartialUpdateRecoveryChunk {
     pub(super) recovered_bytes: usize,
     /// Identities this statement covered.
     pub(super) keys: usize,
+    /// Statements the identities were read with, one per adjacency group.
+    pub(super) statements: usize,
 }
 
 #[cfg(test)]
@@ -750,7 +795,9 @@ impl PartialUpdateRecovery for StoredRowRecovery<'_> {
                 .next_chunk_size(request.max_recovered_bytes().saturating_sub(recovered_bytes));
             let chunk_end = keys.len().min(covered_keys.saturating_add(chunk_size));
             let chunk_started = Instant::now();
-            let chunk = self.recover_range(request, covered_keys..chunk_end)?;
+            // The synchronous driver is the test-facing one; it groups keys so
+            // its statements match what production emits on sorted storage.
+            let chunk = self.recover_range(request, covered_keys..chunk_end, true)?;
             pacer.observe(chunk.keys, chunk.recovered_bytes, chunk_started.elapsed());
             recovered_bytes = recovered_bytes.saturating_add(chunk.recovered_bytes);
             recovered.merge(chunk.recovered);
@@ -772,6 +819,91 @@ impl PartialUpdateRecovery for StoredRowRecovery<'_> {
 
         Ok(PartialUpdateRecoveryOutcome { recovered, covered_keys })
     }
+}
+
+/// Splits one statement's keys into groups that sit close together.
+///
+/// Keys are grouped only while a cut removes most of the span it is cutting:
+/// a statement costs a fixed amount whatever it covers, so more statements pay
+/// for themselves only when each one reads a much smaller part of the table.
+/// A composite or non-canonical identity has no distance to measure, so it
+/// stays one group.
+fn adjacency_groups(
+    keys: &[PartialUpdateRecoveryKey],
+    key_ordered_storage: bool,
+) -> Vec<Vec<&PartialUpdateRecoveryKey>> {
+    let whole = || vec![keys.iter().collect::<Vec<_>>()];
+    // On storage that is not ordered by the identity, a narrow key range is not
+    // a narrow range of the files: every statement would read the same payload
+    // again and only add its own fixed cost. The caller knows whether the table
+    // has a sort order; without one, the read stays a single statement.
+    if !key_ordered_storage || keys.len() < 2 {
+        return whole();
+    }
+    let mut ordered: Vec<(u128, &PartialUpdateRecoveryKey)> = Vec::with_capacity(keys.len());
+    for key in keys {
+        let [component] = key.components.as_slice() else {
+            return whole();
+        };
+        let Some(image) = component.sort_image() else {
+            return whole();
+        };
+        ordered.push((image, key));
+    }
+    ordered.sort_unstable_by_key(|(image, _)| *image);
+
+    // Cut the widest gap while it takes most of the whole key set's span with
+    // it. The gain is measured against that whole span, not against the group
+    // being cut: splitting a group that is already narrow buys nothing and
+    // costs a statement.
+    let total_span = ordered
+        .last()
+        .zip(ordered.first())
+        .and_then(|(last, first)| last.0.checked_sub(first.0))
+        .unwrap_or_default();
+    if total_span == 0 {
+        return whole();
+    }
+    let mut groups = vec![ordered.as_slice()];
+    while groups.len() < MAX_RECOVERY_KEY_GROUPS {
+        let Some((index, cut, gain)) = groups
+            .iter()
+            .enumerate()
+            .filter_map(|(index, group)| {
+                widest_gap(group, total_span).map(|(cut, gain)| (index, cut, gain))
+            })
+            .max_by(|left, right| left.2.total_cmp(&right.2))
+        else {
+            break;
+        };
+        if gain < RECOVERY_KEY_GROUP_GAIN {
+            break;
+        }
+        let (head, tail) = groups[index].split_at(cut);
+        groups[index] = head;
+        groups.insert(index + 1, tail);
+    }
+
+    groups.into_iter().map(|group| group.iter().map(|(_, key)| *key).collect()).collect()
+}
+
+/// Returns where to cut one sorted group and how much of the whole key set's
+/// span that removes.
+fn widest_gap(
+    group: &[(u128, &PartialUpdateRecoveryKey)],
+    total_span: u128,
+) -> Option<(usize, f64)> {
+    if group.len() < 2 || total_span == 0 {
+        return None;
+    }
+    let span = total_span;
+    let (index, gap) = group
+        .windows(2)
+        .enumerate()
+        .map(|(index, pair)| (index + 1, pair[1].0.saturating_sub(pair[0].0)))
+        .max_by_key(|(_, gap)| *gap)?;
+
+    Some((index, gap as f64 / span as f64))
 }
 
 /// Reduces one JSON plan to operator names and numeric metrics.
@@ -1197,6 +1329,116 @@ mod tests {
         rows[0].values()[0].clone()
     }
 
+    /// Builds recovery keys for the given integer identities.
+    fn integer_keys(ids: &[i64]) -> Vec<PartialUpdateRecoveryKey> {
+        let schema = replicated_schema(vec![
+            ColumnSchema::new("id".to_owned(), Type::INT8, -1, 1, false).with_primary_key(1),
+            ColumnSchema::new("value".to_owned(), Type::TEXT, -1, 2, true),
+        ]);
+        ids.iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let key = Cell::I64(*id);
+                PartialUpdateRecoveryKey {
+                    predicate: identity_predicate(
+                        schema.identity_column_schemas().zip(std::iter::once(&key)),
+                    ),
+                    components: vec![KeyComponent::from_cell(&key, cell_to_sql_literal_ref(&key))],
+                    mutation_index: index,
+                }
+            })
+            .collect()
+    }
+
+    /// Returns the identities of each group, in the group's own order.
+    fn grouped_predicates(keys: &[PartialUpdateRecoveryKey]) -> Vec<Vec<String>> {
+        adjacency_groups(keys, true)
+            .into_iter()
+            .map(|group| group.iter().map(|key| key.predicate.clone()).collect())
+            .collect()
+    }
+
+    /// Keys that sit together stay in one statement.
+    ///
+    /// Splitting costs a whole statement's fixed overhead, so a key set that is
+    /// already narrow must not pay it.
+    #[test]
+    fn keys_that_sit_together_stay_in_one_statement() {
+        let keys = integer_keys(&[100, 101, 102, 103, 104]);
+
+        assert_eq!(grouped_predicates(&keys).len(), 1);
+    }
+
+    /// A far-away key is read by itself instead of dragging the whole range in.
+    ///
+    /// Measured on a lake of that shape: 187 keys from one place scan 187
+    /// rows, and 187 keys spread over the same table scan 298,345 rows and
+    /// peak at 1.9 GB of buffers, because the range predicate brackets the
+    /// whole key set.
+    #[test]
+    fn a_distant_key_is_read_on_its_own() {
+        let keys = integer_keys(&[100, 101, 102, 5_000_000]);
+
+        let groups = grouped_predicates(&keys);
+
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        assert_eq!(groups[0].len(), 3);
+        assert_eq!(groups[1].len(), 1);
+    }
+
+    /// The split is bounded, however scattered the keys are.
+    #[test]
+    fn scattered_keys_are_bounded_by_the_group_limit() {
+        let keys = integer_keys(&[0, 1_000_000, 2_000_000, 3_000_000, 4_000_000, 5_000_000]);
+
+        let groups = grouped_predicates(&keys);
+
+        assert!(groups.len() <= MAX_RECOVERY_KEY_GROUPS, "{groups:?}");
+        assert_eq!(
+            groups.iter().map(Vec::len).sum::<usize>(),
+            keys.len(),
+            "every key must be read exactly once"
+        );
+    }
+
+    /// Unordered storage gets one statement, however scattered the keys are.
+    ///
+    /// A narrow key range is only a narrow range of the files when the files
+    /// are ordered by that key. Without the order, extra statements read the
+    /// same payload again and add nothing but their own fixed cost.
+    #[test]
+    fn storage_that_is_not_key_ordered_is_never_split() {
+        let keys = integer_keys(&[100, 101, 102, 5_000_000]);
+
+        assert_eq!(adjacency_groups(&keys, false).len(), 1);
+        assert_eq!(adjacency_groups(&keys, true).len(), 2);
+    }
+
+    /// An identity with no distance to measure stays one statement.
+    #[test]
+    fn a_non_canonical_identity_is_not_grouped() {
+        let schema = replicated_schema(vec![
+            ColumnSchema::new("name".to_owned(), Type::TEXT, -1, 1, false).with_primary_key(1),
+            ColumnSchema::new("value".to_owned(), Type::TEXT, -1, 2, true),
+        ]);
+        let keys: Vec<PartialUpdateRecoveryKey> = ["a", "zzz"]
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let key = Cell::String((*name).to_owned());
+                PartialUpdateRecoveryKey {
+                    predicate: identity_predicate(
+                        schema.identity_column_schemas().zip(std::iter::once(&key)),
+                    ),
+                    components: vec![KeyComponent::from_cell(&key, cell_to_sql_literal_ref(&key))],
+                    mutation_index: index,
+                }
+            })
+            .collect();
+
+        assert_eq!(adjacency_groups(&keys, true).len(), 1);
+    }
+
     /// The pacer's whole job: never plan a statement whose observed cost would
     /// exceed the caller's timeout, and come back smaller after one does.
     #[test]
@@ -1342,7 +1584,7 @@ mod tests {
 
         for analyze in [false, true] {
             let plan = recovery
-                .explain_range(&request, 0..1, analyze)
+                .explain_range(&request, 0..1, analyze, true)
                 .unwrap_or_else(|error| panic!("analyze={analyze} plan failed: {error}"));
 
             assert!(

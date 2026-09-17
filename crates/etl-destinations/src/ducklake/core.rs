@@ -3465,6 +3465,11 @@ where
                                 replay_epoch,
                                 pending_mutations,
                                 &mut checkpoint_lease,
+                                // Splitting a read by key adjacency only pays
+                                // on storage that is ordered by that key; on
+                                // unordered files every statement reads the
+                                // same payload again.
+                                destination.table_sorting.contains_key(&destination_table_name),
                             )
                             .await?;
                             info!(
