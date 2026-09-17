@@ -15,7 +15,7 @@ use std::{
     hash::{Hash, Hasher},
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -927,7 +927,7 @@ async fn recover_partial_update_chunk(
             // twenty seconds waiting for a slot or a connection has nothing to
             // explain, and repeating the read would add load to the shortage
             // that delayed it.
-            if query_elapsed >= SLOW_RECOVERY_STATEMENT
+            if query_elapsed >= slow_recovery_statement()
                 && !attempt_explained.swap(true, Ordering::Relaxed)
             {
                 log_recovery_plan(
@@ -975,6 +975,26 @@ const RECOVERY_PLAN_TIMEOUT: Duration = Duration::from_secs(30);
 /// costs about as much as the statement it repeats, so it is done once per
 /// request rather than per statement.
 const SLOW_RECOVERY_STATEMENT: Duration = Duration::from_secs(20);
+
+/// The resolved slow-statement threshold in milliseconds.
+static SLOW_RECOVERY_STATEMENT_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Returns the threshold a statement must pass to be explained.
+fn slow_recovery_statement() -> Duration {
+    match SLOW_RECOVERY_STATEMENT_MS.load(Ordering::Relaxed) {
+        u64::MAX => SLOW_RECOVERY_STATEMENT,
+        configured => Duration::from_millis(configured),
+    }
+}
+
+/// Explains every recovery statement at least `threshold_ms` long.
+///
+/// Tests use this because a local statement is milliseconds: without it the
+/// analyzed plan, the one form production found broken, is never exercised.
+#[cfg(feature = "test-utils")]
+pub fn set_slow_recovery_statement_ms_for_tests(threshold_ms: u64) {
+    SLOW_RECOVERY_STATEMENT_MS.store(threshold_ms, Ordering::Relaxed);
+}
 
 /// Logs the plan of a recovery statement that timed out or ran slowly.
 ///
@@ -3488,6 +3508,7 @@ pub fn reset_ducklake_test_hooks() {
     *FAIL_AFTER_ATOMIC_BATCH_COMMIT_TABLE.lock() = None;
     *FAIL_AFTER_COPY_BATCH_COMMIT_TABLE.lock() = None;
     STAGING_TABLE_CREATIONS_BY_TABLE.lock().clear();
+    SLOW_RECOVERY_STATEMENT_MS.store(u64::MAX, Ordering::Relaxed);
     crate::ducklake::partial_update::reset_partial_update_recovery_timeout_for_tests();
 }
 
