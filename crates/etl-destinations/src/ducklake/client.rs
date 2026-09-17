@@ -888,6 +888,15 @@ pub(super) fn duckdb_blocking_timeout_error(timeout: Duration, stage: &'static s
     )
 }
 
+/// Returns whether an error is one of the blocking-operation timeouts above.
+///
+/// A timeout says the work itself did not fit the budget, so a caller that can
+/// make the work smaller should do that instead of repeating it unchanged.
+pub(super) fn is_duckdb_blocking_timeout_error(error: &EtlError) -> bool {
+    error.kind() == ErrorKind::DestinationQueryFailed
+        && error.description() == Some("DuckLake blocking operation timed out")
+}
+
 /// Builds the error returned when shutdown has stopped new DuckDB work.
 pub(super) fn ducklake_shutdown_requested_error() -> EtlError {
     etl_error!(ErrorKind::DestinationConnectionFailed, DUCKLAKE_SHUTDOWN_REQUESTED)

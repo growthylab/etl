@@ -11,9 +11,11 @@
 //! in memory and fold them into the same batched `DELETE` plus staged `INSERT`
 //! the full-row paths already use.
 
+#[cfg(test)]
+use std::time::Instant;
 use std::{
     collections::{BTreeSet, HashMap},
-    time::Instant,
+    time::Duration,
 };
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
@@ -24,6 +26,7 @@ use etl::{
     etl_error,
     schema::{ColumnSchema, ReplicatedTableSchema, Type, is_array_type},
 };
+#[cfg(test)]
 use tracing::info;
 
 use crate::ducklake::{
@@ -46,6 +49,103 @@ const RECOVERY_KEY_BATCH_SIZE: usize = 1024;
 /// later statement from observed bytes, and a request whose stored rows turn
 /// out to be large then overshoots its byte budget by at most one row.
 const RECOVERY_PROBE_KEY_BATCH_SIZE: usize = 1;
+/// Elapsed time one recovery statement aims to stay under.
+///
+/// The byte budget alone says nothing about how long a statement runs: the
+/// same identities cost milliseconds on a compacted table and minutes on one
+/// with tens of thousands of small data files. Sizing later statements from
+/// the seconds per identity already observed keeps one statement well inside
+/// the caller's timeout, so a slow table degrades into more, smaller reads
+/// instead of one read that never returns.
+const RECOVERY_CHUNK_TARGET_ELAPSED: Duration = Duration::from_secs(30);
+
+/// Sizes the statements of one recovery from what the earlier ones cost.
+///
+/// The pacer carries the observed bytes and elapsed time per identity plus an
+/// upper bound that a timed-out statement halves. A caller that runs each
+/// statement under its own timeout can therefore retry a timeout with a
+/// strictly smaller statement instead of repeating the one that timed out.
+#[derive(Debug)]
+pub(super) struct RecoveryChunkPacer {
+    /// Upper bound on the identities of one statement.
+    limit: usize,
+    /// Identities covered by the statements observed so far.
+    covered_keys: usize,
+    /// Bytes those statements recovered.
+    recovered_bytes: usize,
+    /// Time those statements took.
+    elapsed: Duration,
+}
+
+impl Default for RecoveryChunkPacer {
+    fn default() -> Self {
+        Self {
+            limit: RECOVERY_KEY_BATCH_SIZE,
+            covered_keys: 0,
+            recovered_bytes: 0,
+            elapsed: Duration::ZERO,
+        }
+    }
+}
+
+impl RecoveryChunkPacer {
+    /// Returns how many further identities the next statement may cover.
+    ///
+    /// The first statement probes with a single identity; later ones take the
+    /// smaller of what the remaining byte budget and the elapsed-time target
+    /// allow, and never more than the current limit.
+    pub(super) fn next_chunk_size(&self, remaining_bytes: usize) -> usize {
+        if self.covered_keys == 0 {
+            return RECOVERY_PROBE_KEY_BATCH_SIZE.min(self.limit);
+        }
+
+        let by_bytes = match self.recovered_bytes {
+            0 => RECOVERY_KEY_BATCH_SIZE,
+            recovered_bytes => remaining_bytes / recovered_bytes.div_ceil(self.covered_keys),
+        };
+        let by_elapsed = match self.elapsed {
+            Duration::ZERO => RECOVERY_KEY_BATCH_SIZE,
+            elapsed => {
+                let per_key = elapsed.as_nanos().div_ceil(self.covered_keys as u128).max(1);
+                usize::try_from(RECOVERY_CHUNK_TARGET_ELAPSED.as_nanos() / per_key)
+                    .unwrap_or(RECOVERY_KEY_BATCH_SIZE)
+            }
+        };
+
+        by_bytes.min(by_elapsed).clamp(1, self.limit)
+    }
+
+    /// Records what one completed statement covered and cost.
+    pub(super) fn observe(&mut self, keys: usize, recovered_bytes: usize, elapsed: Duration) {
+        self.covered_keys = self.covered_keys.saturating_add(keys);
+        self.recovered_bytes = self.recovered_bytes.saturating_add(recovered_bytes);
+        self.elapsed = self.elapsed.saturating_add(elapsed);
+    }
+
+    /// Halves the statement limit after a timeout.
+    ///
+    /// Returns whether the limit actually shrank: a statement covering a single
+    /// identity that still times out cannot be made smaller, and the caller
+    /// must surface that failure rather than repeat it.
+    pub(super) fn shrink(&mut self) -> bool {
+        if self.limit <= 1 {
+            return false;
+        }
+        self.limit /= 2;
+        // The observations came from statements that were allowed to be larger,
+        // so they would immediately size the next one back up.
+        self.covered_keys = 0;
+        self.recovered_bytes = 0;
+        self.elapsed = Duration::ZERO;
+
+        true
+    }
+
+    /// Returns the current upper bound on one statement's identities.
+    pub(super) fn limit(&self) -> usize {
+        self.limit
+    }
+}
 
 /// Builds the identity predicate shared by deletes and recovered rows.
 ///
@@ -112,6 +212,11 @@ impl PartialUpdateRecoveryRequest {
         &self.columns
     }
 
+    /// Returns the bytes the recovered values of this request may add.
+    pub(super) fn max_recovered_bytes(&self) -> usize {
+        self.max_recovered_bytes
+    }
+
     /// Returns whether the request would read nothing.
     pub(super) fn is_empty(&self) -> bool {
         self.keys.is_empty() || self.columns.is_empty()
@@ -139,6 +244,17 @@ impl RecoveredPartialRows {
     /// Creates an empty result for the columns of one request.
     fn for_request(request: &PartialUpdateRecoveryRequest) -> Self {
         Self { columns: request.columns().to_vec(), rows: HashMap::new() }
+    }
+
+    /// Folds the identities of a later statement of the same recovery in.
+    ///
+    /// Both sides carry the columns of one request, and each statement covers
+    /// a disjoint range of its identities, so no entry is ever overwritten.
+    pub(super) fn merge(&mut self, other: Self) {
+        if self.columns.is_empty() {
+            self.columns = other.columns;
+        }
+        self.rows.extend(other.rows);
     }
 
     /// Returns the replicated-column indexes each stored row carries.
@@ -187,6 +303,12 @@ pub(super) struct PartialUpdateRecoveryOutcome {
 }
 
 /// Reads the stored values a batch of partial updates leaves out.
+///
+/// Production reads one statement at a time through
+/// [`StoredRowRecovery::recover_range`], so that each statement is bounded by
+/// its own timeout. This whole-request form drives the same steps
+/// synchronously for tests that prepare a batch without a connection pool.
+#[cfg(test)]
 pub(super) trait PartialUpdateRecovery {
     /// Returns the stored rows for the identities the read covers.
     fn recover(
@@ -310,21 +432,13 @@ impl<'a> StoredRowRecovery<'a> {
     }
 }
 
-impl PartialUpdateRecovery for StoredRowRecovery<'_> {
-    fn recover(
-        &self,
+impl StoredRowRecovery<'_> {
+    /// Resolves the replicated columns one request reads back.
+    fn recovered_column_schemas<'b>(
+        &'b self,
         request: &PartialUpdateRecoveryRequest,
-    ) -> EtlResult<PartialUpdateRecoveryOutcome> {
-        let mut recovered = RecoveredPartialRows::for_request(request);
-        if request.is_empty() {
-            return Ok(PartialUpdateRecoveryOutcome { recovered, covered_keys: 0 });
-        }
-
-        let started = Instant::now();
-        let identity_columns: Vec<&ColumnSchema> =
-            self.replicated_table_schema.identity_column_schemas().collect();
-        let replicated_columns: Vec<&ColumnSchema> =
-            self.replicated_table_schema.column_schemas().collect();
+        replicated_columns: &[&'b ColumnSchema],
+    ) -> EtlResult<Vec<&'b ColumnSchema>> {
         let mut recovered_columns = Vec::with_capacity(request.columns().len());
         for column_index in request.columns() {
             let Some(column) = replicated_columns.get(*column_index) else {
@@ -341,29 +455,77 @@ impl PartialUpdateRecovery for StoredRowRecovery<'_> {
             recovered_columns.push(*column);
         }
 
+        Ok(recovered_columns)
+    }
+
+    /// Reads one range of a request's identities with a single statement.
+    ///
+    /// Each range is its own statement, so a caller that owns the timeout can
+    /// bound every statement separately instead of bounding the whole
+    /// recovery once.
+    pub(super) fn recover_range(
+        &self,
+        request: &PartialUpdateRecoveryRequest,
+        range: std::ops::Range<usize>,
+    ) -> EtlResult<PartialUpdateRecoveryChunk> {
+        let identity_columns: Vec<&ColumnSchema> =
+            self.replicated_table_schema.identity_column_schemas().collect();
+        let replicated_columns: Vec<&ColumnSchema> =
+            self.replicated_table_schema.column_schemas().collect();
+        let recovered_columns = self.recovered_column_schemas(request, &replicated_columns)?;
+
+        let keys = &request.keys()[range];
+        let mut recovered = RecoveredPartialRows::for_request(request);
+        let recovered_bytes =
+            self.recover_chunk(keys, &identity_columns, &recovered_columns, &mut recovered)?;
+
+        Ok(PartialUpdateRecoveryChunk { recovered, recovered_bytes, keys: keys.len() })
+    }
+}
+
+/// Stored rows read back by one statement of a recovery.
+#[derive(Debug)]
+pub(super) struct PartialUpdateRecoveryChunk {
+    /// Stored rows for the identities this statement covered.
+    pub(super) recovered: RecoveredPartialRows,
+    /// Bytes those rows carry.
+    pub(super) recovered_bytes: usize,
+    /// Identities this statement covered.
+    pub(super) keys: usize,
+}
+
+#[cfg(test)]
+impl PartialUpdateRecovery for StoredRowRecovery<'_> {
+    fn recover(
+        &self,
+        request: &PartialUpdateRecoveryRequest,
+    ) -> EtlResult<PartialUpdateRecoveryOutcome> {
+        let mut recovered = RecoveredPartialRows::for_request(request);
+        if request.is_empty() {
+            return Ok(PartialUpdateRecoveryOutcome { recovered, covered_keys: 0 });
+        }
+
+        let started = Instant::now();
         // Recovered values are far larger than the partial events that need
         // them, so the read stops once it has filled the batch's byte budget
         // and leaves the remaining identities to the next batch. Chunk sizes
-        // follow the bytes per identity the read has already observed, so the
-        // budget is overshot by at most one chunk.
+        // follow the bytes and elapsed time per identity the read has already
+        // observed, so the budget is overshot by at most one chunk.
         let keys = request.keys();
+        let mut pacer = RecoveryChunkPacer::default();
         let mut covered_keys = 0usize;
         let mut recovered_bytes = 0usize;
         while covered_keys < keys.len() {
-            let chunk_size = next_recovery_chunk_size(
-                request.max_recovered_bytes.saturating_sub(recovered_bytes),
-                covered_keys,
-                recovered_bytes,
-            );
+            let chunk_size = pacer
+                .next_chunk_size(request.max_recovered_bytes().saturating_sub(recovered_bytes));
             let chunk_end = keys.len().min(covered_keys.saturating_add(chunk_size));
-            recovered_bytes = recovered_bytes.saturating_add(self.recover_chunk(
-                &keys[covered_keys..chunk_end],
-                &identity_columns,
-                &recovered_columns,
-                &mut recovered,
-            )?);
+            let chunk_started = Instant::now();
+            let chunk = self.recover_range(request, covered_keys..chunk_end)?;
+            pacer.observe(chunk.keys, chunk.recovered_bytes, chunk_started.elapsed());
+            recovered_bytes = recovered_bytes.saturating_add(chunk.recovered_bytes);
+            recovered.merge(chunk.recovered);
             covered_keys = chunk_end;
-            if recovered_bytes >= request.max_recovered_bytes {
+            if recovered_bytes >= request.max_recovered_bytes() {
                 break;
             }
         }
@@ -372,7 +534,7 @@ impl PartialUpdateRecovery for StoredRowRecovery<'_> {
             table = %self.table_name,
             keys = covered_keys,
             requested_keys = keys.len(),
-            recovered_columns = recovered_columns.len(),
+            recovered_columns = request.columns().len(),
             recovered_bytes,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "ducklake recovered partial update columns"
@@ -380,24 +542,6 @@ impl PartialUpdateRecovery for StoredRowRecovery<'_> {
 
         Ok(PartialUpdateRecoveryOutcome { recovered, covered_keys })
     }
-}
-
-/// Returns how many further identities one read statement may cover.
-///
-/// The first statement probes with a small chunk; later ones extrapolate the
-/// remaining budget from the bytes per identity observed so far.
-fn next_recovery_chunk_size(
-    remaining_bytes: usize,
-    covered_keys: usize,
-    recovered_bytes: usize,
-) -> usize {
-    if covered_keys == 0 || recovered_bytes == 0 {
-        return RECOVERY_PROBE_KEY_BATCH_SIZE;
-    }
-
-    let bytes_per_key = recovered_bytes.div_ceil(covered_keys);
-
-    (remaining_bytes / bytes_per_key).clamp(1, RECOVERY_KEY_BATCH_SIZE)
 }
 
 /// Returns the `SELECT` expression that reads one column back.
@@ -754,6 +898,57 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         rows[0].values()[0].clone()
+    }
+
+    /// The pacer's whole job: never plan a statement whose observed cost would
+    /// exceed the caller's timeout, and come back smaller after one does.
+    #[test]
+    fn the_pacer_probes_then_sizes_statements_from_observed_cost() {
+        let mut pacer = RecoveryChunkPacer::default();
+        assert_eq!(
+            pacer.next_chunk_size(usize::MAX),
+            1,
+            "the first statement measures one identity"
+        );
+
+        // 1 KiB and 10 ms per identity: the elapsed target allows 3000, the
+        // limit caps it, and a small byte budget cuts it further.
+        pacer.observe(1, 1024, Duration::from_millis(10));
+        assert_eq!(pacer.next_chunk_size(usize::MAX), RECOVERY_KEY_BATCH_SIZE);
+        assert_eq!(pacer.next_chunk_size(16 * 1024), 16);
+
+        // 6 s per identity on a table whose files are not compacted: five
+        // identities already fill the 30 s target.
+        let mut slow = RecoveryChunkPacer::default();
+        slow.observe(1, 16, Duration::from_secs(6));
+        assert_eq!(slow.next_chunk_size(usize::MAX), 5);
+
+        // A statement is never planned with zero identities, however small the
+        // remaining budget is.
+        let mut large_rows = RecoveryChunkPacer::default();
+        large_rows.observe(1, 8 * 1024 * 1024, Duration::from_millis(1));
+        assert_eq!(large_rows.next_chunk_size(1), 1);
+    }
+
+    #[test]
+    fn the_pacer_halves_its_limit_until_one_identity_remains() {
+        let mut pacer = RecoveryChunkPacer::default();
+        pacer.observe(64, 64 * 1024, Duration::from_millis(64));
+        assert!(pacer.shrink());
+        assert_eq!(pacer.limit(), RECOVERY_KEY_BATCH_SIZE / 2);
+        assert_eq!(
+            pacer.next_chunk_size(usize::MAX),
+            1,
+            "a shrunk pacer re-probes instead of reusing what the larger statement measured"
+        );
+
+        let mut shrinks = 1;
+        while pacer.shrink() {
+            shrinks += 1;
+        }
+        assert_eq!(pacer.limit(), 1);
+        assert_eq!(shrinks, RECOVERY_KEY_BATCH_SIZE.ilog2() as usize);
+        assert!(!pacer.shrink(), "a single-identity statement cannot shrink further");
     }
 
     #[test]
