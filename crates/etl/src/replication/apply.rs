@@ -1442,7 +1442,7 @@ where
                             replication_message_stream.as_mut(),
                             "memory backpressure activated",
                         )
-                        .await?
+                        .await?;
                     }
                     Some(false) => {}
                     None => *batch_memory_subscription = None,
@@ -1548,7 +1548,7 @@ where
                             replication_message_stream.as_mut(),
                             "memory backpressure activated during shutdown drain",
                         )
-                        .await?
+                        .await?;
                     }
                     Some(false) => {}
                     None => *batch_memory_subscription = None,
