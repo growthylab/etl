@@ -456,12 +456,30 @@ impl BlockingStageTimings {
     }
 }
 
-/// Elapsed time above which one foreground operation reports its stages.
+/// Default elapsed time above which one foreground operation reports its
+/// stages.
 ///
 /// Healthy operations are milliseconds; anything approaching a second is worth
 /// a line, and the line is what tells an operator whether the time went into
 /// the query or into waiting for a slot or a connection.
-const SLOW_BLOCKING_OPERATION: Duration = Duration::from_secs(1);
+const DEFAULT_SLOW_BLOCKING_OPERATION: Duration = Duration::from_secs(1);
+/// Setting that lowers (or raises) that threshold for one deployment.
+///
+/// An investigation usually wants every operation's stages for a while, and
+/// redeploying a different constant is a poor way to get them.
+const SLOW_BLOCKING_OPERATION_ENV: &str = "ETL_DUCKLAKE_SLOW_OPERATION_MS";
+
+/// Returns the configured threshold, read once per process.
+fn slow_blocking_operation() -> Duration {
+    static THRESHOLD: LazyLock<Duration> = LazyLock::new(|| {
+        std::env::var(SLOW_BLOCKING_OPERATION_ENV)
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .map_or(DEFAULT_SLOW_BLOCKING_OPERATION, Duration::from_millis)
+    });
+
+    *THRESHOLD
+}
 
 /// Supplies one managed connection to the shared blocking-operation runner.
 ///
@@ -1235,7 +1253,7 @@ where
         etl_error!(ErrorKind::ApplyWorkerPanic, "DuckLake blocking operation task panicked")
     })?;
     let elapsed = operation_started.elapsed();
-    if elapsed >= SLOW_BLOCKING_OPERATION {
+    if elapsed >= slow_blocking_operation() {
         // The one line an operator needs to tell a slow query apart from a
         // queued one, without a debug build or a tracing filter change.
         info!(
