@@ -187,10 +187,6 @@ impl HoldHandle {
     }
 }
 
-/// Applies a consumed fault to an operation's response.
-///
-/// [`FaultAction::Reject`] is normally handled before the inner destination
-/// runs; if it reaches the response phase it fails the response defensively.
 /// Applies a fault that blocks the destination call before the work starts.
 ///
 /// Returns the fault that still applies to the response, if any.
@@ -204,6 +200,10 @@ pub async fn apply_dispatch_fault(fault: Option<FaultAction>) -> Option<FaultAct
     }
 }
 
+/// Applies a consumed fault to an operation's response.
+///
+/// [`FaultAction::Reject`] is normally handled before the inner destination
+/// runs; if it reaches the response phase it fails the response defensively.
 pub async fn apply_response_fault<T>(
     fault: Option<FaultAction>,
     inner_result: EtlResult<T>,

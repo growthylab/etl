@@ -108,9 +108,9 @@ const DEFAULT_KEEP_ALIVE_DURATION: Duration = Duration::from_secs(60);
 /// A third of the timeout gives the window three chances instead of one: at
 /// `60%` a single late update was already a dropped connection, and the
 /// updates that matter are exactly the ones sent while the loop is busy.
-/// growthylab prod 2026-09-17 lost the replication connection every two to
-/// seven minutes, each time replaying a batch and waiting out a 30 s backoff
-/// on a 1.4 GB backlog.
+/// A deployment whose destination regularly took tens of seconds per write lost
+/// its replication connection every few minutes, each time replaying a batch
+/// and waiting out the restart backoff on a large backlog.
 const KEEP_ALIVE_DEADLINE_FRACTION: f64 = 1.0 / 3.0;
 /// Minimum client-side deadline for proactive keep alive retries.
 ///
@@ -2317,8 +2317,8 @@ where
         // how a slow lake stops the loop from reading more WAL. What it must
         // not do is stop the standby status updates, because PostgreSQL drops
         // the replication connection after `wal_sender_timeout` without one.
-        // Prod 2026-09-17: a destination call that took 111 s cost the
-        // connection twice, each time followed by a restart and a replay.
+        // A destination call of two minutes has been observed to cost the
+        // connection, each time followed by a restart and a replay.
         let destination = self.destination.clone();
         let write = destination.write_events(events, durability, flush_result);
         tokio::pin!(write);

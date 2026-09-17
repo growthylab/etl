@@ -104,6 +104,8 @@ use crate::{
 /// One connection is enough because inline-size sampling and metrics sampling
 /// are both best-effort background reads and can safely serialize.
 const DUCKLAKE_METADATA_PG_POOL_SIZE: u32 = 1;
+/// Pause-acquisition wait above which one maintenance operation reports it.
+const MAINTENANCE_PAUSE_WAIT_REPORT: Duration = Duration::from_secs(1);
 /// Prefix for ETL-owned tombstone columns that keep same-name replacement DDL
 /// replay-safe.
 pub(super) const DUCKLAKE_DROPPED_COLUMN_PREFIX: &str = "supabase_etl_ducklake_dropped_";
@@ -4541,9 +4543,6 @@ pub fn table_name_to_ducklake_table_name(table_name: &TableName) -> EtlResult<Du
     Ok(DuckLakeTableName::from_source(table_name))
 }
 
-/// Gate wait above which one maintenance operation reports it.
-const MAINTENANCE_GATE_WAIT_REPORT: Duration = Duration::from_secs(1);
-
 impl<S: DestinationStore> DuckLakeDestination<S> {
     /// Runs host maintenance on the writer instance while mutations are paused.
     ///
@@ -4558,18 +4557,20 @@ impl<S: DestinationStore> DuckLakeDestination<S> {
         R: Send + 'static,
         F: FnOnce(&duckdb::Connection) -> EtlResult<R> + Send + 'static,
     {
-        // The exclusive gate is queued behind every foreground write in flight,
-        // so an operation's elapsed time says nothing about what it cost until
-        // the wait is reported separately: prod 2026-09-17 read 57 inline
-        // flushes of 170–180 s each as slow flushes, when all but one of them
-        // were waiting for their turn.
-        let gate_wait_started = tokio::time::Instant::now();
+        // The pause drains pinned copy sessions and then queues behind every
+        // foreground write in flight, so an operation's elapsed time says
+        // nothing about what it cost until that wait is reported separately: a
+        // deployment once read dozens of simultaneous inline flushes of nearly
+        // three minutes each as slow flushes, when all but one of them were
+        // waiting for their turn. The reported wait covers the whole pause
+        // acquisition, copy-session drain included.
+        let pause_wait_started = tokio::time::Instant::now();
         let pause = self.acquire_external_maintenance_pause().await;
-        let gate_wait = gate_wait_started.elapsed();
-        if gate_wait >= MAINTENANCE_GATE_WAIT_REPORT {
+        let pause_wait = pause_wait_started.elapsed();
+        if pause_wait >= MAINTENANCE_PAUSE_WAIT_REPORT {
             info!(
-                waited_ms = gate_wait.as_millis() as u64,
-                "ducklake maintenance waited for the writer gate"
+                waited_ms = pause_wait.as_millis() as u64,
+                "ducklake maintenance waited for the maintenance pause"
             );
         }
         crate::ducklake::client::run_duckdb_blocking_with_timeout(

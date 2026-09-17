@@ -1053,9 +1053,8 @@ async fn apply_disconnect_at_randomized_positions_converges_without_loss() {
 /// cannot run while the loop is awaiting the destination, so a destination that
 /// applies backpressure inside `write_events` — which is how a lake tells the
 /// loop to stop reading WAL — silently trades one slow write for a dropped
-/// connection, a restart and a replay. growthylab prod 2026-09-17 lost the
-/// connection twice in fifteen minutes that way, each time behind a write that
-/// took 85–111 s.
+/// connection, a restart and a replay. A deployment whose writes took one to
+/// two minutes lost the connection repeatedly that way.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slow_destination_write_keeps_the_replication_connection_alive() {
     init_test_tracing();
