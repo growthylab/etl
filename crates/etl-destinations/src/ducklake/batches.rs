@@ -71,6 +71,7 @@ use crate::{
         },
         replay_epoch::LEGACY_REPLAY_EPOCH,
         sql::{qualified_lake_table_name, quote_identifier},
+        streaming_progress::{StreamingProgress, StreamingProgressTable},
     },
     retry::{RetryAttempt, RetryDecision, RetryPolicy, retry_with_backoff},
 };
@@ -189,9 +190,6 @@ fn format_update_mutation_error_detail(
     )
 }
 
-/// ETL-managed per-table streaming replay progress for steady-state CDC
-/// retries.
-const STREAMING_PROGRESS_TABLE: &str = "__etl_streaming_progress";
 /// Maximum number of times a failed write attempt is retried before giving up.
 const MAX_COMMIT_RETRIES: u32 = 10;
 /// Initial backoff duration before the first retry.
@@ -534,12 +532,14 @@ pub(super) async fn ensure_applied_batches_table_exists(
     .await
 }
 
-/// Ensures the ETL-managed streaming progress table exists.
+/// Ensures every streaming progress table this destination writes exists, with
+/// the current columns.
 pub(super) async fn ensure_streaming_progress_table_exists(
     pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
     blocking_slots: Arc<Semaphore>,
     table_creation_slots: Arc<Semaphore>,
     streaming_progress_table_created: Arc<AtomicBool>,
+    progress_table: StreamingProgressTable,
 ) -> EtlResult<()> {
     if streaming_progress_table_created.load(Ordering::Relaxed) {
         return Ok(());
@@ -553,46 +553,49 @@ pub(super) async fn ensure_streaming_progress_table_exists(
         return Ok(());
     }
 
-    let ddl = format!(
-        r#"CREATE TABLE IF NOT EXISTS {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}" (
-             table_name VARCHAR NOT NULL,
-             replay_epoch VARCHAR,
-             last_commit_lsn UBIGINT NOT NULL,
-             last_tx_ordinal UBIGINT NOT NULL,
-             updated_at TIMESTAMPTZ NOT NULL
-             );"#
-    );
+    let table_names: Vec<String> = progress_table.written_tables().map(str::to_owned).collect();
     let created = Arc::clone(&streaming_progress_table_created);
-    let table_name = STREAMING_PROGRESS_TABLE.to_owned();
 
     run_duckdb_blocking(pool, blocking_slots, move |conn| -> EtlResult<()> {
-        match conn.execute_batch(&ddl) {
-            Ok(()) => {}
-            Err(err) if is_create_table_conflict(&err, &table_name) => {}
-            Err(err) => {
-                return Err(etl_error!(
-                    ErrorKind::DestinationQueryFailed,
-                    "DuckLake CREATE TABLE failed",
-                    format_query_error_detail(&ddl),
-                    source: err
-                ));
+        for table_name in &table_names {
+            let ddl = format!(
+                r#"CREATE TABLE IF NOT EXISTS {LAKE_CATALOG}.{} (
+                     table_name VARCHAR NOT NULL,
+                     replay_epoch VARCHAR,
+                     last_commit_lsn UBIGINT NOT NULL,
+                     last_tx_ordinal UBIGINT NOT NULL,
+                     updated_at TIMESTAMPTZ NOT NULL
+                     );"#,
+                quote_identifier(table_name)
+            );
+            match conn.execute_batch(&ddl) {
+                Ok(()) => {}
+                Err(err) if is_create_table_conflict(&err, table_name) => {}
+                Err(err) => {
+                    return Err(etl_error!(
+                        ErrorKind::DestinationQueryFailed,
+                        "DuckLake CREATE TABLE failed",
+                        format_query_error_detail(&ddl),
+                        source: err
+                    ));
+                }
             }
-        }
-        ensure_helper_table_replay_epoch_column(conn, STREAMING_PROGRESS_TABLE)?;
+            ensure_helper_table_replay_epoch_column(conn, table_name)?;
 
-        let set_option_sql = format!(
-            "CALL {LAKE_CATALOG}.set_option('data_inlining_row_limit', {}, table_name => {});",
-            HELPER_TABLE_DATA_INLINING_ROW_LIMIT,
-            quote_literal(STREAMING_PROGRESS_TABLE),
-        );
-        conn.execute_batch(&set_option_sql).map_err(|error| {
-            etl_error!(
-                ErrorKind::DestinationQueryFailed,
-                "DuckLake set_option failed",
-                format_query_error_detail(&set_option_sql),
-                source: error
-            )
-        })?;
+            let set_option_sql = format!(
+                "CALL {LAKE_CATALOG}.set_option('data_inlining_row_limit', {}, table_name => {});",
+                HELPER_TABLE_DATA_INLINING_ROW_LIMIT,
+                quote_literal(table_name),
+            );
+            conn.execute_batch(&set_option_sql).map_err(|error| {
+                etl_error!(
+                    ErrorKind::DestinationQueryFailed,
+                    "DuckLake set_option failed",
+                    format_query_error_detail(&set_option_sql),
+                    source: error
+                )
+            })?;
+        }
 
         created.store(true, Ordering::Relaxed);
         Ok(())
@@ -667,7 +670,9 @@ fn helper_table_has_column(
 ///
 /// Each batch keeps a separate retry and timeout budget, so a committed batch
 /// never consumes the next batch's execution budget and the replay watermark
-/// stays atomic with its data, including ambiguous commits.
+/// stays atomic with its data, including ambiguous commits. Each batch starts
+/// from the watermark the previous one confirmed, so a steady stream of
+/// batches reads no watermark from the lake.
 ///
 /// Preparation is interleaved with application because completing partial
 /// updates reads stored values. A batch must observe the rows every earlier
@@ -684,21 +689,20 @@ pub(super) async fn prepare_and_apply_mutation_table_batches(
     tracked_mutations: Vec<TrackedTableMutation>,
     checkpoint_lease: &mut CheckpointLease,
     key_ordered_storage: bool,
+    progress: &StreamingProgress,
 ) -> EtlResult<()> {
     let mut pending_chunks: VecDeque<Vec<TrackedTableMutation>> =
         split_tracked_mutations(config, tracked_mutations).into();
     info!(table = %table_name, batch_count = pending_chunks.len(),
         "ducklake table batches prepared");
 
-    let mut known_progress = None;
     while let Some(mut chunk) = pending_chunks.pop_front() {
         // The previous batch has committed and the next one has not started,
         // so a maintenance unit may run here. A long sequence of batches on a
         // fragmented table is exactly when maintenance is most needed and
-        // least able to start.
-        if checkpoint_lease.yield_to_waiting_maintenance(&table_name).await {
-            known_progress = None;
-        }
+        // least able to start. Maintenance never advances a table's
+        // watermark, so the confirmed one stays valid across the handover.
+        checkpoint_lease.yield_to_waiting_maintenance(&table_name).await;
         let mut recovered = RecoveredPartialRows::empty();
         if has_canonical_identity(replicated_table_schema) {
             let request = plan_partial_update_recovery(
@@ -743,11 +747,11 @@ pub(super) async fn prepare_and_apply_mutation_table_batches(
         let Some(batch) = prepared_batches.pop() else {
             continue;
         };
-        known_progress = apply_table_batch_with_progress_retry(
+        apply_table_batch_with_retry(
             Arc::clone(&pool),
             Arc::clone(&blocking_slots),
             batch,
-            known_progress,
+            progress,
         )
         .await?;
     }
@@ -1132,29 +1136,37 @@ where
 }
 
 /// Applies one atomic per-table batch and retries on failure.
+///
+/// A streaming batch starts from the watermark the writer confirmed for its
+/// table, if any, and reads the durable watermark otherwise. The caller holds
+/// the table's write slot, so no other writer advances that watermark. The
+/// confirmed watermark is forgotten before the first attempt and recorded
+/// again only once the batch has committed: an attempt that fails, times out
+/// or is cancelled leaves the watermark unknown, and every retry rereads the
+/// durable watermark because a failed COMMIT may still have landed.
 pub(super) async fn apply_table_batch_with_retry(
     pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
     blocking_slots: Arc<Semaphore>,
     batch: PreparedDuckLakeTableBatch,
+    progress: &StreamingProgress,
 ) -> EtlResult<()> {
-    apply_table_batch_with_progress_retry(pool, blocking_slots, batch, None).await.map(|_| ())
-}
-
-/// Reuse a cursor only within the caller's held table slot, after a confirmed
-/// successful attempt. Every retry rereads durable progress (ambiguous COMMIT).
-async fn apply_table_batch_with_progress_retry(
-    pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
-    blocking_slots: Arc<Semaphore>,
-    batch: PreparedDuckLakeTableBatch,
-    known_progress: Option<TableStreamingProgress>,
-) -> EtlResult<Option<TableStreamingProgress>> {
+    let streaming = batch.uses_streaming_progress();
+    let replay_epoch = batch.replay_epoch.clone();
+    let known_progress = if streaming {
+        let known = progress.cache().get(&batch.table_name, &replay_epoch);
+        progress.cache().forget(&batch.table_name);
+        known.flatten().map(|last_sequence_key| TableStreamingProgress { last_sequence_key })
+    } else {
+        None
+    };
     let first_attempt = AtomicBool::new(true);
     let table_name = batch.table_name.clone();
     let batch_id = batch.batch_id.clone();
     let batch_kind = batch.batch_kind;
     let batch = Arc::new(batch);
+    let progress_table = progress.table().clone();
 
-    retry_with_backoff(
+    let committed = retry_with_backoff(
         RetryPolicy {
             max_retries: MAX_COMMIT_RETRIES,
             initial_delay: Duration::from_millis(INITIAL_RETRY_DELAY_MS),
@@ -1186,6 +1198,7 @@ async fn apply_table_batch_with_progress_retry(
             let attempt_batch = Arc::clone(&batch);
             let pool = Arc::clone(&pool);
             let blocking_slots = Arc::clone(&blocking_slots);
+            let progress_table = progress_table.clone();
             async move {
                 run_duckdb_blocking_with_context(pool, blocking_slots, move |conn, context| {
                     if batch_kind == DuckLakeTableBatchKind::Copy {
@@ -1194,20 +1207,17 @@ async fn apply_table_batch_with_progress_retry(
                             return Ok(None);
                         }
 
-                        apply_table_batch(conn, attempt_batch.as_ref(), context)?;
+                        apply_table_batch(conn, attempt_batch.as_ref(), context, &progress_table)?;
                         return Ok(None);
                     }
 
-                    let batches = std::slice::from_ref(attempt_batch.as_ref());
-                    match known_progress {
-                        Some(progress) => apply_table_batches_with_progress(
-                            conn,
-                            batches,
-                            context,
-                            Some(progress),
-                        ),
-                        None => apply_table_batches(conn, batches, context),
-                    }
+                    apply_table_batches_with_progress(
+                        conn,
+                        std::slice::from_ref(attempt_batch.as_ref()),
+                        context,
+                        &progress_table,
+                        known_progress,
+                    )
                 })
                 .await
             }
@@ -1234,7 +1244,17 @@ async fn apply_table_batch_with_progress_retry(
             ),
             source: failure.last_error
         )
-    })
+    })?;
+
+    if streaming {
+        progress.cache().record(
+            &table_name,
+            &replay_epoch,
+            committed.map(|progress| progress.last_sequence_key),
+        );
+    }
+
+    Ok(())
 }
 
 /// Returns the approximate decoded size of the values one mutation carries.
@@ -1434,20 +1454,21 @@ fn record_replayed_batch_skip(batch: &PreparedDuckLakeTableBatch) {
     );
 }
 
-/// Reads the steady-state streaming replay watermark for one table.
-fn read_table_streaming_progress(
+/// Reads one table's streaming replay watermark from one progress table.
+fn read_streaming_progress_from(
     conn: &duckdb::Connection,
+    progress_table_name: &str,
     table_name: &DuckLakeTableName,
     replay_epoch: &str,
 ) -> EtlResult<Option<TableStreamingProgress>> {
-    let lookup_started = Instant::now();
     let table_id = table_name.id();
     let sql = format!(
         r#"SELECT last_commit_lsn, last_tx_ordinal
-         FROM {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}"
+         FROM {LAKE_CATALOG}.{}
          WHERE table_name = {} AND COALESCE({REPLAY_EPOCH_COLUMN}, {}) = {}
          ORDER BY last_commit_lsn DESC, last_tx_ordinal DESC
          LIMIT 1;"#,
+        quote_identifier(progress_table_name),
         quote_literal(&table_id),
         quote_literal(LEGACY_REPLAY_EPOCH),
         quote_literal(replay_epoch),
@@ -1477,8 +1498,6 @@ fn read_table_streaming_progress(
             source: err
         )
     })?;
-    info!(table = %table_name, progress_lookup_elapsed_ms = lookup_started.elapsed().as_millis() as u64,
-        "ducklake streaming progress read");
     let Some(row) = row else {
         return Ok(None);
     };
@@ -1505,13 +1524,48 @@ fn read_table_streaming_progress(
     }))
 }
 
+/// Reads the durable streaming replay watermark for one table.
+///
+/// A pipeline with its own progress table also consults the shared table and
+/// uses the later of the two frontiers: before the pipeline moved to its own
+/// table only the shared one knows the frontier.
+fn read_table_streaming_progress(
+    conn: &duckdb::Connection,
+    progress_table: &StreamingProgressTable,
+    table_name: &DuckLakeTableName,
+    replay_epoch: &str,
+) -> EtlResult<Option<TableStreamingProgress>> {
+    let lookup_started = Instant::now();
+    let mut progress =
+        read_streaming_progress_from(conn, progress_table.name(), table_name, replay_epoch)?;
+    let legacy_table = progress_table.legacy();
+    if let Some(legacy_table) = legacy_table {
+        let legacy = read_streaming_progress_from(conn, legacy_table, table_name, replay_epoch)?;
+        progress = match (progress, legacy) {
+            (Some(own), Some(legacy))
+                if compare_sequence_keys(legacy.last_sequence_key, own.last_sequence_key)
+                    == std::cmp::Ordering::Greater =>
+            {
+                Some(legacy)
+            }
+            (None, legacy) => legacy,
+            (own, _) => own,
+        };
+    }
+    info!(table = %table_name, progress_lookup_elapsed_ms = lookup_started.elapsed().as_millis() as u64,
+        legacy_consulted = legacy_table.is_some(), "ducklake streaming progress read");
+
+    Ok(progress)
+}
+
 /// Reads the last applied streaming sequence key for one table.
 pub(super) fn read_table_streaming_progress_sequence_key(
     conn: &duckdb::Connection,
+    progress_table: &StreamingProgressTable,
     table_name: &DuckLakeTableName,
     replay_epoch: &str,
 ) -> EtlResult<Option<EventSequenceKey>> {
-    Ok(read_table_streaming_progress(conn, table_name, replay_epoch)?
+    Ok(read_table_streaming_progress(conn, progress_table, table_name, replay_epoch)?
         .map(|progress| progress.last_sequence_key))
 }
 
@@ -1602,18 +1656,23 @@ fn compare_sequence_keys(left: EventSequenceKey, right: EventSequenceKey) -> std
 }
 
 /// Applies all prepared atomic batches for one table on the same connection.
+#[cfg(test)]
 fn apply_table_batches(
     conn: &duckdb::Connection,
     batches: &[PreparedDuckLakeTableBatch],
     operation_context: &DuckLakeBlockingOperationContext,
+    progress_table: &StreamingProgressTable,
 ) -> EtlResult<Option<TableStreamingProgress>> {
-    apply_table_batches_with_progress(conn, batches, operation_context, None)
+    apply_table_batches_with_progress(conn, batches, operation_context, progress_table, None)
 }
 
+/// Applies prepared batches starting from a known watermark, reading the
+/// durable watermark only when none is known.
 fn apply_table_batches_with_progress(
     conn: &duckdb::Connection,
     batches: &[PreparedDuckLakeTableBatch],
     operation_context: &DuckLakeBlockingOperationContext,
+    progress_table: &StreamingProgressTable,
     known_progress: Option<TableStreamingProgress>,
 ) -> EtlResult<Option<TableStreamingProgress>> {
     if batches.is_empty() {
@@ -1625,6 +1684,7 @@ fn apply_table_batches_with_progress(
             Some(progress) => Some(progress),
             None => read_table_streaming_progress(
                 conn,
+                progress_table,
                 batches[0].table_name(),
                 &batches[0].replay_epoch,
             )?,
@@ -1642,7 +1702,7 @@ fn apply_table_batches_with_progress(
                 continue;
             }
 
-            apply_table_batch(conn, batch, operation_context).map_err(|error| {
+            apply_table_batch(conn, batch, operation_context, progress_table).map_err(|error| {
                 etl_error!(
                     ErrorKind::DestinationQueryFailed,
                     "DuckLake atomic table batch failed",
@@ -1668,7 +1728,7 @@ fn apply_table_batches_with_progress(
             }
         }
 
-        apply_table_batch(conn, batch, operation_context).map_err(|error| {
+        apply_table_batch(conn, batch, operation_context, progress_table).map_err(|error| {
             etl_error!(
                 ErrorKind::DestinationQueryFailed,
                 "DuckLake atomic table batch failed",
@@ -2655,9 +2715,10 @@ fn insert_applied_batch_marker_fields(
 }
 
 /// Appends the steady-state streaming replay watermark inside the open
-/// transaction.
+/// transaction, to every progress table the destination writes.
 fn update_table_streaming_progress(
     conn: &duckdb::Connection,
+    progress_table: &StreamingProgressTable,
     batch: &PreparedDuckLakeTableBatch,
 ) -> EtlResult<()> {
     let last_sequence_key = batch.last_sequence_key.ok_or_else(|| {
@@ -2668,23 +2729,26 @@ fn update_table_streaming_progress(
         )
     })?;
     let table_id = batch.table_name.id();
-    let sql = format!(
-        r#"INSERT INTO {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}"
-         (table_name, replay_epoch, last_commit_lsn, last_tx_ordinal, updated_at)
-         VALUES ({}, {}, {}, {}, current_timestamp);"#,
-        quote_literal(&table_id),
-        quote_literal(&batch.replay_epoch),
-        u64::from(last_sequence_key.commit_lsn),
-        last_sequence_key.tx_ordinal,
-    );
-    conn.execute_batch(&sql).map_err(|err| {
-        etl_error!(
-            ErrorKind::DestinationQueryFailed,
-            "DuckLake streaming progress update failed",
-            format_query_error_detail(&sql),
-            source: err
-        )
-    })?;
+    for progress_table_name in progress_table.written_tables() {
+        let sql = format!(
+            r#"INSERT INTO {LAKE_CATALOG}.{}
+             (table_name, replay_epoch, last_commit_lsn, last_tx_ordinal, updated_at)
+             VALUES ({}, {}, {}, {}, current_timestamp);"#,
+            quote_identifier(progress_table_name),
+            quote_literal(&table_id),
+            quote_literal(&batch.replay_epoch),
+            u64::from(last_sequence_key.commit_lsn),
+            last_sequence_key.tx_ordinal,
+        );
+        conn.execute_batch(&sql).map_err(|err| {
+            etl_error!(
+                ErrorKind::DestinationQueryFailed,
+                "DuckLake streaming progress update failed",
+                format_query_error_detail(&sql),
+                source: err
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -3076,6 +3140,7 @@ fn apply_table_batch(
     conn: &duckdb::Connection,
     batch: &PreparedDuckLakeTableBatch,
     operation_context: &DuckLakeBlockingOperationContext,
+    progress_table: &StreamingProgressTable,
 ) -> EtlResult<()> {
     let batch_started = Instant::now();
     let batch_span = tracing::info_span!(
@@ -3161,7 +3226,7 @@ fn apply_table_batch(
             "ducklake batch checkpoint starting"
         );
         if batch.uses_streaming_progress() {
-            update_table_streaming_progress(conn, batch)?;
+            update_table_streaming_progress(conn, progress_table, batch)?;
         } else {
             insert_applied_batch_marker(conn, batch)?;
         }
@@ -3596,6 +3661,7 @@ mod tests {
     use super::*;
     use crate::ducklake::{
         client::duckdb_blocking_timeout_error, partial_update::AbsentStoredRows,
+        streaming_progress::SHARED_STREAMING_PROGRESS_TABLE,
     };
 
     #[test]
@@ -3803,14 +3869,126 @@ mod tests {
         ))
         .unwrap();
 
-        let current_key =
-            read_table_streaming_progress_sequence_key(&conn, &table_name, "current").unwrap();
+        let current_key = read_table_streaming_progress_sequence_key(
+            &conn,
+            &StreamingProgressTable::default(),
+            &table_name,
+            "current",
+        )
+        .unwrap();
         assert_eq!(current_key, Some(EventSequenceKey::new(PgLsn::from(20), 2)));
 
-        let legacy_key =
-            read_table_streaming_progress_sequence_key(&conn, &table_name, LEGACY_REPLAY_EPOCH)
-                .unwrap();
+        let legacy_key = read_table_streaming_progress_sequence_key(
+            &conn,
+            &StreamingProgressTable::default(),
+            &table_name,
+            LEGACY_REPLAY_EPOCH,
+        )
+        .unwrap();
         assert_eq!(legacy_key, Some(EventSequenceKey::new(PgLsn::from(30), 0)));
+    }
+
+    /// A pipeline that moved to its own progress table reads the later of its
+    /// own and the shared table's frontier.
+    #[test]
+    fn own_progress_table_reads_the_later_of_own_and_shared_frontiers() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        attach_lake_catalog(&conn);
+        let own = StreamingProgressTable::with_suffix("pipeline_a").unwrap();
+        for name in own.written_tables() {
+            conn.execute_batch(&format!(
+                "create table lake.{} (table_name varchar not null, replay_epoch varchar, \
+                 last_commit_lsn ubigint not null, last_tx_ordinal ubigint not null, updated_at \
+                 timestamptz not null);",
+                quote_identifier(name)
+            ))
+            .unwrap();
+        }
+        let insert = |name: &str, lsn: u64, ordinal: u64| {
+            conn.execute_batch(&format!(
+                "insert into lake.{} values ({}, 'epoch', {lsn}, {ordinal}, current_timestamp);",
+                quote_identifier(name),
+                quote_literal(&ducklake_table_name().id())
+            ))
+            .unwrap();
+        };
+        let read = || {
+            read_table_streaming_progress_sequence_key(&conn, &own, &ducklake_table_name(), "epoch")
+                .unwrap()
+        };
+
+        assert_eq!(read(), None);
+        // Only the shared table knows the table: the first read after moving.
+        insert(SHARED_STREAMING_PROGRESS_TABLE, 30, 9);
+        assert_eq!(read(), Some(EventSequenceKey::new(PgLsn::from(30), 9)));
+        // The own table is ahead: it wins.
+        insert(own.name(), 40, 1);
+        assert_eq!(read(), Some(EventSequenceKey::new(PgLsn::from(40), 1)));
+        // A version that only knows the shared table advanced it after a
+        // rollback: the shared frontier wins.
+        insert(SHARED_STREAMING_PROGRESS_TABLE, 40, 2);
+        assert_eq!(read(), Some(EventSequenceKey::new(PgLsn::from(40), 2)));
+    }
+
+    /// A committed batch appends its frontier to its own table and to the
+    /// shared one, so a version that only reads the shared table can resume.
+    #[test]
+    fn own_progress_table_batches_also_append_to_the_shared_table() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        attach_lake_catalog(&conn);
+        let own = StreamingProgressTable::with_suffix("pipeline_a").unwrap();
+        conn.execute_batch(
+            "create schema lake.public; create table lake.public.users (id integer, name varchar);",
+        )
+        .unwrap();
+        for name in own.written_tables() {
+            conn.execute_batch(&format!(
+                "create table lake.{} (table_name varchar, replay_epoch varchar, last_commit_lsn \
+                 ubigint, last_tx_ordinal ubigint, updated_at timestamptz);",
+                quote_identifier(name)
+            ))
+            .unwrap();
+        }
+        let batches = prepare_mutation_table_batches(
+            DuckLakeStreamingBatchConfig::default(),
+            &make_replicated_schema(),
+            ducklake_table_name(),
+            LEGACY_REPLAY_EPOCH.to_owned(),
+            replacement_backlog(20),
+            &AbsentStoredRows,
+        )
+        .unwrap();
+        let context = DuckLakeBlockingOperationContext::for_tests();
+        let applied = apply_table_batches(&conn, &batches, &context, &own).unwrap().unwrap();
+
+        for name in own.written_tables() {
+            let shared_only = StreamingProgressTable::default();
+            let (count, frontier): (i64, u64) = conn
+                .query_row(
+                    &format!(
+                        "select count(*), max(last_tx_ordinal) from lake.{}",
+                        quote_identifier(name)
+                    ),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(count, batches.len() as i64, "{name}");
+            assert_eq!(frontier, applied.last_sequence_key.tx_ordinal, "{name}");
+            if name == SHARED_STREAMING_PROGRESS_TABLE {
+                // What an older version reads.
+                assert_eq!(
+                    read_table_streaming_progress(
+                        &conn,
+                        &shared_only,
+                        &ducklake_table_name(),
+                        LEGACY_REPLAY_EPOCH
+                    )
+                    .unwrap(),
+                    Some(applied)
+                );
+            }
+        }
     }
 
     #[test]
@@ -4039,11 +4217,17 @@ mod tests {
         )
         .unwrap();
         let context = DuckLakeBlockingOperationContext::for_tests();
-        let cached = apply_table_batches(&conn, &batches[..1], &context).unwrap();
-        let progress =
-            read_table_streaming_progress(&conn, &ducklake_table_name(), LEGACY_REPLAY_EPOCH)
-                .unwrap()
+        let cached =
+            apply_table_batches(&conn, &batches[..1], &context, &StreamingProgressTable::default())
                 .unwrap();
+        let progress = read_table_streaming_progress(
+            &conn,
+            &StreamingProgressTable::default(),
+            &ducklake_table_name(),
+            LEGACY_REPLAY_EPOCH,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(progress.last_sequence_key.tx_ordinal, 15);
         // The second batch deletes first, then fails inserting a malformed row.
         let mut failed = prepare_mutation_table_batches(
@@ -4063,7 +4247,16 @@ mod tests {
             Cell::String("invalid-integer".to_owned()),
             Cell::Null,
         ])]));
-        assert!(apply_table_batches_with_progress(&conn, &[failed], &context, cached).is_err());
+        assert!(
+            apply_table_batches_with_progress(
+                &conn,
+                &[failed],
+                &context,
+                &StreamingProgressTable::default(),
+                cached
+            )
+            .is_err()
+        );
         assert_eq!(
             conn.query_row("select count(*) from lake.public.users", [], |row| row
                 .get::<_, i64>(0))
@@ -4071,17 +4264,31 @@ mod tests {
             7
         );
         assert_eq!(
-            read_table_streaming_progress(&conn, &ducklake_table_name(), LEGACY_REPLAY_EPOCH)
-                .unwrap()
-                .unwrap()
-                .last_sequence_key
-                .tx_ordinal,
+            read_table_streaming_progress(
+                &conn,
+                &StreamingProgressTable::default(),
+                &ducklake_table_name(),
+                LEGACY_REPLAY_EPOCH
+            )
+            .unwrap()
+            .unwrap()
+            .last_sequence_key
+            .tx_ordinal,
             15
         );
         // Replaying the entire source transaction skips committed work and
         // continues.
-        let reloaded = apply_table_batches(&conn, &batches, &context).unwrap();
-        apply_table_batches_with_progress(&conn, &batches, &context, reloaded).unwrap();
+        let reloaded =
+            apply_table_batches(&conn, &batches, &context, &StreamingProgressTable::default())
+                .unwrap();
+        apply_table_batches_with_progress(
+            &conn,
+            &batches,
+            &context,
+            &StreamingProgressTable::default(),
+            reloaded,
+        )
+        .unwrap();
         let rows = conn
             .prepare("select id, name from lake.public.users order by id")
             .unwrap()
@@ -4102,11 +4309,16 @@ mod tests {
             ]
         );
         assert_eq!(
-            read_table_streaming_progress(&conn, &ducklake_table_name(), LEGACY_REPLAY_EPOCH)
-                .unwrap()
-                .unwrap()
-                .last_sequence_key
-                .tx_ordinal,
+            read_table_streaming_progress(
+                &conn,
+                &StreamingProgressTable::default(),
+                &ducklake_table_name(),
+                LEGACY_REPLAY_EPOCH
+            )
+            .unwrap()
+            .unwrap()
+            .last_sequence_key
+            .tx_ordinal,
             19
         );
     }
@@ -4521,14 +4733,16 @@ mod tests {
             make_batch(300),
         ];
         let context = DuckLakeBlockingOperationContext::for_tests();
-        apply_table_batches(&conn, &batches[..2], &context).unwrap();
+        apply_table_batches(&conn, &batches[..2], &context, &StreamingProgressTable::default())
+            .unwrap();
         assert_eq!(
             conn.query_row("select count(*) from lake.public.users", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
             0
         );
         for _ in 0..2 {
-            apply_table_batches(&conn, &batches, &context).unwrap();
+            apply_table_batches(&conn, &batches, &context, &StreamingProgressTable::default())
+                .unwrap();
             assert_eq!(
                 conn.query_row("select id from lake.public.users", [], |r| r.get::<_, i32>(0))
                     .unwrap(),
@@ -4536,11 +4750,16 @@ mod tests {
             );
         }
         assert_eq!(
-            read_table_streaming_progress(&conn, &ducklake_table_name(), LEGACY_REPLAY_EPOCH)
-                .unwrap()
-                .unwrap()
-                .last_sequence_key
-                .commit_lsn,
+            read_table_streaming_progress(
+                &conn,
+                &StreamingProgressTable::default(),
+                &ducklake_table_name(),
+                LEGACY_REPLAY_EPOCH
+            )
+            .unwrap()
+            .unwrap()
+            .last_sequence_key
+            .commit_lsn,
             PgLsn::from(300)
         );
     }
@@ -5330,8 +5549,13 @@ mod tests {
                 let prepared_ms = started.elapsed().as_millis();
                 let operations: usize = batches.iter().map(prepared_mutation_count).sum();
                 for batch in &batches {
-                    apply_table_batch(&conn, batch, &DuckLakeBlockingOperationContext::for_tests())
-                        .unwrap();
+                    apply_table_batch(
+                        &conn,
+                        batch,
+                        &DuckLakeBlockingOperationContext::for_tests(),
+                        &StreamingProgressTable::default(),
+                    )
+                    .unwrap();
                 }
                 let elapsed_ms = started.elapsed().as_millis();
                 let counts: (i64, i64, i64) = conn

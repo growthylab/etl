@@ -13,6 +13,7 @@ mod partial_update;
 mod replay_epoch;
 mod schema;
 mod sql;
+mod streaming_progress;
 
 use std::fmt;
 

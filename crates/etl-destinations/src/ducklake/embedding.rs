@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use etl::{error::EtlResult, schema::TableName};
 
-use crate::ducklake::DuckLakeTableName;
+use crate::ducklake::{DuckLakeTableName, streaming_progress::StreamingProgressTable};
 
 /// Creates a fully initialized database for a new connection-pool generation.
 pub(super) type ConnectionInitializer =
@@ -27,4 +27,6 @@ pub(super) struct EmbeddingOptions {
     /// expires after fifteen minutes) supplies a pool whose connect options it
     /// refreshes itself, because a URL can only ever carry one credential.
     pub(super) metadata_pg_pool: Option<sqlx::PgPool>,
+    /// Table streaming batches record their replay progress in.
+    pub(super) streaming_progress_table: StreamingProgressTable,
 }
