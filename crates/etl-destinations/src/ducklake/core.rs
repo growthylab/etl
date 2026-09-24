@@ -4601,6 +4601,16 @@ pub fn table_name_to_ducklake_table_name(table_name: &TableName) -> EtlResult<Du
 }
 
 impl<S: DestinationStore> DuckLakeDestination<S> {
+    /// Returns the table in the lake's default schema that streaming batches
+    /// record their replay progress in.
+    ///
+    /// Only this destination writes that table when it is pipeline-specific,
+    /// so host maintenance may prune it under [`Self::run_maintenance`]. Keep
+    /// every table's latest row per replay epoch.
+    pub fn streaming_progress_table_name(&self) -> &str {
+        self.streaming_progress.table().name()
+    }
+
     /// Runs host maintenance on the writer instance while mutations are paused.
     ///
     /// The operation runs on a blocking thread under the normal query watchdog.
