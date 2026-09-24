@@ -92,6 +92,7 @@ use crate::{
             build_set_default_sql_ducklake, build_set_sorted_by_sql_ducklake,
         },
         sql::{qualified_lake_table_name, quote_identifier},
+        streaming_progress::{StreamingProgress, StreamingProgressTable},
     },
     recovery::{
         ensure_destination_schema_matches_metadata, ensure_relation_schema_transition,
@@ -638,6 +639,8 @@ pub struct DuckLakeDestination<S> {
     applied_batches_table_created: Arc<AtomicBool>,
     /// Cache tracking whether the ETL streaming progress table already exists.
     streaming_progress_table_created: Arc<AtomicBool>,
+    /// Streaming progress table and the frontiers this writer confirmed.
+    streaming_progress: StreamingProgress,
 }
 
 /// Builder for a [`DuckLakeDestination`].
@@ -672,6 +675,8 @@ pub struct DuckLakeDestinationBuilder<S> {
     table_sorting: DuckLakeTableSortingConfig,
     /// External-maintenance coordination policy.
     external_maintenance: DuckLakeExternalMaintenanceConfig,
+    /// Optional suffix naming this pipeline's own streaming progress table.
+    streaming_progress_table_suffix: Option<String>,
     /// Durable destination store.
     store: S,
 }
@@ -694,6 +699,7 @@ impl<S> DuckLakeDestinationBuilder<S> {
             copy_buffer_config: DuckLakeCopyBufferConfig::default(),
             table_sorting: DuckLakeTableSortingConfig::default(),
             external_maintenance: DuckLakeExternalMaintenanceConfig::default(),
+            streaming_progress_table_suffix: None,
             store,
         }
     }
@@ -821,6 +827,22 @@ impl<S> DuckLakeDestinationBuilder<S> {
         self.external_maintenance = external_maintenance;
         self
     }
+
+    /// Records streaming progress in `__etl_streaming_progress_<suffix>`
+    /// instead of the table shared by every pipeline of the catalog.
+    ///
+    /// DuckLake detects conflicts per table, and a delete conflicts with every
+    /// concurrent insert into the same table. Pipelines that share a catalog
+    /// and prune their old progress rows therefore fail each other's commits
+    /// while they share one progress table; a table per pipeline lets a host
+    /// prune its own progress under its own writer pause. Frontier reads also
+    /// consult the shared table, so switching keeps the replay position. The
+    /// suffix must be nonempty ASCII letters, digits or underscores, and must
+    /// stay the same for the pipeline's lifetime.
+    pub fn streaming_progress_table_suffix(mut self, suffix: impl Into<String>) -> Self {
+        self.streaming_progress_table_suffix = Some(suffix.into());
+        self
+    }
 }
 
 impl<S> DuckLakeDestinationBuilder<S>
@@ -829,6 +851,10 @@ where
 {
     /// Validates the configuration and creates the destination.
     pub async fn build(self) -> EtlResult<DuckLakeDestination<S>> {
+        let mut embedding = self.embedding;
+        if let Some(suffix) = &self.streaming_progress_table_suffix {
+            embedding.streaming_progress_table = StreamingProgressTable::with_suffix(suffix)?;
+        }
         let writer_config = DuckLakeWriterConfig::new(
             self.maintenance_target_file_size,
             self.parquet_row_group_size_bytes,
@@ -845,7 +871,7 @@ where
             self.copy_buffer_config,
             self.table_sorting,
             self.external_maintenance,
-            self.embedding,
+            embedding,
             self.store,
         )
         .await
@@ -2153,11 +2179,13 @@ where
             Arc::clone(&applied_batches_table_created),
         )
         .await?;
+        let streaming_progress = StreamingProgress::new(embedding.streaming_progress_table.clone());
         ensure_streaming_progress_table_exists(
             Arc::clone(&pool),
             Arc::clone(&blocking_slots),
             Arc::clone(&table_creation_slots),
             Arc::clone(&streaming_progress_table_created),
+            streaming_progress.table().clone(),
         )
         .await?;
 
@@ -2198,6 +2226,7 @@ where
             applied_tables: Arc::clone(&applied_tables),
             applied_batches_table_created,
             streaming_progress_table_created,
+            streaming_progress,
         };
         gauge!(ETL_DUCKLAKE_POOL_SIZE).set(pool_size as f64);
         let shutdown_signal_manager = Arc::clone(&manager);
@@ -2536,6 +2565,7 @@ where
             self.copy_pool()?,
             Arc::clone(&self.blocking_slots),
             prepared_batch,
+            &self.streaming_progress,
         )
         .await?;
         if copy_complete {
@@ -2581,6 +2611,7 @@ where
                     self.copy_pool()?,
                     Arc::clone(&self.blocking_slots),
                     copy_complete,
+                    &self.streaming_progress,
                 )
                 .await?;
                 self.restore_streaming_data_inlining(&table_name).await?;
@@ -3470,6 +3501,7 @@ where
                                 // unordered files every statement reads the
                                 // same payload again.
                                 destination.table_sorting.contains_key(&destination_table_name),
+                                &destination.streaming_progress,
                             )
                             .await?;
                             info!(
@@ -3570,6 +3602,7 @@ where
                             pool,
                             Arc::clone(&destination.blocking_slots),
                             prepared_batch,
+                            &destination.streaming_progress,
                         )
                         .await
                     });
@@ -3937,6 +3970,7 @@ where
             Arc::clone(&self.blocking_slots),
             Arc::clone(&self.table_creation_slots),
             Arc::clone(&self.streaming_progress_table_created),
+            self.streaming_progress.table().clone(),
         )
         .await
     }
@@ -4073,8 +4107,13 @@ where
         }
     }
 
-    /// Reads one table's durable replay cursor while retaining table-local
-    /// ordering through the pending-work decision.
+    /// Reads one table's replay cursor while retaining table-local ordering
+    /// through the pending-work decision.
+    ///
+    /// The frontier this writer confirmed is used when it is known for the
+    /// table's current replay epoch; otherwise the durable frontier is read and
+    /// remembered, since the held write slot keeps any other writer of this
+    /// table from advancing it.
     async fn read_table_replay_cursor(
         &self,
         replicated_table_schema: &ReplicatedTableSchema,
@@ -4085,16 +4124,25 @@ where
         };
         let table_write_permit = self.acquire_table_write_slot(&table_name).await?;
         let replay_epoch = self.read_table_replay_epoch(&table_name).await?;
-        let checkpoint_guard = self.acquire_mutation_guard().await;
-        let last_sequence_key = read_table_streaming_progress_sequence_key_blocking(
-            self.streaming_pool()?,
-            Arc::clone(&self.blocking_slots),
-            table_name.clone(),
-            replay_epoch.clone(),
-        )
-        .await?;
-        // Schema reconciliation acquires the checkpoint gate itself.
-        drop(checkpoint_guard);
+        let cache = self.streaming_progress.cache();
+        let last_sequence_key = match cache.get(&table_name, &replay_epoch) {
+            Some(last_sequence_key) => last_sequence_key,
+            None => {
+                let checkpoint_guard = self.acquire_mutation_guard().await;
+                let last_sequence_key = read_table_streaming_progress_sequence_key_blocking(
+                    self.streaming_pool()?,
+                    Arc::clone(&self.blocking_slots),
+                    self.streaming_progress.table().clone(),
+                    table_name.clone(),
+                    replay_epoch.clone(),
+                )
+                .await?;
+                // Schema reconciliation acquires the checkpoint gate itself.
+                drop(checkpoint_guard);
+                cache.record(&table_name, &replay_epoch, last_sequence_key);
+                last_sequence_key
+            }
+        };
 
         Ok(DuckLakeTableReplayCursor {
             table_name,
@@ -4110,10 +4158,13 @@ where
     }
 
     /// Starts or resumes the replay epoch transition for a table reset.
+    ///
+    /// The reset starts a new frontier, so the confirmed one is forgotten.
     async fn begin_table_replay_epoch_transition(
         &self,
         table_name: &DuckLakeTableName,
     ) -> EtlResult<String> {
+        self.streaming_progress.cache().forget(table_name);
         begin_table_replay_epoch_transition(
             &self.metadata_pg_pool,
             self.metadata_schema.as_ref(),
@@ -4332,11 +4383,17 @@ where
 async fn read_table_streaming_progress_sequence_key_blocking(
     pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
     blocking_slots: Arc<Semaphore>,
+    progress_table: StreamingProgressTable,
     table_name: DuckLakeTableName,
     replay_epoch: String,
 ) -> EtlResult<Option<EventSequenceKey>> {
     run_duckdb_blocking(pool, blocking_slots, move |conn| {
-        read_table_streaming_progress_sequence_key(conn, &table_name, &replay_epoch)
+        read_table_streaming_progress_sequence_key(
+            conn,
+            &progress_table,
+            &table_name,
+            &replay_epoch,
+        )
     })
     .await
 }
@@ -4517,14 +4574,11 @@ pub(super) struct CheckpointLease {
 impl CheckpointLease {
     /// Hands the gate to a waiting maintenance run, then takes it back.
     ///
-    /// Returns whether the gate was actually handed over. Nothing happens when
-    /// no maintenance is waiting, so the common path costs one atomic load.
-    pub(super) async fn yield_to_waiting_maintenance(
-        &mut self,
-        table_name: &DuckLakeTableName,
-    ) -> bool {
+    /// Nothing happens when no maintenance is waiting, so the common path
+    /// costs one atomic load.
+    pub(super) async fn yield_to_waiting_maintenance(&mut self, table_name: &DuckLakeTableName) {
         if self.waiters.load(Ordering::SeqCst) == 0 {
-            return false;
+            return;
         }
 
         let started = tokio::time::Instant::now();
@@ -4535,8 +4589,6 @@ impl CheckpointLease {
             waited_ms = started.elapsed().as_millis() as u64,
             "ducklake yielded the writer gate to waiting maintenance"
         );
-
-        true
     }
 }
 
