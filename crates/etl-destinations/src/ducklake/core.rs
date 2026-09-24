@@ -841,7 +841,9 @@ impl<S> DuckLakeDestinationBuilder<S> {
     /// keeps the replay position, and a version that only knows the shared
     /// table can take over after a rollback. The suffix must be nonempty
     /// lowercase ASCII letters, digits or underscores (identifiers fold case),
-    /// and must stay the same for the pipeline's lifetime.
+    /// and must stay the same for the pipeline's lifetime. The host maintains
+    /// the table: external maintenance, which only knows the shared table, is
+    /// rejected together with this option.
     pub fn streaming_progress_table_suffix(mut self, suffix: impl Into<String>) -> Self {
         self.streaming_progress_table_suffix = Some(suffix.into());
         self
@@ -856,6 +858,19 @@ where
     pub async fn build(self) -> EtlResult<DuckLakeDestination<S>> {
         let mut embedding = self.embedding;
         if let Some(suffix) = &self.streaming_progress_table_suffix {
+            // The external maintenance runner prunes the shared progress table,
+            // which a pipeline with its own table keeps appending to, and never
+            // prunes the pipeline's own table.
+            if self.external_maintenance.mode != DuckLakeMaintenanceMode::Disabled {
+                return Err(etl_error!(
+                    ErrorKind::ConfigError,
+                    "DuckLake streaming progress table suffix requires host maintenance",
+                    format!(
+                        "External maintenance mode {:?} prunes only the shared progress table",
+                        self.external_maintenance.mode
+                    )
+                ));
+            }
             embedding.streaming_progress_table = StreamingProgressTable::with_suffix(suffix)?;
         }
         let writer_config = DuckLakeWriterConfig::new(
@@ -6099,6 +6114,30 @@ mod tests {
             )
             .await
             .unwrap();
+        }
+    }
+
+    /// A pipeline-specific progress table is maintained by the host; the
+    /// external runner would prune the shared table instead.
+    #[tokio::test]
+    async fn progress_table_suffix_rejects_external_maintenance_before_connecting() {
+        for (suffix, external_maintenance) in [
+            ("pipeline_a", DuckLakeExternalMaintenanceConfig::kubernetes(7)),
+            ("Pipeline_A", DuckLakeExternalMaintenanceConfig::disabled()),
+        ] {
+            let error = DuckLakeDestination::builder(
+                Url::parse("postgres://127.0.0.1:1/unreachable").unwrap(),
+                Url::parse("file:///unreachable/").unwrap(),
+                1,
+                MemoryStore::new(),
+            )
+            .external_maintenance(external_maintenance)
+            .streaming_progress_table_suffix(suffix)
+            .build()
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(error.kind(), ErrorKind::ConfigError, "{suffix}");
         }
     }
 
