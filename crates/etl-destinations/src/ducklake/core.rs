@@ -835,10 +835,13 @@ impl<S> DuckLakeDestinationBuilder<S> {
     /// concurrent insert into the same table. Pipelines that share a catalog
     /// and prune their old progress rows therefore fail each other's commits
     /// while they share one progress table; a table per pipeline lets a host
-    /// prune its own progress under its own writer pause. Frontier reads also
-    /// consult the shared table, so switching keeps the replay position. The
-    /// suffix must be nonempty ASCII letters, digits or underscores, and must
-    /// stay the same for the pipeline's lifetime.
+    /// prune its own progress under its own writer pause. Batches also keep
+    /// appending to the shared table, which the host must then no longer
+    /// delete from, and frontier reads take the later of both tables: switching
+    /// keeps the replay position, and a version that only knows the shared
+    /// table can take over after a rollback. The suffix must be nonempty ASCII
+    /// letters, digits or underscores, and must stay the same for the
+    /// pipeline's lifetime.
     pub fn streaming_progress_table_suffix(mut self, suffix: impl Into<String>) -> Self {
         self.streaming_progress_table_suffix = Some(suffix.into());
         self
@@ -4606,7 +4609,8 @@ impl<S: DestinationStore> DuckLakeDestination<S> {
     ///
     /// Only this destination writes that table when it is pipeline-specific,
     /// so host maintenance may prune it under [`Self::run_maintenance`]. Keep
-    /// every table's latest row per replay epoch.
+    /// every table's latest row per replay epoch, and do not delete from the
+    /// shared table the destination also appends to.
     pub fn streaming_progress_table_name(&self) -> &str {
         self.streaming_progress.table().name()
     }

@@ -13,9 +13,11 @@
 //! concurrent delete from the same table. Several pipelines sharing one catalog
 //! and one progress table therefore conflict whenever one of them prunes its
 //! old progress rows while another commits. A host can give each pipeline its
-//! own progress table; frontier reads then also consult the shared table an
-//! earlier version wrote, so moving to a separate table keeps the replay
-//! position.
+//! own progress table to prune under its own writer pause. Batches keep
+//! appending to the shared table too, which nobody deletes from any more, and
+//! frontier reads take the later of both, so moving to a separate table and
+//! rolling back to a version that only knows the shared table both keep the
+//! replay position.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -63,11 +65,21 @@ impl StreamingProgressTable {
         &self.name
     }
 
-    /// Returns the shared table an earlier writer of the same tables may have
-    /// recorded progress in, when this is not that table.
+    /// Returns the shared table, when this is not that table.
+    ///
+    /// A pipeline with its own table keeps appending every frontier to the
+    /// shared table as well and never deletes from it, so a version that only
+    /// knows the shared table can take over after a rollback. Inserts do not
+    /// conflict with each other; only deletes do.
     pub(super) fn legacy(&self) -> Option<&'static str> {
         (self.name.as_ref() != SHARED_STREAMING_PROGRESS_TABLE)
             .then_some(SHARED_STREAMING_PROGRESS_TABLE)
+    }
+
+    /// Returns every table a committed batch appends its frontier to: this
+    /// table first, then the shared table when this is not it.
+    pub(super) fn written_tables(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.name()).chain(self.legacy())
     }
 }
 
@@ -173,11 +185,16 @@ mod tests {
         let table = StreamingProgressTable::with_suffix("pipeline_7").unwrap();
         assert_eq!(table.name(), "__etl_streaming_progress_pipeline_7");
         assert_eq!(table.legacy(), Some(SHARED_STREAMING_PROGRESS_TABLE));
+        assert_eq!(
+            table.written_tables().collect::<Vec<_>>(),
+            ["__etl_streaming_progress_pipeline_7", SHARED_STREAMING_PROGRESS_TABLE]
+        );
         assert!(DuckLakeTableName::new("main", table.name()).is_internal_helper());
 
         let shared = StreamingProgressTable::default();
         assert_eq!(shared.name(), SHARED_STREAMING_PROGRESS_TABLE);
         assert_eq!(shared.legacy(), None);
+        assert_eq!(shared.written_tables().collect::<Vec<_>>(), [SHARED_STREAMING_PROGRESS_TABLE]);
 
         for suffix in ["", "a-b", "a\"b", "a b", "é", "x;drop"] {
             let error = StreamingProgressTable::with_suffix(suffix).unwrap_err();
