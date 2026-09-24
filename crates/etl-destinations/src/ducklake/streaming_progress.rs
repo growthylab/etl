@@ -43,17 +43,24 @@ impl StreamingProgressTable {
     /// Returns a pipeline-specific table named
     /// `__etl_streaming_progress_<suffix>`.
     ///
-    /// The suffix is restricted to ASCII letters, digits and underscores so the
-    /// name needs no quoting beyond the usual identifier quotes and keeps the
-    /// reserved `__etl_` prefix that hides helper tables from table discovery.
+    /// The suffix is restricted to lowercase ASCII letters, digits and
+    /// underscores: DuckDB folds identifier case, so two suffixes differing
+    /// only in case would name one physical table and share it again. The name
+    /// keeps the reserved `__etl_` prefix that hides helper tables from table
+    /// discovery.
     pub(super) fn with_suffix(suffix: &str) -> EtlResult<Self> {
         if suffix.is_empty()
-            || !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
         {
             return Err(etl_error!(
                 ErrorKind::ConfigError,
                 "Invalid DuckLake streaming progress table suffix",
-                format!("Suffix `{suffix}` must be nonempty ASCII letters, digits or underscores")
+                format!(
+                    "Suffix `{suffix}` must be nonempty lowercase ASCII letters, digits or \
+                     underscores"
+                )
             ));
         }
 
@@ -196,7 +203,7 @@ mod tests {
         assert_eq!(shared.legacy(), None);
         assert_eq!(shared.written_tables().collect::<Vec<_>>(), [SHARED_STREAMING_PROGRESS_TABLE]);
 
-        for suffix in ["", "a-b", "a\"b", "a b", "é", "x;drop"] {
+        for suffix in ["", "a-b", "a\"b", "a b", "é", "x;drop", "Pipeline_7", "PIPELINE_7"] {
             let error = StreamingProgressTable::with_suffix(suffix).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::ConfigError);
         }

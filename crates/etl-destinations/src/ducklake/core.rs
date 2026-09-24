@@ -839,9 +839,9 @@ impl<S> DuckLakeDestinationBuilder<S> {
     /// appending to the shared table, which the host must then no longer
     /// delete from, and frontier reads take the later of both tables: switching
     /// keeps the replay position, and a version that only knows the shared
-    /// table can take over after a rollback. The suffix must be nonempty ASCII
-    /// letters, digits or underscores, and must stay the same for the
-    /// pipeline's lifetime.
+    /// table can take over after a rollback. The suffix must be nonempty
+    /// lowercase ASCII letters, digits or underscores (identifiers fold case),
+    /// and must stay the same for the pipeline's lifetime.
     pub fn streaming_progress_table_suffix(mut self, suffix: impl Into<String>) -> Self {
         self.streaming_progress_table_suffix = Some(suffix.into());
         self
