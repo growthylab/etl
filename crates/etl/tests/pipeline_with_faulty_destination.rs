@@ -1125,3 +1125,102 @@ async fn a_slow_destination_write_keeps_the_replication_connection_alive() {
         "a surviving connection must not replay the batch"
     );
 }
+
+/// A write that fails after holding the apply loop past a keepalive deadline
+/// must be replayed.
+///
+/// The keepalives the loop sends while a destination call is in flight must
+/// report the last durable flush position. Once the batch has been handed to
+/// the destination, nothing else in the loop's state marks it unresolved, so
+/// reporting the quiescent position confirms the in-flight batch to
+/// PostgreSQL, which then never sends it again after the write fails and the
+/// worker reconnects.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_that_fails_after_a_slow_dispatch_is_replayed() {
+    init_test_tracing();
+
+    // GIVEN: a source whose walsender expects a standby status every two
+    // seconds, so the loop answers several times during one slow write
+    let mut database = spawn_source_database().await;
+    let alter = format!(
+        "ALTER DATABASE {} SET wal_sender_timeout = '2s'",
+        quote_identifier(database.config.name.as_str())
+    );
+    database.client.as_ref().unwrap().simple_query(&alter).await.unwrap();
+
+    let database_schema = setup_test_database_schema(&database, TableSelection::UsersOnly).await;
+    let table_id = database_schema.users_schema().id;
+
+    let store = NotifyingStore::new();
+    let destination = TestDestinationWrapper::wrap(MemoryDestination::new(store.clone()));
+
+    let pipeline_id: PipelineId = random();
+    let apply_slot_name: String =
+        EtlReplicationSlot::for_apply_worker(pipeline_id).try_into().unwrap();
+    let mut pipeline = create_pipeline(
+        &database.config,
+        pipeline_id,
+        database_schema.publication_name(),
+        store.clone(),
+        destination.clone(),
+    );
+
+    let users_sync_complete_notify = store.notify_on_table_sync_complete(table_id).await;
+    pipeline.start().await.unwrap();
+    users_sync_complete_notify.notified().await;
+
+    let (_, walsender_before) =
+        replication_slot_state(database.client.as_ref().unwrap(), &apply_slot_name).await;
+    let walsender_before = walsender_before.unwrap();
+
+    // WHEN: the write carrying the next row holds the loop for several
+    // keepalive periods and then fails without writing anything
+    destination
+        .inject_fault(
+            FaultyOp::WriteEvents,
+            FaultAction::dispatch_slowly_then_reject(
+                Duration::from_secs(6),
+                ErrorKind::DestinationTimeout,
+                "injected failure after a slow dispatch",
+            ),
+        )
+        .await;
+    insert_users_data(&mut database, &database_schema.users_schema().name, 1..=1).await;
+
+    let reconnected = wait_for_new_walsender(
+        database.client.as_ref().unwrap(),
+        &apply_slot_name,
+        walsender_before,
+        DEFAULT_NOTIFY_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert!(reconnected.is_some());
+
+    // A later row proves the reconnected worker is streaming, whatever it
+    // resumed from.
+    let marker_lower_bound: PgLsn = database
+        .client
+        .as_ref()
+        .unwrap()
+        .query_one("select pg_current_wal_lsn()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let marker_notify = destination
+        .notify_on_events(move |events| {
+            table_insert_commit_lsns(events, table_id)
+                .iter()
+                .any(|commit_lsn| *commit_lsn > marker_lower_bound)
+        })
+        .await;
+    insert_users_data(&mut database, &database_schema.users_schema().name, 2..=2).await;
+    marker_notify.notified().await;
+    pipeline.shutdown_and_wait().await.unwrap();
+
+    // THEN: the failed row was replayed after the reconnect, before the marker
+    let events = destination.get_events().await;
+    let commit_lsns = table_insert_commit_lsns(&events, table_id);
+    assert_eq!(commit_lsns.len(), 2);
+    assert!(commit_lsns[0] < marker_lower_bound);
+}

@@ -80,6 +80,10 @@ pub enum FaultAction {
     /// runs, which is what a destination that applies backpressure inside
     /// `write_events` does to the apply loop.
     DispatchSlowly(Duration),
+    /// The call itself blocks for the duration and then refuses the work, so
+    /// the inner destination never runs: a destination that held the loop
+    /// in backpressure and then failed without writing anything.
+    DispatchSlowlyThenReject(Duration, InjectedError),
 }
 
 impl FaultAction {
@@ -97,6 +101,16 @@ impl FaultAction {
     /// Creates an action that blocks the call itself for `delay`.
     pub fn dispatch_slowly(delay: Duration) -> Self {
         Self::DispatchSlowly(delay)
+    }
+
+    /// Creates an action that blocks the call itself for `delay` and then
+    /// refuses the work with the given error kind and message.
+    pub fn dispatch_slowly_then_reject(
+        delay: Duration,
+        kind: ErrorKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::DispatchSlowlyThenReject(delay, InjectedError::new(kind, message))
     }
 
     /// Creates a hold action and the handle that releases it.
@@ -189,14 +203,19 @@ impl HoldHandle {
 
 /// Applies a fault that blocks the destination call before the work starts.
 ///
-/// Returns the fault that still applies to the response, if any.
-pub async fn apply_dispatch_fault(fault: Option<FaultAction>) -> Option<FaultAction> {
+/// Returns the fault that still applies to the response, if any, or the error
+/// the call must return instead of running the inner destination.
+pub async fn apply_dispatch_fault(fault: Option<FaultAction>) -> EtlResult<Option<FaultAction>> {
     match fault {
         Some(FaultAction::DispatchSlowly(delay)) => {
             tokio::time::sleep(delay).await;
-            None
+            Ok(None)
         }
-        other => other,
+        Some(FaultAction::DispatchSlowlyThenReject(delay, injected)) => {
+            tokio::time::sleep(delay).await;
+            Err(injected.to_etl_error())
+        }
+        other => Ok(other),
     }
 }
 
@@ -222,6 +241,7 @@ pub async fn apply_response_fault<T>(
         // reach this point for an operation that does not apply dispatch
         // faults at all; passing the result through keeps that harmless.
         Some(FaultAction::DispatchSlowly(_)) => inner_result,
+        Some(FaultAction::DispatchSlowlyThenReject(_, injected)) => Err(injected.to_etl_error()),
     }
 }
 

@@ -379,7 +379,7 @@ where
         let fault = self.take_fault(FaultyOp::WriteEvents).await?;
         // A dispatch fault blocks this call, exactly like a destination that
         // applies backpressure before accepting the batch.
-        let fault = apply_dispatch_fault(fault).await;
+        let fault = apply_dispatch_fault(fault).await?;
 
         let destination = {
             let inner = self.inner.read().await;

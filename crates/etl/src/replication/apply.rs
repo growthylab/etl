@@ -2313,6 +2313,15 @@ where
         // the pending receiver is stored on the loop state until the
         // destination signals completion.
         let (flush_result, pending_flush_result) = WriteEventsResult::new(metadata);
+        // The batch is unresolved work from the moment it is handed over, not
+        // only once the call returns. The keepalives below report
+        // `checkpoint_lsn()`, and with the batch already taken from the loop
+        // and its commit end LSN moved into the metadata, nothing else keeps
+        // the loop from looking quiescent: the checkpoint would jump to the
+        // last received LSN, past this batch and every earlier accepted write
+        // it carries, and PostgreSQL would never send them again if the write
+        // then fails or the process dies.
+        self.state.pending_flush_result = Some(pending_flush_result);
         // A destination is free to apply backpressure inside this call: it is
         // how a slow lake stops the loop from reading more WAL. What it must
         // not do is stop the standby status updates, because PostgreSQL drops
@@ -2330,9 +2339,9 @@ where
                     break;
                 }
                 _ = Self::wait_for_keep_alive_deadline(self.state.keep_alive_deadline) => {
-                    // The reported positions cannot have advanced while this
-                    // write is in flight, so this resends the last durable
-                    // checkpoint, exactly like the loop's own keepalive branch.
+                    // The pending result makes the loop non-quiescent, so this
+                    // resends the last durable flush LSN, exactly like the
+                    // loop's own keepalive branch while a write is in flight.
                     self.send_status_update(
                         replication_message_stream.as_mut(),
                         true,
@@ -2344,7 +2353,6 @@ where
                 }
             }
         }
-        self.state.pending_flush_result = Some(pending_flush_result);
 
         // Reset only after dispatch. A batch deferred behind an in-flight write
         // keeps its deadline until that write completes and dispatch is retried.
