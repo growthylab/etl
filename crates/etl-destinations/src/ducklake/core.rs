@@ -30,7 +30,7 @@ use etl_config::{
         DuckLakeSortNulls, DuckLakeTableSortingConfig, DuckLakeWriterConfig, Validate,
     },
 };
-use metrics::gauge;
+use metrics::{counter, gauge};
 use parking_lot::{Mutex, RwLock as ParkingLotRwLock};
 use pg_escape::{quote_identifier as quote_postgres_identifier, quote_literal};
 use sqlx::{AssertSqlSafe, PgPool, postgres::PgPoolOptions};
@@ -53,13 +53,14 @@ use crate::{
         ATTACH_DATA_INLINING_ROW_LIMIT, COPY_DATA_INLINING_ROW_LIMIT, DUCKLAKE_COLUMN_NAME_MAPPING,
         DuckLakeTableName, LAKE_CATALOG, S3Config,
         batches::{
-            DuckLakeCopyAccumulator, PreparedDuckLakeCopyBatch, TableMutation,
-            TrackedTableMutation, TrackedTruncateEvent, apply_table_batch_with_retry,
+            DuckLakeCopyAccumulator, INITIAL_RETRY_DELAY_MS, MAX_COMMIT_RETRIES,
+            MAX_RETRY_DELAY_MS, PreparedDuckLakeCopyBatch, TableMutation, TrackedTableMutation,
+            TrackedTruncateEvent, apply_table_batch_with_retry, ducklake_retry_decision,
             ensure_applied_batches_table_exists, ensure_streaming_progress_table_exists,
-            prepare_and_apply_mutation_table_batches, prepare_copy_complete_table_batch,
-            prepare_copy_table_batch, prepare_truncate_table_batch,
-            read_table_streaming_progress_sequence_key, retain_mutations_after_sequence_key,
-            retain_truncates_after_sequence_key,
+            jitter_ducklake_retry_delay, prepare_and_apply_mutation_table_batches,
+            prepare_copy_complete_table_batch, prepare_copy_table_batch,
+            prepare_truncate_table_batch, read_table_streaming_progress_sequence_key,
+            retain_mutations_after_sequence_key, retain_truncates_after_sequence_key,
         },
         client::{
             DuckLakeConnectionManager, DuckLakeDedicatedConnection, DuckLakeInterruptRegistry,
@@ -76,7 +77,8 @@ use crate::{
         external_maintenance::ExternalMaintenanceOperations,
         inline_size::DuckLakePendingInlineSizeSampler,
         metrics::{
-            DuckLakeMetricsSampler, ETL_DUCKLAKE_POOL_SIZE, query_catalog_maintenance_metrics,
+            BATCH_KIND_LABEL, DuckLakeMetricsSampler, ETL_DUCKLAKE_POOL_SIZE,
+            ETL_DUCKLAKE_RETRIES_TOTAL, RETRY_SCOPE_LABEL, query_catalog_maintenance_metrics,
             query_table_storage_metrics, register_metrics,
             resolve_ducklake_metadata_schema_blocking, spawn_ducklake_metrics_sampler,
         },
@@ -98,6 +100,7 @@ use crate::{
         ensure_destination_schema_matches_metadata, ensure_relation_schema_transition,
         warn_unsupported_column_type_change,
     },
+    retry::{RetryAttempt, RetryPolicy, retry_with_backoff},
 };
 
 /// Shared Postgres metadata pool size for DuckLake background samplers.
@@ -1327,6 +1330,74 @@ fn ensure_ducklake_schema_plan_recoverable(
     }
 
     Ok(())
+}
+
+/// Applies one schema plan in a single DuckLake transaction.
+fn apply_schema_plan_blocking(
+    conn: &duckdb::Connection,
+    table_name: &DuckLakeTableName,
+    plan: &SchemaPlan,
+) -> EtlResult<()> {
+    let execute_ddl = |sql: &str, description: &'static str| -> EtlResult<()> {
+        conn.execute_batch(sql).map_err(|source| {
+            etl_error!(
+                ErrorKind::DestinationQueryFailed,
+                description,
+                format_query_error_detail(sql),
+                source: source
+            )
+        })
+    };
+
+    execute_ddl("begin transaction", "DuckLake DDL transaction failed")?;
+
+    let apply_result = (|| -> EtlResult<()> {
+        let column_names = read_ducklake_table_column_names_blocking(conn, table_name)?;
+        let nullable_column_names = read_ducklake_nullable_column_names_blocking(conn, table_name)?;
+        let DuckLakeSchemaDdlPlan { statements, column_names: _column_names } =
+            plan_ducklake_schema_ddl_with_nullability(
+                table_name,
+                column_names,
+                nullable_column_names,
+                plan,
+            )?;
+
+        for statement in statements {
+            execute_ddl(&statement.sql, statement.error_description)?;
+        }
+
+        #[cfg(feature = "test-utils")]
+        maybe_commit_competing_snapshot_before_schema_commit_for_tests(conn, table_name)?;
+
+        Ok(())
+    })();
+
+    if let Err(error) = apply_result {
+        if let Err(rollback_error) = conn.execute_batch("rollback") {
+            warn!(
+                error = %rollback_error,
+                table = %table_name,
+                "ducklake schema change rollback failed"
+            );
+        }
+        return Err(error);
+    }
+
+    let commit_result = execute_ddl("commit", "DuckLake DDL transaction commit failed");
+    #[cfg(feature = "test-utils")]
+    restore_retry_count_after_competing_snapshot_for_tests(conn);
+    if commit_result.is_err() {
+        // DuckDB normally ends a transaction whose COMMIT failed; make sure the
+        // pooled connection never carries an open one into the next attempt.
+        if let Err(rollback_error) = conn.execute_batch("rollback") {
+            debug!(
+                error = %rollback_error,
+                table = %table_name,
+                "ducklake schema change had no transaction left after failed commit"
+            );
+        }
+    }
+    commit_result
 }
 
 /// Renders a shared plan using live DuckLake name and nullability state.
@@ -3015,56 +3086,49 @@ where
 
         let _table_write_permit = self.acquire_table_write_slot(table_name).await?;
         let _checkpoint_guard = self.acquire_mutation_guard().await;
+        let pool = self.streaming_pool()?;
         let table_name = table_name.clone();
-        let plan = plan.clone();
+        let plan = Arc::new(plan.clone());
 
-        run_duckdb_blocking(self.streaming_pool()?, Arc::clone(&self.blocking_slots), move |conn| {
-            let execute_ddl = |sql: &str, description: &'static str| -> EtlResult<()> {
-                conn.execute_batch(sql).map_err(|source| {
-                    etl_error!(
-                        ErrorKind::DestinationQueryFailed,
-                        description,
-                        format_query_error_detail(sql),
-                        source: source
-                    )
-                })
-            };
-
-            execute_ddl("begin transaction", "DuckLake DDL transaction failed")?;
-
-            let apply_result = (|| -> EtlResult<()> {
-                let column_names = read_ducklake_table_column_names_blocking(conn, &table_name)?;
-                let nullable_column_names =
-                    read_ducklake_nullable_column_names_blocking(conn, &table_name)?;
-                let DuckLakeSchemaDdlPlan { statements, column_names: _column_names } =
-                    plan_ducklake_schema_ddl_with_nullability(
-                        &table_name,
-                        column_names,
-                        nullable_column_names,
-                        &plan,
-                    )?;
-
-                for statement in statements {
-                    execute_ddl(&statement.sql, statement.error_description)?;
-                }
-
-                Ok(())
-            })();
-
-            if let Err(error) = apply_result {
-                if let Err(rollback_error) = conn.execute_batch("rollback") {
-                    warn!(
-                        error = %rollback_error,
-                        table = %table_name,
-                        "ducklake schema change rollback failed"
-                    );
-                }
-                return Err(error);
-            }
-
-            execute_ddl("commit", "DuckLake DDL transaction commit failed")
-        })
+        // A DDL commit races every other writer of the shared catalog for the
+        // next snapshot id, exactly like a data batch. Each attempt rereads the
+        // live columns and replans, so replaying after an ambiguous COMMIT that
+        // did land is a no-op rather than a duplicate ALTER.
+        retry_with_backoff(
+            RetryPolicy {
+                max_retries: MAX_COMMIT_RETRIES,
+                initial_delay: Duration::from_millis(INITIAL_RETRY_DELAY_MS),
+                max_delay: Duration::from_millis(MAX_RETRY_DELAY_MS),
+            },
+            ducklake_retry_decision,
+            jitter_ducklake_retry_delay,
+            |attempt: RetryAttempt<'_, etl::error::EtlError>| {
+                counter!(
+                    ETL_DUCKLAKE_RETRIES_TOTAL,
+                    BATCH_KIND_LABEL => "schema_change",
+                    RETRY_SCOPE_LABEL => "schema_change",
+                )
+                .increment(1);
+                warn!(
+                    attempt = attempt.retry_index,
+                    max = attempt.max_retries,
+                    table = %table_name,
+                    error = %super::diagnostics::query_log_detail(attempt.error),
+                    "ducklake schema change attempt failed, retrying"
+                );
+            },
+            || {
+                let table_name = table_name.clone();
+                let plan = Arc::clone(&plan);
+                run_duckdb_blocking(
+                    Arc::clone(&pool),
+                    Arc::clone(&self.blocking_slots),
+                    move |conn| apply_schema_plan_blocking(conn, &table_name, &plan),
+                )
+            },
+        )
         .await
+        .map_err(|failure| failure.last_error)
     }
 
     /// Reconciles the configured sort order and maintenance-only insert policy.
@@ -4447,6 +4511,72 @@ static PAUSED_COPY_APPEND_RESUME: std::sync::LazyLock<Mutex<Option<CopyAppendRes
 static FAIL_POOL_REFRESH_ONCE: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "test-utils")]
 static FAIL_DROP_TABLE_FOR_COPY_ONCE: AtomicBool = AtomicBool::new(false);
+
+/// Remaining DDL commits that must lose the snapshot race, by table id.
+#[cfg(feature = "test-utils")]
+static LOSE_SCHEMA_COMMITS: std::sync::LazyLock<Mutex<Option<(String, usize)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+#[cfg(feature = "test-utils")]
+static SCHEMA_COMMIT_RETRY_COUNT_OVERRIDDEN: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "test-utils")]
+static COMPETING_SNAPSHOT_SEQUENCE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Makes the next `commits` schema-change commits for `table_name` lose the
+/// catalog snapshot race to a concurrent writer.
+#[cfg(feature = "test-utils")]
+pub fn arm_lose_schema_commits_for_tests(table_name: &str, commits: usize) {
+    *LOSE_SCHEMA_COMMITS.lock() = Some((table_name.to_owned(), commits));
+}
+
+/// Commits a competing snapshot from another connection while the schema
+/// change transaction is still open, and disables DuckLake's own commit retry
+/// so the next COMMIT fails with the duplicate snapshot id.
+#[cfg(feature = "test-utils")]
+fn maybe_commit_competing_snapshot_before_schema_commit_for_tests(
+    conn: &duckdb::Connection,
+    table_name: &DuckLakeTableName,
+) -> EtlResult<()> {
+    {
+        let mut armed = LOSE_SCHEMA_COMMITS.lock();
+        let Some((table, remaining)) = armed.as_mut() else {
+            return Ok(());
+        };
+        if table.as_str() != table_name.id().as_str() {
+            return Ok(());
+        }
+        *remaining -= 1;
+        if *remaining == 0 {
+            *armed = None;
+        }
+    }
+
+    let to_etl_error = |source: duckdb::Error| {
+        etl_error!(
+            ErrorKind::DestinationQueryFailed,
+            "DuckLake test hook failed to commit a competing snapshot",
+            source: source
+        )
+    };
+    conn.execute_batch("SET ducklake_max_retry_count = 0").map_err(to_etl_error)?;
+    SCHEMA_COMMIT_RETRY_COUNT_OVERRIDDEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    let sequence = COMPETING_SNAPSHOT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    conn.try_clone()
+        .and_then(|competitor| {
+            competitor.execute_batch(&format!(
+                "CREATE TABLE {LAKE_CATALOG}.main.competing_snapshot_{sequence} (id INTEGER)"
+            ))
+        })
+        .map_err(to_etl_error)
+}
+
+/// Restores DuckLake's commit retry after a hooked schema commit.
+#[cfg(feature = "test-utils")]
+fn restore_retry_count_after_competing_snapshot_for_tests(conn: &duckdb::Connection) {
+    if SCHEMA_COMMIT_RETRY_COUNT_OVERRIDDEN.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        let _ = conn.execute_batch("RESET ducklake_max_retry_count");
+    }
+}
 
 /// Injects one pool-refresh failure for tests.
 #[cfg(feature = "test-utils")]

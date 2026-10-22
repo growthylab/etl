@@ -57,11 +57,12 @@ use etl_destinations::ducklake::{
 use etl_destinations::ducklake::{
     arm_fail_after_atomic_batch_commit_once_for_tests,
     arm_fail_after_copy_batch_commit_once_for_tests, arm_fail_drop_table_for_copy_once_for_tests,
-    arm_fail_pool_refresh_once_for_tests, arm_pause_next_copy_append_for_tests,
-    ducklake_staging_table_creations_for_tests, pool_refresh_failure_armed_for_tests,
-    release_paused_copy_append_for_tests, reset_drop_table_for_copy_failure_for_tests,
-    reset_ducklake_test_hooks, reset_paused_copy_append_for_tests,
-    reset_pool_refresh_failure_for_tests, run_external_maintenance_watcher,
+    arm_fail_pool_refresh_once_for_tests, arm_lose_schema_commits_for_tests,
+    arm_pause_next_copy_append_for_tests, ducklake_staging_table_creations_for_tests,
+    pool_refresh_failure_armed_for_tests, release_paused_copy_append_for_tests,
+    reset_drop_table_for_copy_failure_for_tests, reset_ducklake_test_hooks,
+    reset_paused_copy_append_for_tests, reset_pool_refresh_failure_for_tests,
+    run_external_maintenance_watcher,
 };
 #[cfg(feature = "test-utils")]
 use etl_maintenance::{
@@ -2220,6 +2221,103 @@ async fn write_events_splits_same_table_batch_by_replicated_schema() {
         .unwrap();
 
     let conn = open_lake_conn_when_tables_visible(&catalog_url, &data_url, &[&table_name]).await;
+    let mut statement = conn
+        .prepare(&format!(
+            "select id, name, email from {} order by id",
+            qualified_lake_table_name(&table_name)
+        ))
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, "Before DDL".to_owned(), None),
+            (2, "After DDL".to_owned(), Some("after@example.com".to_owned())),
+        ]
+    );
+}
+
+/// A schema change whose COMMIT loses the catalog snapshot race to another
+/// writer is replayed instead of failing the pipeline.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread")]
+async fn write_events_retries_schema_change_that_loses_snapshot_race() {
+    use etl::{event::InsertEvent, schema::PgLsn};
+
+    let _test_hook_guard = acquire_ducklake_test_hook_guard().await;
+    reset_ducklake_test_hooks();
+
+    let lake =
+        create_test_lake("write_events_retries_schema_change_that_loses_snapshot_race").await;
+    let catalog_url = lake.catalog_url.clone();
+    let data_url = lake.data_url.clone();
+
+    let old_schema = make_schema(49, "public", "schema_race_products");
+    let new_schema = make_schema_with_email(&old_schema, 200);
+    let old_replicated_table_schema = make_replicated_table_schema(&old_schema);
+    let new_replicated_table_schema = make_replicated_table_schema(&new_schema);
+    let table_name = table_name_to_ducklake_table_name(&old_schema.name).unwrap();
+
+    let store = MemoryStore::new();
+    store.store_table_schema(old_schema).await.unwrap();
+    store.store_table_schema(new_schema).await.unwrap();
+
+    let destination = new_unbuffered_destination(
+        catalog_url.clone(),
+        data_url.clone(),
+        1,
+        None,
+        None,
+        None,
+        None,
+        store,
+    )
+    .await
+    .unwrap();
+
+    destination
+        .write_events(vec![Event::Insert(InsertEvent {
+            commit_lsn: PgLsn::from(100_u64),
+            tx_ordinal: 0,
+            replicated_table_schema: old_replicated_table_schema,
+            table_row: TableRow::new(vec![Cell::I32(1), Cell::String("Before DDL".to_owned())]),
+        })])
+        .await
+        .unwrap();
+
+    arm_lose_schema_commits_for_tests(&table_name.id(), 3);
+
+    destination
+        .write_events(vec![Event::Insert(InsertEvent {
+            commit_lsn: PgLsn::from(201_u64),
+            tx_ordinal: 0,
+            replicated_table_schema: new_replicated_table_schema,
+            table_row: TableRow::new(vec![
+                Cell::I32(2),
+                Cell::String("After DDL".to_owned()),
+                Cell::String("after@example.com".to_owned()),
+            ]),
+        })])
+        .await
+        .unwrap();
+
+    let conn = open_lake_conn_when_tables_visible(&catalog_url, &data_url, &[&table_name]).await;
+    let competing_tables: i64 = conn
+        .query_row(
+            "select count(*) from duckdb_tables() where table_name like 'competing_snapshot_%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(competing_tables, 3, "every armed commit must have lost the race once");
+
     let mut statement = conn
         .prepare(&format!(
             "select id, name, email from {} order by id",
