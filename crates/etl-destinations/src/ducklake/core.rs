@@ -4517,7 +4517,8 @@ static FAIL_DROP_TABLE_FOR_COPY_ONCE: AtomicBool = AtomicBool::new(false);
 static LOSE_SCHEMA_COMMITS: std::sync::LazyLock<Mutex<Option<(String, usize)>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 #[cfg(feature = "test-utils")]
-static SCHEMA_COMMIT_RETRY_COUNT_OVERRIDDEN: AtomicBool = AtomicBool::new(false);
+static OVERRIDDEN_SCHEMA_COMMIT_RETRY_COUNT: std::sync::LazyLock<Mutex<Option<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 #[cfg(feature = "test-utils")]
 static COMPETING_SNAPSHOT_SEQUENCE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -4558,8 +4559,13 @@ fn maybe_commit_competing_snapshot_before_schema_commit_for_tests(
             source: source
         )
     };
+    let configured: String = conn
+        .query_row("SELECT current_setting('ducklake_max_retry_count')::VARCHAR", [], |row| {
+            row.get(0)
+        })
+        .map_err(to_etl_error)?;
     conn.execute_batch("SET ducklake_max_retry_count = 0").map_err(to_etl_error)?;
-    SCHEMA_COMMIT_RETRY_COUNT_OVERRIDDEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    *OVERRIDDEN_SCHEMA_COMMIT_RETRY_COUNT.lock() = Some(configured);
     let sequence = COMPETING_SNAPSHOT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     conn.try_clone()
         .and_then(|competitor| {
@@ -4570,11 +4576,11 @@ fn maybe_commit_competing_snapshot_before_schema_commit_for_tests(
         .map_err(to_etl_error)
 }
 
-/// Restores DuckLake's commit retry after a hooked schema commit.
+/// Restores the configured DuckLake commit retry after a hooked schema commit.
 #[cfg(feature = "test-utils")]
 fn restore_retry_count_after_competing_snapshot_for_tests(conn: &duckdb::Connection) {
-    if SCHEMA_COMMIT_RETRY_COUNT_OVERRIDDEN.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        let _ = conn.execute_batch("RESET ducklake_max_retry_count");
+    if let Some(configured) = OVERRIDDEN_SCHEMA_COMMIT_RETRY_COUNT.lock().take() {
+        let _ = conn.execute_batch(&format!("SET ducklake_max_retry_count = {configured}"));
     }
 }
 
