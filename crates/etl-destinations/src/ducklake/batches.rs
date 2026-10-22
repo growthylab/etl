@@ -191,16 +191,16 @@ fn format_update_mutation_error_detail(
 }
 
 /// Maximum number of times a failed write attempt is retried before giving up.
-const MAX_COMMIT_RETRIES: u32 = 10;
+pub(super) const MAX_COMMIT_RETRIES: u32 = 10;
 /// Initial backoff duration before the first retry.
-const INITIAL_RETRY_DELAY_MS: u64 = 50;
+pub(super) const INITIAL_RETRY_DELAY_MS: u64 = 50;
 /// Upper bound on backoff duration.
-const MAX_RETRY_DELAY_MS: u64 = 2_000;
+pub(super) const MAX_RETRY_DELAY_MS: u64 = 2_000;
 /// Minimum retry delay for transient delete-file visibility failures.
 const TRANSIENT_DELETE_FILE_RETRY_DELAY_MS: u64 = 5_000;
 
 /// Decides whether DuckLake-owned retry loops should retry one failure.
-fn ducklake_retry_decision(error: &etl::error::EtlError) -> RetryDecision {
+pub(super) fn ducklake_retry_decision(error: &etl::error::EtlError) -> RetryDecision {
     if is_ducklake_shutdown_requested_error(error) {
         RetryDecision::Stop
     } else {
@@ -1427,7 +1427,7 @@ pub(super) fn prepare_truncate_table_batch(
 }
 
 /// Applies jitter to one DuckLake retry delay.
-fn jitter_ducklake_retry_delay(base_delay: Duration) -> Duration {
+pub(super) fn jitter_ducklake_retry_delay(base_delay: Duration) -> Duration {
     let jitter_ratio = rand::rng().random_range(0.5..=1.5_f64);
     base_delay.mul_f64(jitter_ratio)
 }
