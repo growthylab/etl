@@ -553,7 +553,7 @@ pub(super) async fn ensure_streaming_progress_table_exists(
         return Ok(());
     }
 
-    let table_names: Vec<String> = progress_table.written_tables().map(str::to_owned).collect();
+    let table_names = [progress_table.name().to_owned()];
     let created = Arc::clone(&streaming_progress_table_created);
 
     run_duckdb_blocking(pool, blocking_slots, move |conn| -> EtlResult<()> {
@@ -1525,10 +1525,6 @@ fn read_streaming_progress_from(
 }
 
 /// Reads the durable streaming replay watermark for one table.
-///
-/// A pipeline with its own progress table also consults the shared table and
-/// uses the later of the two frontiers: before the pipeline moved to its own
-/// table only the shared one knows the frontier.
 fn read_table_streaming_progress(
     conn: &duckdb::Connection,
     progress_table: &StreamingProgressTable,
@@ -1536,24 +1532,10 @@ fn read_table_streaming_progress(
     replay_epoch: &str,
 ) -> EtlResult<Option<TableStreamingProgress>> {
     let lookup_started = Instant::now();
-    let mut progress =
+    let progress =
         read_streaming_progress_from(conn, progress_table.name(), table_name, replay_epoch)?;
-    let legacy_table = progress_table.legacy();
-    if let Some(legacy_table) = legacy_table {
-        let legacy = read_streaming_progress_from(conn, legacy_table, table_name, replay_epoch)?;
-        progress = match (progress, legacy) {
-            (Some(own), Some(legacy))
-                if compare_sequence_keys(legacy.last_sequence_key, own.last_sequence_key)
-                    == std::cmp::Ordering::Greater =>
-            {
-                Some(legacy)
-            }
-            (None, legacy) => legacy,
-            (own, _) => own,
-        };
-    }
     info!(table = %table_name, progress_lookup_elapsed_ms = lookup_started.elapsed().as_millis() as u64,
-        legacy_consulted = legacy_table.is_some(), "ducklake streaming progress read");
+        "ducklake streaming progress read");
 
     Ok(progress)
 }
@@ -2714,8 +2696,8 @@ fn insert_applied_batch_marker_fields(
     Ok(())
 }
 
-/// Appends the steady-state streaming replay watermark inside the open
-/// transaction, to every progress table the destination writes.
+/// Appends the steady-state streaming replay watermark to the progress table
+/// inside the open transaction.
 fn update_table_streaming_progress(
     conn: &duckdb::Connection,
     progress_table: &StreamingProgressTable,
@@ -2729,12 +2711,12 @@ fn update_table_streaming_progress(
         )
     })?;
     let table_id = batch.table_name.id();
-    for progress_table_name in progress_table.written_tables() {
+    {
         let sql = format!(
             r#"INSERT INTO {LAKE_CATALOG}.{}
              (table_name, replay_epoch, last_commit_lsn, last_tx_ordinal, updated_at)
              VALUES ({}, {}, {}, {}, current_timestamp);"#,
-            quote_identifier(progress_table_name),
+            quote_identifier(progress_table.name()),
             quote_literal(&table_id),
             quote_literal(&batch.replay_epoch),
             u64::from(last_sequence_key.commit_lsn),
@@ -3888,52 +3870,10 @@ mod tests {
         assert_eq!(legacy_key, Some(EventSequenceKey::new(PgLsn::from(30), 0)));
     }
 
-    /// A pipeline that moved to its own progress table reads the later of its
-    /// own and the shared table's frontier.
+    /// A pipeline with its own progress table writes and reads only that
+    /// table: the shared table's frontier is ignored and never appended to.
     #[test]
-    fn own_progress_table_reads_the_later_of_own_and_shared_frontiers() {
-        let conn = duckdb::Connection::open_in_memory().unwrap();
-        attach_lake_catalog(&conn);
-        let own = StreamingProgressTable::with_suffix("pipeline_a").unwrap();
-        for name in own.written_tables() {
-            conn.execute_batch(&format!(
-                "create table lake.{} (table_name varchar not null, replay_epoch varchar, \
-                 last_commit_lsn ubigint not null, last_tx_ordinal ubigint not null, updated_at \
-                 timestamptz not null);",
-                quote_identifier(name)
-            ))
-            .unwrap();
-        }
-        let insert = |name: &str, lsn: u64, ordinal: u64| {
-            conn.execute_batch(&format!(
-                "insert into lake.{} values ({}, 'epoch', {lsn}, {ordinal}, current_timestamp);",
-                quote_identifier(name),
-                quote_literal(&ducklake_table_name().id())
-            ))
-            .unwrap();
-        };
-        let read = || {
-            read_table_streaming_progress_sequence_key(&conn, &own, &ducklake_table_name(), "epoch")
-                .unwrap()
-        };
-
-        assert_eq!(read(), None);
-        // Only the shared table knows the table: the first read after moving.
-        insert(SHARED_STREAMING_PROGRESS_TABLE, 30, 9);
-        assert_eq!(read(), Some(EventSequenceKey::new(PgLsn::from(30), 9)));
-        // The own table is ahead: it wins.
-        insert(own.name(), 40, 1);
-        assert_eq!(read(), Some(EventSequenceKey::new(PgLsn::from(40), 1)));
-        // A version that only knows the shared table advanced it after a
-        // rollback: the shared frontier wins.
-        insert(SHARED_STREAMING_PROGRESS_TABLE, 40, 2);
-        assert_eq!(read(), Some(EventSequenceKey::new(PgLsn::from(40), 2)));
-    }
-
-    /// A committed batch appends its frontier to its own table and to the
-    /// shared one, so a version that only reads the shared table can resume.
-    #[test]
-    fn own_progress_table_batches_also_append_to_the_shared_table() {
+    fn own_progress_table_is_the_only_progress_written_and_read() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
         attach_lake_catalog(&conn);
         let own = StreamingProgressTable::with_suffix("pipeline_a").unwrap();
@@ -3941,7 +3881,7 @@ mod tests {
             "create schema lake.public; create table lake.public.users (id integer, name varchar);",
         )
         .unwrap();
-        for name in own.written_tables() {
+        for name in [own.name(), SHARED_STREAMING_PROGRESS_TABLE] {
             conn.execute_batch(&format!(
                 "create table lake.{} (table_name varchar, replay_epoch varchar, last_commit_lsn \
                  ubigint, last_tx_ordinal ubigint, updated_at timestamptz);",
@@ -3949,6 +3889,19 @@ mod tests {
             ))
             .unwrap();
         }
+        conn.execute_batch(&format!(
+            "insert into lake.{} values ({}, {}, 999999, 0, current_timestamp);",
+            quote_identifier(SHARED_STREAMING_PROGRESS_TABLE),
+            quote_literal(&ducklake_table_name().id()),
+            quote_literal(LEGACY_REPLAY_EPOCH)
+        ))
+        .unwrap();
+        assert_eq!(
+            read_table_streaming_progress(&conn, &own, &ducklake_table_name(), LEGACY_REPLAY_EPOCH)
+                .unwrap(),
+            None,
+            "the shared table's frontier is not read"
+        );
         let batches = prepare_mutation_table_batches(
             DuckLakeStreamingBatchConfig::default(),
             &make_replicated_schema(),
@@ -3960,35 +3913,25 @@ mod tests {
         .unwrap();
         let context = DuckLakeBlockingOperationContext::for_tests();
         let applied = apply_table_batches(&conn, &batches, &context, &own).unwrap().unwrap();
-
-        for name in own.written_tables() {
-            let shared_only = StreamingProgressTable::default();
-            let (count, frontier): (i64, u64) = conn
-                .query_row(
-                    &format!(
-                        "select count(*), max(last_tx_ordinal) from lake.{}",
-                        quote_identifier(name)
-                    ),
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            assert_eq!(count, batches.len() as i64, "{name}");
-            assert_eq!(frontier, applied.last_sequence_key.tx_ordinal, "{name}");
-            if name == SHARED_STREAMING_PROGRESS_TABLE {
-                // What an older version reads.
-                assert_eq!(
-                    read_table_streaming_progress(
-                        &conn,
-                        &shared_only,
-                        &ducklake_table_name(),
-                        LEGACY_REPLAY_EPOCH
-                    )
-                    .unwrap(),
-                    Some(applied)
-                );
-            }
-        }
+        let count = |name: &str| -> i64 {
+            conn.query_row(
+                &format!("select count(*) from lake.{}", quote_identifier(name)),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count(own.name()), batches.len() as i64);
+        assert_eq!(
+            count(SHARED_STREAMING_PROGRESS_TABLE),
+            1,
+            "nothing appended to the shared table"
+        );
+        assert_eq!(
+            read_table_streaming_progress(&conn, &own, &ducklake_table_name(), LEGACY_REPLAY_EPOCH)
+                .unwrap(),
+            Some(applied)
+        );
     }
 
     #[test]
