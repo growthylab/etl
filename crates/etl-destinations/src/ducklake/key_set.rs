@@ -66,21 +66,6 @@ impl KeyComponent {
         Self { literal, ordinal: KeyOrdinal::from_cell(cell) }
     }
 
-    /// Returns an order-preserving image of this component's value.
-    ///
-    /// The image orders exactly as DuckDB orders the column, so the distance
-    /// between two images is the distance a range predicate has to cover.
-    /// Returns [`None`] for `NULL` and for values outside the canonical
-    /// integer and UUID identity domain, which have no such image.
-    pub(super) fn sort_image(&self) -> Option<u128> {
-        match self.ordinal? {
-            // Shifted into the unsigned domain so the ordering is preserved
-            // and the distance between two values stays meaningful.
-            KeyOrdinal::Integer(value) => Some((i128::from(value) - i128::from(i64::MIN)) as u128),
-            KeyOrdinal::Uuid(image) => Some(image),
-        }
-    }
-
     /// Returns the SQL literal for this component.
     pub(super) fn literal(&self) -> &str {
         &self.literal
@@ -187,7 +172,8 @@ impl DeleteKeySet {
     /// Returns [`None`] when no key was pushed. The key set is reset so the
     /// same accumulator serves the next run of full-row writes.
     pub(super) fn take_clause(&mut self) -> Option<String> {
-        let (keys, predicates) = self.take_parts()?;
+        let keys = self.keys.join(",");
+        let predicates = self.take_predicates("cdc_keys")?;
 
         Some(format!(
             "USING (VALUES {keys}) AS cdc_keys({}) WHERE {predicates}",
@@ -195,34 +181,30 @@ impl DeleteKeySet {
         ))
     }
 
-    /// Takes the accumulated key set as a `SELECT` join clause.
+    /// Takes the predicate that joins the target to rows staged as
+    /// `cdc_staged`.
     ///
-    /// The clause carries the same `VALUES` list, null-safe join and range
-    /// predicates as [`DeleteKeySet::take_clause`], so a read over the key set
-    /// prunes data files exactly like the batched delete does.
-    pub(super) fn take_join_clause(&mut self) -> Option<String> {
-        let (keys, predicates) = self.take_parts()?;
-
-        Some(format!(
-            ", (VALUES {keys}) AS cdc_keys({}) WHERE {predicates}",
-            self.identity_columns.join(",")
-        ))
+    /// The staged rows carry the identities themselves, so only the null-safe
+    /// join and the range predicates are rendered; the range lets a set update
+    /// prune data files exactly like the batched delete does.
+    pub(super) fn take_staged_predicate(&mut self) -> Option<String> {
+        self.take_predicates("cdc_staged")
     }
 
-    /// Takes the rendered key list and predicates, resetting the accumulator.
-    fn take_parts(&mut self) -> Option<(String, String)> {
-        if self.keys.is_empty() {
+    /// Takes the join and range predicates against `source`, resetting the
+    /// accumulator.
+    fn take_predicates(&mut self, source: &str) -> Option<String> {
+        if std::mem::take(&mut self.keys).is_empty() {
             return None;
         }
 
-        let keys = std::mem::take(&mut self.keys);
         let reset = vec![ColumnBound::Unset; self.bounds.len()];
         let bounds = std::mem::replace(&mut self.bounds, reset);
 
         let mut predicates: Vec<String> = self
             .identity_columns
             .iter()
-            .map(|column| format!("cdc_target.{column} IS NOT DISTINCT FROM cdc_keys.{column}"))
+            .map(|column| format!("cdc_target.{column} IS NOT DISTINCT FROM {source}.{column}"))
             .collect();
         for (column, bound) in self.identity_columns.iter().zip(&bounds) {
             if let ColumnBound::Range { min, max } = bound {
@@ -231,7 +213,7 @@ impl DeleteKeySet {
             }
         }
 
-        Some((keys.join(","), predicates.join(" AND ")))
+        Some(predicates.join(" AND "))
     }
 }
 

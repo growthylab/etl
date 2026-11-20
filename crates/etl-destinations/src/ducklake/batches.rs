@@ -10,12 +10,12 @@
 #[cfg(feature = "test-utils")]
 use std::sync::LazyLock;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     error, fmt,
     hash::{Hash, Hasher},
     sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -37,18 +37,14 @@ use tokio::{sync::Semaphore, time::Instant};
 use tokio_postgres::types::PgLsn;
 use tracing::{debug, info, trace, warn};
 
-#[cfg(test)]
-use crate::ducklake::partial_update::PartialUpdateRecovery;
 use crate::{
     ducklake::{
         DUCKLAKE_COLUMN_NAME_MAPPING, DuckLakeStreamingBatchConfig, DuckLakeTableName,
         LAKE_CATALOG,
         client::{
-            DuckLakeBlockingOperationContext, DuckLakeConnectionManager, FOREGROUND_QUERY_TIMEOUT,
-            format_query_error_detail, is_duckdb_blocking_timeout_error,
-            is_duckdb_query_execution_timeout, is_ducklake_shutdown_requested_error,
-            run_duckdb_blocking, run_duckdb_blocking_timed, run_duckdb_blocking_with_context,
-            run_duckdb_blocking_with_timeout,
+            DuckLakeBlockingOperationContext, DuckLakeConnectionManager, format_query_error_detail,
+            is_ducklake_shutdown_requested_error, run_duckdb_blocking,
+            run_duckdb_blocking_with_context,
         },
         core::{CheckpointLease, is_create_table_conflict},
         diagnostics::query_log_detail,
@@ -63,11 +59,6 @@ use crate::{
             ETL_DUCKLAKE_FAILED_BATCHES_TOTAL, ETL_DUCKLAKE_REPLAYED_BATCHES_TOTAL,
             ETL_DUCKLAKE_RETRIES_TOTAL, ETL_DUCKLAKE_UPSERT_ROWS, PREPARED_ROWS_KIND_LABEL,
             RETRY_SCOPE_LABEL, SUB_BATCH_KIND_LABEL,
-        },
-        partial_update::{
-            PartialUpdateRecoveryChunk, PartialUpdateRecoveryKey, PartialUpdateRecoveryOutcome,
-            PartialUpdateRecoveryRequest, RECOVERY_KEY_BATCH_SIZE, RecoveredPartialRows,
-            RecoveryChunkPacer, StoredRowRecovery, identity_predicate,
         },
         replay_epoch::LEGACY_REPLAY_EPOCH,
         sql::{qualified_lake_table_name, quote_identifier},
@@ -84,23 +75,6 @@ const SQL_INSERT_BATCH_SIZE: usize = 128;
 /// Keep this small so each delete statement remains cheap while still avoiding
 /// one round-trip per deleted row.
 const SQL_DELETE_BATCH_SIZE: usize = 16;
-/// Identities one atomic batch may have to read back for its partial updates.
-///
-/// The streaming row and byte caps bound the events of a batch, and a batch of
-/// partial updates carries almost no bytes precisely because Postgres omitted
-/// the TOASTed columns. The read those events imply is the expensive part, so
-/// it needs its own cap: without one, a single batch can owe a read of every
-/// identity the row cap allows, on a table where each read statement is slow.
-///
-/// The cap matches [`RECOVERY_KEY_BATCH_SIZE`], the most identities one read
-/// statement may ever cover, so a batch can never owe more than one full-sized
-/// statement's worth of work that it cannot spread over later batches. Cutting
-/// it lower would split batches that coalesce cleanly today into more atomic
-/// commits, and more commits is more small data files — the very condition
-/// that makes each read slow. Bounding the statements is what protects a slow
-/// table; this cap only protects against a deployment whose row cap is far
-/// larger than the read can absorb.
-const MAX_PARTIAL_UPDATE_KEYS_PER_BATCH: usize = RECOVERY_KEY_BATCH_SIZE;
 /// ETL-managed marker table storing per-table applied copy batches.
 const APPLIED_BATCHES_TABLE: &str = "__etl_applied_table_batches";
 /// Data inlining limit for append-only DuckLake helper tables.
@@ -233,6 +207,15 @@ enum PreparedTableMutation {
         assignments: Vec<String>,
         // For the WHERE clause predicate used in the UPDATE statement. Example: "id = 4 AND
         // content = 'hello'"
+        predicate: String,
+    },
+    SetUpdate {
+        // Staged identity and present values, `NULL` in the columns left out.
+        rows: PreparedRows,
+        // SET clause assignments read from the staged rows. Example:
+        // "\"name\" = cdc_staged.\"name\""
+        assignments: Vec<String>,
+        // Null-safe join against the staged rows plus the key range bounds.
         predicate: String,
     },
 }
@@ -673,11 +656,6 @@ fn helper_table_has_column(
 /// stays atomic with its data, including ambiguous commits. Each batch starts
 /// from the watermark the previous one confirmed, so a steady stream of
 /// batches reads no watermark from the lake.
-///
-/// Preparation is interleaved with application because completing partial
-/// updates reads stored values. A batch must observe the rows every earlier
-/// batch of the same call already wrote, so its recovery read runs only once
-/// the previous batch has committed.
 #[expect(clippy::too_many_arguments, reason = "One table's full streaming write context")]
 pub(super) async fn prepare_and_apply_mutation_table_batches(
     pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
@@ -688,52 +666,18 @@ pub(super) async fn prepare_and_apply_mutation_table_batches(
     replay_epoch: String,
     tracked_mutations: Vec<TrackedTableMutation>,
     checkpoint_lease: &mut CheckpointLease,
-    key_ordered_storage: bool,
     progress: &StreamingProgress,
 ) -> EtlResult<()> {
-    let mut pending_chunks: VecDeque<Vec<TrackedTableMutation>> =
-        split_tracked_mutations(config, tracked_mutations).into();
-    info!(table = %table_name, batch_count = pending_chunks.len(),
-        "ducklake table batches prepared");
+    let chunks = split_tracked_mutations(config, tracked_mutations);
+    info!(table = %table_name, batch_count = chunks.len(), "ducklake table batches prepared");
 
-    while let Some(mut chunk) = pending_chunks.pop_front() {
+    for chunk in chunks {
         // The previous batch has committed and the next one has not started,
         // so a maintenance unit may run here. A long sequence of batches on a
         // fragmented table is exactly when maintenance is most needed and
         // least able to start. Maintenance never advances a table's
         // watermark, so the confirmed one stays valid across the handover.
         checkpoint_lease.yield_to_waiting_maintenance(&table_name).await;
-        let mut recovered = RecoveredPartialRows::empty();
-        if has_canonical_identity(replicated_table_schema) {
-            let request = plan_partial_update_recovery(
-                replicated_table_schema,
-                chunk.iter().map(|tracked| &tracked.mutation),
-                recovery_byte_budget(config, &chunk),
-            )?;
-            if !request.is_empty() {
-                let request = Arc::new(request);
-                let outcome = recover_partial_update_rows_with_retry(
-                    Arc::clone(&pool),
-                    Arc::clone(&blocking_slots),
-                    replicated_table_schema.clone(),
-                    table_name.clone(),
-                    Arc::clone(&request),
-                    key_ordered_storage,
-                )
-                .await?;
-                // A read that stopped at its byte budget leaves the events
-                // from the first uncovered identity to the next batch, which
-                // reads again once this batch has committed.
-                let covered_mutations =
-                    covered_mutation_count(chunk.len(), &request, outcome.covered_keys);
-                if covered_mutations < chunk.len() {
-                    let remainder = chunk.split_off(covered_mutations);
-                    pending_chunks.push_front(remainder);
-                }
-                recovered = outcome.recovered;
-            }
-        }
-
         let mut prepared_batches = Vec::with_capacity(1);
         push_prepared_mutation_batch(
             &mut prepared_batches,
@@ -741,7 +685,6 @@ pub(super) async fn prepare_and_apply_mutation_table_batches(
             &table_name,
             &replay_epoch,
             chunk,
-            recovered,
         )?;
 
         let Some(batch) = prepared_batches.pop() else {
@@ -757,382 +700,6 @@ pub(super) async fn prepare_and_apply_mutation_table_batches(
     }
 
     Ok(())
-}
-
-/// Returns the bytes one batch may add by completing its partial updates.
-///
-/// The chunk is already bounded by the streaming byte cap, but it is bounded
-/// by the bytes the events carry, and a partial update carries none of the
-/// values it leaves out. Budgeting the recovery against the same cap keeps a
-/// batch of partial updates for large stored rows from growing without bound.
-fn recovery_byte_budget(
-    config: DuckLakeStreamingBatchConfig,
-    chunk: &[TrackedTableMutation],
-) -> usize {
-    let chunk_bytes = chunk
-        .iter()
-        .map(|tracked| mutation_size_hint(&tracked.mutation))
-        .fold(0usize, usize::saturating_add);
-
-    config.max_bytes.saturating_sub(chunk_bytes).max(1)
-}
-
-/// Returns how many leading mutations of a chunk one recovery covers.
-///
-/// Identities are requested in first-seen order and a read stops only at its
-/// byte budget, so the uncovered identities are a suffix and the batch keeps
-/// every event before the first of them.
-fn covered_mutation_count(
-    chunk_len: usize,
-    request: &PartialUpdateRecoveryRequest,
-    covered_keys: usize,
-) -> usize {
-    request.keys().get(covered_keys).map_or(chunk_len, |key| key.mutation_index.min(chunk_len))
-}
-
-/// Reads one batch's missing partial-update columns, one statement at a time.
-///
-/// Each statement covers a range of the request's identities, runs under its
-/// own foreground timeout, and is sized from the bytes and elapsed time the
-/// earlier statements of the same request cost. A statement that times out
-/// halves the size of the next one instead of being repeated unchanged: the
-/// production incident this guards against is a table whose active data files
-/// grew into the tens of thousands, where one read of a whole batch's
-/// identities cannot finish inside any fixed timeout and every retry repeats
-/// exactly the work that already failed.
-///
-/// Every other read failure keeps the commit retry budget, because a recovery
-/// read fails for the same transient reasons a commit does.
-async fn recover_partial_update_rows_with_retry(
-    pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
-    blocking_slots: Arc<Semaphore>,
-    replicated_table_schema: ReplicatedTableSchema,
-    table_name: DuckLakeTableName,
-    request: Arc<PartialUpdateRecoveryRequest>,
-    key_ordered_storage: bool,
-) -> EtlResult<PartialUpdateRecoveryOutcome> {
-    let requested_keys = request.keys().len();
-    let started = Instant::now();
-    let pacer = Arc::new(StdMutex::new(RecoveryChunkPacer::default()));
-    // One analyzed plan per request: running the statement again to measure it
-    // costs what the statement costs.
-    let explained = Arc::new(AtomicBool::new(false));
-    let mut recovered = RecoveredPartialRows::empty();
-    let mut covered_keys = 0usize;
-    let mut recovered_bytes = 0usize;
-
-    while covered_keys < requested_keys {
-        let remaining_bytes = request.max_recovered_bytes().saturating_sub(recovered_bytes);
-        let chunk = recover_partial_update_chunk(
-            Arc::clone(&pool),
-            Arc::clone(&blocking_slots),
-            replicated_table_schema.clone(),
-            table_name.clone(),
-            Arc::clone(&request),
-            Arc::clone(&pacer),
-            Arc::clone(&explained),
-            covered_keys,
-            remaining_bytes,
-            key_ordered_storage,
-        )
-        .await?;
-
-        covered_keys = covered_keys.saturating_add(chunk.keys);
-        recovered_bytes = recovered_bytes.saturating_add(chunk.recovered_bytes);
-        recovered.merge(chunk.recovered);
-        if recovered_bytes >= request.max_recovered_bytes() {
-            break;
-        }
-    }
-
-    info!(
-        table = %table_name,
-        keys = covered_keys,
-        requested_keys,
-        recovered_columns = request.columns().len(),
-        recovered_bytes,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "ducklake recovered partial update columns"
-    );
-
-    Ok(PartialUpdateRecoveryOutcome { recovered, covered_keys })
-}
-
-/// Reads one statement's worth of identities, retrying read failures.
-///
-/// The pacer is shared with the other statements of the same request, so a
-/// timeout shrinks the statement this call retries as well as every later one.
-#[expect(clippy::too_many_arguments, reason = "One recovery statement's full context")]
-async fn recover_partial_update_chunk(
-    pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
-    blocking_slots: Arc<Semaphore>,
-    replicated_table_schema: ReplicatedTableSchema,
-    table_name: DuckLakeTableName,
-    request: Arc<PartialUpdateRecoveryRequest>,
-    pacer: Arc<StdMutex<RecoveryChunkPacer>>,
-    explained: Arc<AtomicBool>,
-    covered_keys: usize,
-    remaining_bytes: usize,
-    key_ordered_storage: bool,
-) -> EtlResult<PartialUpdateRecoveryChunk> {
-    let requested_keys = request.keys().len();
-    let retry_table_name = table_name.clone();
-    let retry_pacer = Arc::clone(&pacer);
-
-    retry_recovery_read(retry_table_name, requested_keys, retry_pacer, move || {
-        let pool = Arc::clone(&pool);
-        let blocking_slots = Arc::clone(&blocking_slots);
-        let attempt_schema = replicated_table_schema.clone();
-        let attempt_table_name = table_name.clone();
-        let attempt_request = Arc::clone(&request);
-        let attempt_pacer = Arc::clone(&pacer);
-        let attempt_explained = Arc::clone(&explained);
-        async move {
-            let chunk_size = lock_pacer(&attempt_pacer).next_chunk_size(remaining_bytes);
-            let chunk_end = requested_keys.min(covered_keys.saturating_add(chunk_size));
-            let range = covered_keys..chunk_end;
-            let logged_table_name = attempt_table_name.clone();
-            let started = Instant::now();
-            let (chunk, query_elapsed) = match run_duckdb_blocking_timed(
-                Arc::clone(&pool),
-                Arc::clone(&blocking_slots),
-                FOREGROUND_QUERY_TIMEOUT,
-                {
-                    let attempt_table_name = attempt_table_name.clone();
-                    let attempt_schema = attempt_schema.clone();
-                    let attempt_request = Arc::clone(&attempt_request);
-                    let range = range.clone();
-                    move |conn| {
-                        StoredRowRecovery::new(conn, &attempt_table_name, &attempt_schema)
-                            .recover_range(&attempt_request, range, key_ordered_storage)
-                    }
-                },
-            )
-            .await
-            {
-                Ok(timed) => timed,
-                Err(error) => {
-                    // Only a statement that reached DuckDB has a plan worth
-                    // asking for; a capacity timeout would just queue again.
-                    if is_duckdb_query_execution_timeout(&error) {
-                        log_recovery_plan(
-                            pool,
-                            blocking_slots,
-                            attempt_schema,
-                            attempt_table_name,
-                            attempt_request,
-                            range,
-                            false,
-                            "timeout",
-                            key_ordered_storage,
-                        )
-                        .await;
-                    }
-                    return Err(error);
-                }
-            };
-            let elapsed = started.elapsed();
-            lock_pacer(&attempt_pacer).observe(chunk.keys, chunk.recovered_bytes, elapsed);
-            // Gated on the query's own time: an operation that spent its
-            // twenty seconds waiting for a slot or a connection has nothing to
-            // explain, and repeating the read would add load to the shortage
-            // that delayed it.
-            if query_elapsed >= slow_recovery_statement()
-                && !attempt_explained.swap(true, Ordering::Relaxed)
-            {
-                log_recovery_plan(
-                    pool,
-                    blocking_slots,
-                    attempt_schema,
-                    logged_table_name.clone(),
-                    attempt_request,
-                    range,
-                    true,
-                    "slow_statement",
-                    key_ordered_storage,
-                )
-                .await;
-            }
-            info!(
-                table = %logged_table_name,
-                keys = chunk.keys,
-                requested_keys,
-                recovered_bytes = chunk.recovered_bytes,
-                // One statement per adjacency group: keys that sit far apart
-                // are read separately so neither range covers the gap.
-                statements = chunk.statements,
-                elapsed_ms = elapsed.as_millis() as u64,
-                query_execution_ms = query_elapsed.as_millis() as u64,
-                // Each statement is submitted with its own full budget, so a
-                // request of many statements is never bounded as a whole.
-                timeout_ms = FOREGROUND_QUERY_TIMEOUT.as_millis() as u64,
-                "ducklake partial update recovery chunk completed"
-            );
-
-            Ok(chunk)
-        }
-    })
-    .await
-}
-
-/// Budget for the plan lookup after a timed-out recovery statement.
-///
-/// `EXPLAIN` does not execute the statement, so this only has to cover
-/// planning: catalog metadata, file lists and statistics. It is deliberately
-/// far smaller than the foreground budget the statement just exhausted.
-const RECOVERY_PLAN_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Elapsed time above which a successful recovery statement is explained.
-///
-/// Statements covering a single identity have been measured at half a minute.
-/// A statement that slow is the one worth measuring, and `EXPLAIN ANALYZE`
-/// costs about as much as the statement it repeats, so it is done once per
-/// request rather than per statement.
-const SLOW_RECOVERY_STATEMENT: Duration = Duration::from_secs(20);
-
-/// The resolved slow-statement threshold in milliseconds.
-static SLOW_RECOVERY_STATEMENT_MS: AtomicU64 = AtomicU64::new(u64::MAX);
-
-/// Returns the threshold a statement must pass to be explained.
-fn slow_recovery_statement() -> Duration {
-    match SLOW_RECOVERY_STATEMENT_MS.load(Ordering::Relaxed) {
-        u64::MAX => SLOW_RECOVERY_STATEMENT,
-        configured => Duration::from_millis(configured),
-    }
-}
-
-/// Explains every recovery statement at least `threshold_ms` long.
-///
-/// Tests use this because a local statement is milliseconds: without it the
-/// analyzed plan, the one form production found broken, is never exercised.
-#[cfg(feature = "test-utils")]
-pub fn set_slow_recovery_statement_ms_for_tests(threshold_ms: u64) {
-    SLOW_RECOVERY_STATEMENT_MS.store(threshold_ms, Ordering::Relaxed);
-}
-
-/// Logs the plan of a recovery statement that timed out or ran slowly.
-///
-/// A deployment once spent twenty hours on `stage=query_execution`
-/// with nothing to say where the time went. The plan says how many rows and
-/// data files the read actually touched, which is what separates a scan that
-/// pruned nothing from an overhead that is not in the scan at all. The plan is
-/// reduced to operator names and numeric metrics before it is logged: the
-/// statement embeds source identity values, and those never reach a log.
-///
-/// A failure here is itself only diagnostic, so it is logged and dropped.
-#[expect(clippy::too_many_arguments, reason = "One recovery statement's full context")]
-async fn log_recovery_plan(
-    pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
-    blocking_slots: Arc<Semaphore>,
-    replicated_table_schema: ReplicatedTableSchema,
-    table_name: DuckLakeTableName,
-    request: Arc<PartialUpdateRecoveryRequest>,
-    range: std::ops::Range<usize>,
-    analyze: bool,
-    reason: &'static str,
-    key_ordered_storage: bool,
-) {
-    let keys = range.len();
-    let explain_table_name = table_name.clone();
-    // Planning is cheap; running the statement again costs what the statement
-    // costs, so an analyzed plan gets the same budget the statement had.
-    let budget = match analyze {
-        true => FOREGROUND_QUERY_TIMEOUT,
-        false => RECOVERY_PLAN_TIMEOUT,
-    };
-    let plan =
-        run_duckdb_blocking_with_timeout(pool, blocking_slots, budget, move |conn| {
-            StoredRowRecovery::new(conn, &explain_table_name, &replicated_table_schema)
-                .explain_range(&request, range, analyze, key_ordered_storage)
-        })
-        .await;
-    match plan {
-        Ok(plan) => warn!(
-            table = %table_name,
-            keys,
-            reason,
-            analyzed = analyze,
-            plan = %plan,
-            "ducklake partial update recovery plan"
-        ),
-        Err(error) => warn!(
-            table = %table_name,
-            keys,
-            reason,
-            analyzed = analyze,
-            error = %query_log_detail(&error),
-            "ducklake partial update recovery plan could not be read"
-        ),
-    }
-}
-
-/// Locks the shared pacer, recovering a poisoned lock.
-///
-/// The pacer only carries sizing hints, so a panic in another statement of the
-/// same request must not turn into a failed batch.
-fn lock_pacer(
-    pacer: &StdMutex<RecoveryChunkPacer>,
-) -> std::sync::MutexGuard<'_, RecoveryChunkPacer> {
-    pacer.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Retries one recovery statement with the batch commit retry budget.
-///
-/// A timeout halves the statement before the retry, and a statement that has
-/// already shrunk to a single identity stops retrying: repeating it cannot
-/// succeed, and holding the write path for ten more timeouts is what kept the
-/// incident's replication slot from advancing.
-async fn retry_recovery_read<AttemptFn, AttemptFut>(
-    table_name: DuckLakeTableName,
-    requested_keys: usize,
-    pacer: Arc<StdMutex<RecoveryChunkPacer>>,
-    attempt: AttemptFn,
-) -> EtlResult<PartialUpdateRecoveryChunk>
-where
-    AttemptFn: FnMut() -> AttemptFut,
-    AttemptFut: std::future::Future<Output = EtlResult<PartialUpdateRecoveryChunk>>,
-{
-    let decision_pacer = Arc::clone(&pacer);
-    retry_with_backoff(
-        RetryPolicy {
-            max_retries: MAX_COMMIT_RETRIES,
-            initial_delay: Duration::from_millis(INITIAL_RETRY_DELAY_MS),
-            max_delay: Duration::from_millis(
-                MAX_RETRY_DELAY_MS.max(TRANSIENT_DELETE_FILE_RETRY_DELAY_MS),
-            ),
-        },
-        move |error: &etl::error::EtlError| {
-            if !is_duckdb_blocking_timeout_error(error) {
-                return ducklake_retry_decision(error);
-            }
-            if lock_pacer(&decision_pacer).shrink() {
-                RetryDecision::Retry
-            } else {
-                RetryDecision::Stop
-            }
-        },
-        jitter_ducklake_retry_delay,
-        |attempt: RetryAttempt<'_, etl::error::EtlError>| {
-            counter!(
-                ETL_DUCKLAKE_RETRIES_TOTAL,
-                BATCH_KIND_LABEL => DuckLakeTableBatchKind::Mutation.as_str(),
-                RETRY_SCOPE_LABEL => "partial_update_recovery",
-            )
-            .increment(1);
-            warn!(
-                attempt = attempt.retry_index,
-                max = attempt.max_retries,
-                table = %table_name,
-                keys = requested_keys,
-                chunk_limit = lock_pacer(&pacer).limit(),
-                error = %query_log_detail(attempt.error),
-                "ducklake partial update recovery attempt failed, retrying"
-            );
-        },
-        attempt,
-    )
-    .await
-    .map_err(|failure| failure.last_error)
 }
 
 /// Applies one atomic per-table batch and retries on failure.
@@ -1270,7 +837,7 @@ fn mutation_size_hint(mutation: &TableMutation) -> usize {
 
 /// Splits one table's CDC mutations into ordered atomic batch inputs.
 ///
-/// Mutations stay in source order and use the upstream CDC mutation cap.
+/// Mutations stay in source order and use the upstream CDC row and byte caps.
 fn split_tracked_mutations(
     config: DuckLakeStreamingBatchConfig,
     tracked_mutations: Vec<TrackedTableMutation>,
@@ -1278,27 +845,20 @@ fn split_tracked_mutations(
     let mut chunks = Vec::new();
     let mut pending_mutations = Vec::new();
     let mut pending_bytes = 0usize;
-    let mut pending_recovery_keys = 0usize;
 
     for tracked_mutation in tracked_mutations {
         let mutation_bytes = mutation_size_hint(&tracked_mutation.mutation);
-        let recovery_keys = usize::from(needs_partial_update_recovery(&tracked_mutation.mutation));
         if !pending_mutations.is_empty()
-            && (pending_bytes.saturating_add(mutation_bytes) > config.max_bytes
-                || pending_recovery_keys.saturating_add(recovery_keys)
-                    > MAX_PARTIAL_UPDATE_KEYS_PER_BATCH)
+            && pending_bytes.saturating_add(mutation_bytes) > config.max_bytes
         {
             chunks.push(std::mem::take(&mut pending_mutations));
             pending_bytes = 0;
-            pending_recovery_keys = 0;
         }
         pending_bytes = pending_bytes.saturating_add(mutation_bytes);
-        pending_recovery_keys = pending_recovery_keys.saturating_add(recovery_keys);
         pending_mutations.push(tracked_mutation);
         if pending_mutations.len() >= config.max_rows {
             chunks.push(std::mem::take(&mut pending_mutations));
             pending_bytes = 0;
-            pending_recovery_keys = 0;
         }
     }
 
@@ -1307,19 +867,6 @@ fn split_tracked_mutations(
     }
 
     chunks
-}
-
-/// Returns whether one mutation may owe a recovery read.
-///
-/// The count is deliberately an upper bound: repeated identities and updates
-/// the normalizer completes in memory are counted once each, which splits a
-/// batch slightly earlier instead of planning a read the batch cannot afford.
-fn needs_partial_update_recovery(mutation: &TableMutation) -> bool {
-    matches!(
-        mutation,
-        TableMutation::Update { new_row: UpdatedTableRow::Partial(partial_row), .. }
-            if !partial_row.missing_column_indexes().is_empty()
-    )
 }
 
 /// Prepares every atomic batch of one table's CDC mutations up front.
@@ -1334,19 +881,15 @@ fn prepare_mutation_table_batches(
     table_name: DuckLakeTableName,
     replay_epoch: String,
     tracked_mutations: Vec<TrackedTableMutation>,
-    recovery: &dyn PartialUpdateRecovery,
 ) -> EtlResult<Vec<PreparedDuckLakeTableBatch>> {
     let mut prepared_batches = Vec::new();
     for chunk in split_tracked_mutations(config, tracked_mutations) {
-        let recovered =
-            recover_chunk_partial_updates(replicated_table_schema, &chunk, usize::MAX, recovery)?.1;
         push_prepared_mutation_batch(
             &mut prepared_batches,
             replicated_table_schema,
             &table_name,
             &replay_epoch,
             chunk,
-            recovered,
         )?;
     }
 
@@ -1757,7 +1300,6 @@ fn push_prepared_mutation_batch(
     table_name: &DuckLakeTableName,
     replay_epoch: &str,
     tracked_mutations: Vec<TrackedTableMutation>,
-    recovered: RecoveredPartialRows,
 ) -> EtlResult<()> {
     if tracked_mutations.is_empty() {
         return Ok(());
@@ -1782,7 +1324,6 @@ fn push_prepared_mutation_batch(
         action: PreparedDuckLakeTableBatchAction::Mutation(prepare_table_mutations(
             replicated_table_schema,
             mutations,
-            recovered,
         )?),
     });
 
@@ -1812,113 +1353,111 @@ fn flush_full_row_writes(
     }
 }
 
-/// Reads the stored columns one batch's partial updates leave out, then
-/// normalizes the batch.
+/// Partial updates that leave out the same columns, applied as one statement.
 ///
-/// Production reads through [`prepare_and_apply_mutation_table_batches`],
-/// which retries the read; this keeps the same steps reachable for tests that
-/// drive one batch against a local table.
-#[cfg(test)]
-fn recover_and_prepare_table_mutations(
-    replicated_table_schema: &ReplicatedTableSchema,
-    mutations: Vec<TableMutation>,
-    recovery: &dyn PartialUpdateRecovery,
-) -> EtlResult<Vec<PreparedTableMutation>> {
-    if !has_canonical_identity(replicated_table_schema) {
-        return prepare_ordered_table_mutations(replicated_table_schema, mutations);
-    }
-
-    let request = plan_partial_update_recovery(replicated_table_schema, &mutations, usize::MAX)?;
-    let recovered = if request.is_empty() {
-        RecoveredPartialRows::empty()
-    } else {
-        recovery.recover(&request)?.recovered
-    };
-
-    prepare_table_mutations(replicated_table_schema, mutations, recovered)
+/// Each staged row holds the identity and every value its event carried, with
+/// `NULL` in the columns the event left out. Those columns are never assigned,
+/// so their stored values stay in the lake and never pass through this process.
+struct SetUpdateGroup {
+    /// Column indexes every event of this group left out.
+    missing: Vec<usize>,
+    /// One staged row per identity, in first-seen order.
+    rows: Vec<TableRow>,
+    /// Key-set components of each staged row, for the range bounds.
+    keys: Vec<Vec<KeyComponent>>,
+    /// Staged row of each identity; a repeated identity keeps its last values.
+    positions: HashMap<String, usize>,
 }
 
-/// Plans and performs one chunk's recovery read.
-///
-/// Returns how many leading mutations of the chunk the recovery covers, which
-/// is fewer than the whole chunk only when the read stopped at its byte
-/// budget, and the rows it read back. This is the synchronous counterpart of
-/// the steps [`prepare_and_apply_mutation_table_batches`] performs around its
-/// retried read.
-#[cfg(test)]
-fn recover_chunk_partial_updates(
-    replicated_table_schema: &ReplicatedTableSchema,
-    chunk: &[TrackedTableMutation],
-    max_recovered_bytes: usize,
-    recovery: &dyn PartialUpdateRecovery,
-) -> EtlResult<(usize, RecoveredPartialRows)> {
-    if !has_canonical_identity(replicated_table_schema) {
-        return Ok((chunk.len(), RecoveredPartialRows::empty()));
-    }
-
-    let request = plan_partial_update_recovery(
-        replicated_table_schema,
-        chunk.iter().map(|tracked| &tracked.mutation),
-        max_recovered_bytes,
-    )?;
-    if request.is_empty() {
-        return Ok((chunk.len(), RecoveredPartialRows::empty()));
-    }
-
-    let outcome = recovery.recover(&request)?;
-
-    Ok((covered_mutation_count(chunk.len(), &request, outcome.covered_keys), outcome.recovered))
-}
-
-/// Plans the single read that completes the batch's coalescable partial
-/// updates.
-///
-/// The plan tracks identities the way [`prepare_table_mutations`] does, minus
-/// the flush that the ordered partial-update path performs. It therefore
-/// requests a superset of the identities the normalizer can use: a requested
-/// identity the normalizer ends up not needing costs one extra key in the
-/// read, while an identity the normalizer needs is always requested.
-fn plan_partial_update_recovery<'a>(
-    replicated_table_schema: &ReplicatedTableSchema,
-    mutations: impl IntoIterator<Item = &'a TableMutation>,
-    max_recovered_bytes: usize,
-) -> EtlResult<PartialUpdateRecoveryRequest> {
-    let mut keys = Vec::new();
-    let mut columns = BTreeSet::new();
-    let mut deleted = HashSet::new();
-    for (mutation_index, mutation) in mutations.into_iter().enumerate() {
-        match mutation {
-            TableMutation::Insert(_) => {}
-            TableMutation::Delete(row) => {
-                deleted.insert(delete_predicate_from_row(replicated_table_schema, row)?);
-            }
-            TableMutation::Replace(row) => {
-                deleted.insert(delete_predicate_from_row(replicated_table_schema, row)?);
-            }
-            TableMutation::Update { delete_row, new_row } => {
-                let predicate = delete_predicate_from_row(replicated_table_schema, delete_row)?;
-                let is_new_identity = deleted.insert(predicate.clone());
-                let UpdatedTableRow::Partial(partial_row) = new_row else {
-                    continue;
-                };
-                // A partial row with nothing missing needs no stored value,
-                // and a repeated identity is completed in memory from the
-                // first read.
-                if !is_new_identity || partial_row.missing_column_indexes().is_empty() {
-                    continue;
-                }
-
-                columns.extend(partial_row.missing_column_indexes().iter().copied());
-                keys.push(PartialUpdateRecoveryKey {
-                    predicate,
-                    components: delete_key_components(replicated_table_schema, delete_row)?,
-                    mutation_index,
-                });
-            }
+impl SetUpdateGroup {
+    /// Stages one partial update, replacing an earlier one at the same
+    /// identity.
+    fn push(&mut self, predicate: String, key: Vec<KeyComponent>, row: TableRow) {
+        if let Some(index) = self.positions.get(&predicate) {
+            self.rows[*index] = row;
+            return;
         }
+        self.positions.insert(predicate, self.rows.len());
+        self.rows.push(row);
+        self.keys.push(key);
     }
 
-    Ok(PartialUpdateRecoveryRequest::new(keys, columns, max_recovered_bytes))
+    /// Builds the set update, or nothing when no stored column changes.
+    fn into_prepared(self, schema: &ReplicatedTableSchema) -> Option<PreparedTableMutation> {
+        let identity: HashSet<_> =
+            schema.identity_column_schemas().map(|column| column.ordinal_position).collect();
+        let assignments: Vec<String> = schema
+            .column_schemas()
+            .enumerate()
+            .filter(|(index, column)| {
+                !self.missing.contains(index) && !identity.contains(&column.ordinal_position)
+            })
+            .map(|(_, column)| {
+                let column = quote_identifier(&DUCKLAKE_COLUMN_NAME_MAPPING.map_name(&column.name));
+                format!("{column} = cdc_staged.{column}")
+            })
+            .collect();
+        if assignments.is_empty() {
+            return None;
+        }
+        let mut key_set = DeleteKeySet::new(schema);
+        for key in &self.keys {
+            key_set.push(key);
+        }
+
+        Some(PreparedTableMutation::SetUpdate {
+            predicate: key_set.take_staged_predicate()?,
+            assignments,
+            rows: prepare_rows(self.rows),
+        })
+    }
+}
+
+/// Appends every pending set update, in the order the groups were opened.
+fn flush_set_updates(
+    schema: &ReplicatedTableSchema,
+    prepared: &mut Vec<PreparedTableMutation>,
+    groups: &mut Vec<SetUpdateGroup>,
+) {
+    prepared.extend(groups.drain(..).filter_map(|group| group.into_prepared(schema)));
+}
+
+/// Expands a partial row to the full column width, `NULL` where it is missing.
+fn staged_partial_row(
+    schema: &ReplicatedTableSchema,
+    partial_row: &PartialTableRow,
+) -> EtlResult<TableRow> {
+    let column_count = schema.column_schemas().count();
+    let missing = partial_row.missing_column_indexes();
+    if partial_row.total_columns() != column_count
+        || partial_row.values().len() + missing.len() != column_count
+        || missing.iter().any(|column| *column >= column_count)
+    {
+        return Err(etl_error!(
+            ErrorKind::InvalidState,
+            "DuckLake partial update row does not match schema",
+            format!(
+                "Table '{}' has {column_count} replicated columns, the partial row reports {} \
+                 with {} present and {} missing",
+                schema.name(),
+                partial_row.total_columns(),
+                partial_row.values().len(),
+                missing.len()
+            )
+        ));
+    }
+    let mut present = partial_row.values().iter();
+
+    Ok(TableRow::new(
+        (0..column_count)
+            .map(|column| match missing.contains(&column) {
+                true => Cell::Null,
+                false => {
+                    present.next().expect("validated partial row has each present column").clone()
+                }
+            })
+            .collect(),
+    ))
 }
 
 /// Returns whether predicate equality is a complete identity comparison.
@@ -1977,70 +1516,29 @@ fn patch_pending_rows(
     Ok(())
 }
 
-/// Completes a partial row from the stored values of one recovered row.
-fn complete_partial_row(
-    replicated_table_schema: &ReplicatedTableSchema,
-    partial_row: &PartialTableRow,
-    recovered_columns: &[usize],
-    recovered_values: &[Cell],
-) -> EtlResult<TableRow> {
-    let mut present = partial_row.values().iter();
-    let mut values = Vec::with_capacity(partial_row.total_columns());
-    for column in 0..partial_row.total_columns() {
-        if !partial_row.missing_column_indexes().contains(&column) {
-            let Some(value) = present.next() else {
-                return Err(etl_error!(
-                    ErrorKind::InvalidState,
-                    "DuckLake partial update row ended early",
-                    format!(
-                        "Table '{}' did not provide enough values for its partial update row",
-                        replicated_table_schema.name()
-                    )
-                ));
-            };
-            values.push(value.clone());
-            continue;
-        }
-
-        let Some(value) = recovered_columns
-            .binary_search(&column)
-            .ok()
-            .and_then(|index| recovered_values.get(index))
-        else {
-            return Err(etl_error!(
-                ErrorKind::InvalidState,
-                "DuckLake partial update recovery is missing a column",
-                format!(
-                    "Table '{}' did not read back replicated column {column}",
-                    replicated_table_schema.name()
-                )
-            ));
-        };
-        values.push(value.clone());
-    }
-
-    Ok(TableRow::new(values))
-}
-
-/// Normalizes full-row CDC operations inside an existing atomic batch.
+/// Normalizes CDC operations inside an existing atomic batch.
 ///
-/// The invariant is: applying the pending deletes to the original table and
-/// then appending pending rows equals executing the consumed events in order.
-/// Deleting an identity removes both original rows and earlier pending rows;
-/// inserting only appends. A key-changing full update deletes its OLD identity
-/// and appends the NEW row without deleting existing rows at the new identity.
-/// A partial update whose identity is already deleted folds the pending rows
-/// it patches. Otherwise it is completed from the values `recovered` read back
-/// for its identity and joins the same key set and insert run as a full row.
-/// An identity with no recovered row keeps the pre-coalescing ordered
-/// `UPDATE`, which is the only form that can still patch rows staged earlier
-/// in this batch; that statement flushes the run, so every remaining recovered
-/// value is dropped as stale and later partial updates keep the ordered form
-/// too.
+/// The invariant is: applying the pending set updates, then the pending
+/// deletes, to the original table and then appending pending rows equals
+/// executing the consumed events in order. Deleting an identity removes both
+/// original rows and earlier pending rows; inserting only appends. A
+/// key-changing full update deletes its OLD identity and appends the NEW row
+/// without deleting existing rows at the new identity.
+///
+/// A partial update patches the pending rows at its identity in memory. If the
+/// identity is already deleted, those are the only rows left. Otherwise the
+/// stored rows are completed in the lake: the update joins the set update of
+/// every partial update that leaves out the same columns, which runs before
+/// the run's deletes and inserts. That order is safe because a set update only
+/// touches its own identities, and the run touched none of them before the
+/// partial update arrived; whatever the run does to them afterwards runs
+/// after the set update, as it did in the source. An identity that moves to a
+/// set update of other columns flushes the group holding it, so two set
+/// updates of one identity keep their order. A partial update that changes
+/// its identity keeps the ordered `UPDATE` and flushes everything before it.
 fn prepare_table_mutations(
     schema: &ReplicatedTableSchema,
     mutations: Vec<TableMutation>,
-    mut recovered: RecoveredPartialRows,
 ) -> EtlResult<Vec<PreparedTableMutation>> {
     if !has_canonical_identity(schema) {
         return prepare_ordered_table_mutations(schema, mutations);
@@ -2053,6 +1551,7 @@ fn prepare_table_mutations(
     let mut key_set = DeleteKeySet::new(schema);
     let mut deleted = HashSet::new();
     let mut positions: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut groups: Vec<SetUpdateGroup> = Vec::new();
     for mutation in mutations {
         let (delete, insert) = match mutation {
             TableMutation::Insert(row) => (None, Some(row)),
@@ -2089,65 +1588,42 @@ fn prepare_table_mutations(
                     patch_pending_rows(schema, &mut rows, &mut positions, &predicate, &row)?;
                     continue;
                 }
-                let has_pending_row = positions
-                    .get(&predicate)
-                    .is_some_and(|indexes| indexes.iter().any(|index| rows[*index].is_some()));
-                let stored_row_count = recovered.rows_for(&predicate).map(<[TableRow]>::len);
-                if has_pending_row && stored_row_count == Some(0) {
-                    // The read covered this identity and storage holds no row
-                    // for it, so every row the statement would touch was
-                    // staged earlier in this batch: patch those in memory
-                    // rather than order a statement for them. This is the
-                    // insert-then-update shape, which would otherwise pay one
-                    // ordered statement per event.
-                    patch_pending_rows(schema, &mut rows, &mut positions, &predicate, &row)?;
+                let staged = staged_partial_row(schema, &row)?;
+                if delete_predicate_from_row(schema, &staged)? != predicate {
+                    let assignments = update_assignments_from_partial_row(schema, &row)?;
+                    flush_set_updates(schema, &mut prepared, &mut groups);
+                    flush_full_row_writes(
+                        &mut prepared,
+                        &mut predicates,
+                        &mut rows,
+                        &mut key_set,
+                        &mut origin,
+                    );
+                    positions.clear();
+                    deleted.clear();
+                    prepared.push(PreparedTableMutation::Update { assignments, predicate });
                     continue;
                 }
-                if let Some(stored_rows) =
-                    recovered.rows_for(&predicate).filter(|stored| !stored.is_empty())
-                {
-                    // Rows staged earlier in this batch are patched in place,
-                    // and each stored row is re-inserted completed, so the key
-                    // set removes only what storage still holds.
-                    let completed = stored_rows
-                        .iter()
-                        .map(|stored| {
-                            complete_partial_row(schema, &row, recovered.columns(), stored.values())
-                        })
-                        .collect::<EtlResult<Vec<_>>>()?;
-                    patch_pending_rows(schema, &mut rows, &mut positions, &predicate, &row)?;
-                    deleted.insert(predicate.clone());
-                    predicates.push(predicate);
-                    key_set.push(&delete_key_components(schema, &delete_row)?);
-                    origin = Some(match origin {
-                        None => "update",
-                        Some("update") => "update",
-                        Some(_) => "mixed",
-                    });
-                    for completed_row in completed {
-                        positions
-                            .entry(delete_predicate_from_row(schema, &completed_row)?)
-                            .or_default()
-                            .push(rows.len());
-                        rows.push(Some(completed_row));
+                patch_pending_rows(schema, &mut rows, &mut positions, &predicate, &row)?;
+                let missing = row.missing_column_indexes();
+                if let Some(index) = groups.iter().position(|group| {
+                    group.missing != missing && group.positions.contains_key(&predicate)
+                }) {
+                    prepared.extend(groups.remove(index).into_prepared(schema));
+                }
+                let index = match groups.iter().position(|group| group.missing == missing) {
+                    Some(index) => index,
+                    None => {
+                        groups.push(SetUpdateGroup {
+                            missing: missing.to_vec(),
+                            rows: Vec::new(),
+                            keys: Vec::new(),
+                            positions: HashMap::new(),
+                        });
+                        groups.len() - 1
                     }
-                    continue;
-                }
-
-                let assignments = update_assignments_from_partial_row(schema, &row)?;
-                flush_full_row_writes(
-                    &mut prepared,
-                    &mut predicates,
-                    &mut rows,
-                    &mut key_set,
-                    &mut origin,
-                );
-                positions.clear();
-                deleted.clear();
-                // The flushed statements change the stored rows this batch
-                // read back, so no recovered value survives the barrier.
-                recovered.clear();
-                prepared.push(PreparedTableMutation::Update { assignments, predicate });
+                };
+                groups[index].push(predicate, delete_key_components(schema, &delete_row)?, staged);
                 continue;
             }
         };
@@ -2172,6 +1648,7 @@ fn prepare_table_mutations(
             rows.push(Some(row));
         }
     }
+    flush_set_updates(schema, &mut prepared, &mut groups);
     flush_full_row_writes(&mut prepared, &mut predicates, &mut rows, &mut key_set, &mut origin);
     Ok(prepared)
 }
@@ -2376,6 +1853,23 @@ fn delete_key_components<'a>(
         .into_iter()
         .map(|(_, cell)| KeyComponent::from_cell(cell, cell_to_sql_literal_ref(cell)))
         .collect())
+}
+
+/// Builds the identity predicate shared by deletes and in-memory row tracking.
+fn identity_predicate<'a>(
+    key_values: impl IntoIterator<Item = (&'a etl::schema::ColumnSchema, &'a Cell)>,
+) -> String {
+    let mut predicates = Vec::new();
+    for (column_schema, value) in key_values {
+        let quoted_column =
+            quote_identifier(&DUCKLAKE_COLUMN_NAME_MAPPING.map_name(&column_schema.name));
+        predicates.push(match value {
+            Cell::Null => format!("{quoted_column} IS NULL"),
+            _ => format!("{quoted_column} = {}", cell_to_sql_literal_ref(value)),
+        });
+    }
+
+    predicates.join(" AND ")
 }
 
 /// Builds a predicate with PostgreSQL identity NULL semantics.
@@ -2800,6 +2294,43 @@ impl ReusableStagingTable {
         self.insert_staged_rows(conn)
     }
 
+    /// Loads one set update's staged rows and applies it to the target table.
+    ///
+    /// The values the partial updates left out are carried over by DuckDB from
+    /// the stored row versions, so nothing is read back into this process.
+    fn stage_and_update(
+        &mut self,
+        conn: &duckdb::Connection,
+        prepared_rows: &PreparedRows,
+        assignments: &[String],
+        predicate: &str,
+    ) -> EtlResult<()> {
+        let started = Instant::now();
+        self.prepare(conn)?;
+        self.load_rows(conn, prepared_rows)?;
+        let sql = format!(
+            "UPDATE {} AS cdc_target SET {} FROM {} AS cdc_staged WHERE {predicate};",
+            qualified_lake_table_name(&self.table_name),
+            assignments.join(", "),
+            quote_identifier(&self.staging_name),
+        );
+        conn.execute_batch(&sql).map_err(|source| {
+            etl_error!(
+                ErrorKind::DestinationQueryFailed,
+                "DuckLake set update failed",
+                source: DuckDbSensitiveQueryError { error: source, sql }
+            )
+        })?;
+        info!(
+            table = %self.table_name,
+            keys = prepared_rows_count(prepared_rows),
+            columns = assignments.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "ducklake partial update applied in lake"
+        );
+        Ok(())
+    }
+
     /// Drops the temp staging table after the batch finishes.
     fn cleanup(&self, conn: &duckdb::Connection) {
         if !self.created {
@@ -3176,11 +2707,13 @@ fn apply_table_batch(
                         PreparedTableMutation::Upsert(_) => "insert",
                         PreparedTableMutation::Delete { .. } => "delete",
                         PreparedTableMutation::Update { .. } => "update",
+                        PreparedTableMutation::SetUpdate { .. } => "set_update",
                     };
                     let operation_rows = match prepared_mutation {
                         PreparedTableMutation::Upsert(rows) => prepared_rows_count(rows),
                         PreparedTableMutation::Delete { predicates, .. } => predicates.len(),
                         PreparedTableMutation::Update { .. } => 1,
+                        PreparedTableMutation::SetUpdate { rows, .. } => prepared_rows_count(rows),
                     };
                     let operation_span = tracing::info_span!(
                         "ducklake_batch_operation",
@@ -3363,6 +2896,9 @@ fn apply_table_mutation(
             assignments.as_slice(),
             predicate,
         ),
+        PreparedTableMutation::SetUpdate { rows, assignments, predicate } => {
+            reusable_staging_table.stage_and_update(conn, rows, assignments, predicate)
+        }
     }
 }
 
@@ -3508,7 +3044,9 @@ fn apply_sub_batch_rows(batch: &PreparedDuckLakeTableBatch) -> Option<usize> {
 
     match &prepared_mutations[0] {
         PreparedTableMutation::Upsert(prepared_rows) => Some(prepared_rows_count(prepared_rows)),
-        PreparedTableMutation::Delete { .. } | PreparedTableMutation::Update { .. } => None,
+        PreparedTableMutation::Delete { .. }
+        | PreparedTableMutation::Update { .. }
+        | PreparedTableMutation::SetUpdate { .. } => None,
     }
 }
 
@@ -3525,6 +3063,7 @@ fn batch_log_kind(batch: &PreparedDuckLakeTableBatch) -> &'static str {
                     PreparedTableMutation::Upsert(_),
                 ] => origin,
                 [PreparedTableMutation::Update { .. }] => "update",
+                [PreparedTableMutation::SetUpdate { .. }] => "set_update",
                 _ => "mutation",
             }
         }
@@ -3585,8 +3124,6 @@ pub fn reset_ducklake_test_hooks() {
     *FAIL_AFTER_ATOMIC_BATCH_COMMIT_TABLE.lock() = None;
     *FAIL_AFTER_COPY_BATCH_COMMIT_TABLE.lock() = None;
     STAGING_TABLE_CREATIONS_BY_TABLE.lock().clear();
-    SLOW_RECOVERY_STATEMENT_MS.store(u64::MAX, Ordering::Relaxed);
-    crate::ducklake::partial_update::reset_partial_update_recovery_timeout_for_tests();
 }
 
 /// Returns the number of staging-table creations performed for one table since
@@ -3659,10 +3196,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::ducklake::{
-        client::duckdb_blocking_timeout_error, partial_update::AbsentStoredRows,
-        streaming_progress::SHARED_STREAMING_PROGRESS_TABLE,
-    };
+    use crate::ducklake::streaming_progress::SHARED_STREAMING_PROGRESS_TABLE;
 
     #[test]
     fn sequence_key_format_preserves_fixed_width_hex_encoding() {
@@ -3955,7 +3489,6 @@ mod tests {
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
             replacement_backlog(20),
-            &AbsentStoredRows,
         )
         .unwrap();
         let context = DuckLakeBlockingOperationContext::for_tests();
@@ -4213,7 +3746,6 @@ mod tests {
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
             replacement_backlog(20),
-            &AbsentStoredRows,
         )
         .unwrap();
         let context = DuckLakeBlockingOperationContext::for_tests();
@@ -4236,7 +3768,6 @@ mod tests {
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
             replacement_backlog(20),
-            &AbsentStoredRows,
         )
         .unwrap()
         .remove(1);
@@ -4340,8 +3871,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let prepared =
-                prepare_table_mutations(&schema, mutations, RecoveredPartialRows::empty()).unwrap();
+            let prepared = prepare_table_mutations(&schema, mutations).unwrap();
             assert_eq!(prepared.len(), 2);
             let PreparedTableMutation::Delete { predicates, .. } = &prepared[0] else {
                 panic!("expected delete");
@@ -4364,8 +3894,7 @@ mod tests {
             mutations.push(TableMutation::Insert(row("started")));
             mutations.push(TableMutation::Replace(row("completed")));
         }
-        let prepared =
-            prepare_table_mutations(&schema, mutations, RecoveredPartialRows::empty()).unwrap();
+        let prepared = prepare_table_mutations(&schema, mutations).unwrap();
         let deletes = prepared
             .iter()
             .filter(|operation| matches!(operation, PreparedTableMutation::Delete { .. }))
@@ -4388,8 +3917,7 @@ mod tests {
             TableMutation::Replace(row(3)),
             TableMutation::Insert(row(4)),
         ];
-        let prepared =
-            prepare_table_mutations(&schema, mutations, RecoveredPartialRows::empty()).unwrap();
+        let prepared = prepare_table_mutations(&schema, mutations).unwrap();
         assert_eq!(prepared.len(), 2);
         let PreparedTableMutation::Delete { predicates, .. } = &prepared[0] else {
             panic!("expected delete");
@@ -4452,9 +3980,8 @@ mod tests {
         )
         .unwrap();
         let mutations = kinds.iter().enumerate().map(|(i, kind)| rewrite_case(*kind, i));
-        // Grouped preparation is interleaved with application, exactly like
-        // `prepare_and_apply_mutation_table_batches` does, so every batch
-        // completes its partial updates from the rows the previous batch left.
+        // Grouped batches are applied in order, exactly like
+        // `prepare_and_apply_mutation_table_batches` does.
         let mutation_groups: Vec<Vec<TableMutation>> = if grouped {
             split_tracked_mutations(
                 DuckLakeStreamingBatchConfig::default(),
@@ -4474,18 +4001,12 @@ mod tests {
         } else {
             mutations.map(|mutation| vec![mutation]).collect()
         };
-        let table_name = ducklake_table_name();
-        let batch = make_prepared_batch(table_name.clone());
+        let batch = make_prepared_batch(ducklake_table_name());
         let mut staging =
             ReusableStagingTable::new(&batch.table_name, replicated_column_names(schema));
         for group in mutation_groups {
             let operations = if grouped {
-                recover_and_prepare_table_mutations(
-                    schema,
-                    group,
-                    &StoredRowRecovery::new(conn, &table_name, schema),
-                )
-                .unwrap()
+                prepare_table_mutations(schema, group).unwrap()
             } else {
                 prepare_ordered_table_mutations(schema, group).unwrap()
             };
@@ -4574,9 +4095,7 @@ mod tests {
                 Cell::String("new".to_owned()),
             ]))
         });
-        let prepared =
-            prepare_table_mutations(&schema, mutations.into(), RecoveredPartialRows::empty())
-                .unwrap();
+        let prepared = prepare_table_mutations(&schema, mutations.into()).unwrap();
         assert_eq!(prepared.len(), 2);
         let PreparedTableMutation::Delete { predicates, .. } = &prepared[0] else {
             panic!("expected delete")
@@ -4660,8 +4179,7 @@ mod tests {
                     TableMutation::Replace(row(2, 1, "final")),
                 ];
                 let operations = if grouped {
-                    prepare_table_mutations(&schema, mutations, RecoveredPartialRows::empty())
-                        .unwrap()
+                    prepare_table_mutations(&schema, mutations).unwrap()
                 } else {
                     prepare_ordered_table_mutations(&schema, mutations).unwrap()
                 };
@@ -4718,7 +4236,6 @@ mod tests {
                         Cell::String("row".to_owned()),
                     ])),
                 )],
-                &AbsentStoredRows,
             )
             .unwrap()
             .remove(0)
@@ -4776,12 +4293,7 @@ mod tests {
                 Cell::String("new".to_owned()),
             ]))
         });
-        assert_eq!(
-            prepare_table_mutations(&schema, mutations.into(), RecoveredPartialRows::empty())
-                .unwrap()
-                .len(),
-            4
-        );
+        assert_eq!(prepare_table_mutations(&schema, mutations.into()).unwrap().len(), 4);
     }
 
     #[test]
@@ -4789,12 +4301,9 @@ mod tests {
         let replicated_table_schema = make_replicated_schema();
         let row = TableRow::new(vec![Cell::I32(1), Cell::String("alice".to_owned())]);
 
-        let prepared = prepare_table_mutations(
-            &replicated_table_schema,
-            vec![TableMutation::Replace(row)],
-            RecoveredPartialRows::empty(),
-        )
-        .unwrap();
+        let prepared =
+            prepare_table_mutations(&replicated_table_schema, vec![TableMutation::Replace(row)])
+                .unwrap();
 
         assert_eq!(prepared.len(), 2);
         match &prepared[0] {
@@ -4802,7 +4311,7 @@ mod tests {
                 assert_eq!(predicates, &vec!["\"id\" = 1".to_owned()]);
                 assert_eq!(origin, &"replace");
             }
-            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
+            _ => {
                 panic!("expected delete first")
             }
         }
@@ -4816,14 +4325,14 @@ mod tests {
             PreparedTableMutation::Upsert(PreparedRows::ArrowRecordBatch(_)) => {
                 panic!("expected appender payload")
             }
-            PreparedTableMutation::Delete { .. } | PreparedTableMutation::Update { .. } => {
+            _ => {
                 panic!("expected upsert second")
             }
         }
     }
 
     #[test]
-    fn prepare_table_mutations_update_emits_update_statement() {
+    fn prepare_table_mutations_key_changing_partial_update_emits_update_statement() {
         let replicated_table_schema = make_replicated_schema();
         let prepared = prepare_table_mutations(
             &replicated_table_schema,
@@ -4831,11 +4340,10 @@ mod tests {
                 delete_row: OldTableRow::Key(TableRow::new(vec![Cell::I32(1)])),
                 new_row: UpdatedTableRow::Partial(PartialTableRow::new(
                     2,
-                    TableRow::new(vec![Cell::I32(1), Cell::String("after".to_owned())]),
+                    TableRow::new(vec![Cell::I32(2), Cell::String("after".to_owned())]),
                     vec![],
                 )),
             }],
-            RecoveredPartialRows::empty(),
         )
         .unwrap();
 
@@ -4844,11 +4352,11 @@ mod tests {
             PreparedTableMutation::Update { assignments, predicate } => {
                 assert_eq!(
                     assignments,
-                    &vec!["\"id\" = 1".to_owned(), "\"name\" = 'after'".to_owned()]
+                    &vec!["\"id\" = 2".to_owned(), "\"name\" = 'after'".to_owned()]
                 );
                 assert_eq!(predicate, "\"id\" = 1");
             }
-            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Delete { .. } => {
+            _ => {
                 panic!("expected update")
             }
         }
@@ -4888,7 +4396,6 @@ mod tests {
                     vec![3],
                 )),
             }],
-            RecoveredPartialRows::empty(),
         )
         .unwrap();
 
@@ -4905,7 +4412,7 @@ mod tests {
                 );
                 assert_eq!(predicate, "\"email\" = 'alice@example.com'");
             }
-            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Delete { .. } => {
+            _ => {
                 panic!("expected update")
             }
         }
@@ -4948,7 +4455,6 @@ mod tests {
                     vec![3],
                 )),
             }],
-            RecoveredPartialRows::empty(),
         )
         .unwrap();
 
@@ -4969,7 +4475,7 @@ mod tests {
                      \"payload\" = 'toast'"
                 );
             }
-            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Delete { .. } => {
+            _ => {
                 panic!("expected update")
             }
         }
@@ -4999,7 +4505,6 @@ mod tests {
                     ])),
                 ),
             ],
-            &AbsentStoredRows,
         )
         .unwrap();
 
@@ -5018,7 +4523,7 @@ mod tests {
                     PreparedTableMutation::Upsert(PreparedRows::ArrowRecordBatch(_)) => {
                         panic!("expected appender payload")
                     }
-                    PreparedTableMutation::Delete { .. } | PreparedTableMutation::Update { .. } => {
+                    _ => {
                         panic!("expected upsert")
                     }
                 }
@@ -5058,7 +4563,6 @@ mod tests {
                     ])),
                 ),
             ],
-            &AbsentStoredRows,
         )
         .unwrap();
 
@@ -5101,7 +4605,6 @@ mod tests {
                     ]))),
                 ),
             ],
-            &AbsentStoredRows,
         )
         .unwrap();
 
@@ -5117,7 +4620,7 @@ mod tests {
                             &vec!["\"id\" = 1".to_owned(), "\"id\" = 2".to_owned()]
                         );
                     }
-                    PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
+                    _ => {
                         panic!("expected delete batch")
                     }
                 }
@@ -5162,7 +4665,6 @@ mod tests {
                     },
                 ),
             ],
-            &AbsentStoredRows,
         )
         .unwrap();
 
@@ -5201,7 +4703,6 @@ mod tests {
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
             tracked,
-            &AbsentStoredRows,
         )
         .unwrap();
 
@@ -5212,7 +4713,7 @@ mod tests {
                 PreparedTableMutation::Delete { predicates, .. } => {
                     assert_eq!(predicates.len(), batch_size);
                 }
-                PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
+                _ => {
                     panic!("expected delete batch")
                 }
             },
@@ -5224,7 +4725,7 @@ mod tests {
                 PreparedTableMutation::Delete { predicates, .. } => {
                     assert_eq!(predicates.len(), 1);
                 }
-                PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
+                _ => {
                     panic!("expected delete batch")
                 }
             },
@@ -5269,7 +4770,6 @@ mod tests {
                     ])),
                 ),
             ],
-            &AbsentStoredRows,
         )
         .unwrap();
 
@@ -5541,8 +5041,7 @@ mod tests {
                         PreparedDuckLakeTableBatchAction::Mutation(if mode == "ordered" {
                             prepare_ordered_table_mutations(&schema, chunk).unwrap()
                         } else {
-                            prepare_table_mutations(&schema, chunk, RecoveredPartialRows::empty())
-                                .unwrap()
+                            prepare_table_mutations(&schema, chunk).unwrap()
                         });
                     batches.push(batch);
                 }
@@ -5609,7 +5108,6 @@ mod tests {
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
             make(),
-            &AbsentStoredRows,
         )
         .unwrap();
         assert_eq!(batches.len(), 40);
@@ -5623,7 +5121,6 @@ mod tests {
             ducklake_table_name(),
             LEGACY_REPLAY_EPOCH.to_owned(),
             pending,
-            &AbsentStoredRows,
         )
         .unwrap();
         assert_eq!(batches.len(), 1);
@@ -5666,7 +5163,7 @@ mod tests {
             data = lake_dir.path().join("data").display(),
         ))
         .unwrap();
-        // Each row is committed on its own, so the recovery read has to span
+        // Each row is committed on its own, so a set update has to span
         // several data files just like a long-lived CDC table does.
         for (id, name, payload) in rows {
             conn.execute_batch(&format!(
@@ -5707,44 +5204,52 @@ mod tests {
             .unwrap()
     }
 
-    /// Fails the test if the normalizer reads stored rows.
-    struct UnexpectedRecovery;
-
-    impl PartialUpdateRecovery for UnexpectedRecovery {
-        fn recover(
-            &self,
-            _request: &PartialUpdateRecoveryRequest,
-        ) -> EtlResult<PartialUpdateRecoveryOutcome> {
-            panic!("the batch must not read stored rows")
+    /// Builds the partial update emitted when the small column is unchanged.
+    fn toast_payload_update(id: i32, payload: &str) -> TableMutation {
+        TableMutation::Update {
+            delete_row: OldTableRow::Key(TableRow::new(vec![Cell::I32(id)])),
+            new_row: UpdatedTableRow::Partial(PartialTableRow::new(
+                3,
+                TableRow::new(vec![Cell::I32(id), Cell::String(payload.to_owned())]),
+                vec![1],
+            )),
         }
     }
 
+    /// Counts the set updates among prepared operations.
+    fn set_update_count(operations: &[PreparedTableMutation]) -> usize {
+        operations
+            .iter()
+            .filter(|operation| matches!(operation, PreparedTableMutation::SetUpdate { .. }))
+            .count()
+    }
+
     #[test]
-    fn partial_updates_of_distinct_keys_use_one_delete_and_one_insert() {
+    fn partial_updates_of_distinct_keys_run_as_one_set_update_in_the_lake() {
         let schema = toast_replicated_schema();
         let seed: Vec<(i32, &str, &str)> = (0..8).map(|id| (id, "before", "toasted")).collect();
         let (_lake_dir, conn) = seeded_toast_lake(&seed);
-        let table_name = ducklake_table_name();
 
-        let prepared = recover_and_prepare_table_mutations(
+        // Key 20 has no stored row: the set update matches nothing for it and
+        // must not turn it into an insert.
+        let prepared = prepare_table_mutations(
             &schema,
-            (0..8).map(|id| toast_partial_update(id, "after")).collect(),
-            &StoredRowRecovery::new(&conn, &table_name, &schema),
+            (0..8).chain([20]).map(|id| toast_partial_update(id, "after")).collect(),
         )
         .unwrap();
 
-        // One key-set delete plus one staged insert, whatever the event count.
-        assert_eq!(prepared.len(), 2);
-        let PreparedTableMutation::Delete { predicates, key_set, origin } = &prepared[0] else {
-            panic!("expected delete");
+        assert_eq!(prepared.len(), 1);
+        let PreparedTableMutation::SetUpdate { rows, assignments, predicate } = &prepared[0] else {
+            panic!("expected one set update");
         };
-        assert_eq!(predicates.len(), 8);
-        assert_eq!(origin, &"update");
-        assert!(key_set.is_some());
-        let PreparedTableMutation::Upsert(rows) = &prepared[1] else { panic!("expected insert") };
-        assert_eq!(prepared_rows_count(rows), 8);
-
-        // The omitted column keeps its stored value in every completed row.
+        assert_eq!(prepared_rows_count(rows), 9);
+        assert_eq!(assignments, &["\"name\" = cdc_staged.\"name\"".to_owned()]);
+        assert_eq!(
+            predicate,
+            "cdc_target.\"id\" IS NOT DISTINCT FROM cdc_staged.\"id\" AND cdc_target.\"id\" >= 0 \
+             AND cdc_target.\"id\" <= 20"
+        );
+        // The omitted column keeps its stored value in every updated row.
         assert_eq!(
             apply_and_read_toast_lake(&conn, &schema, &prepared),
             (0..8).map(|id| (id, "after".to_owned(), "toasted".to_owned())).collect::<Vec<_>>()
@@ -5752,27 +5257,25 @@ mod tests {
     }
 
     #[test]
-    fn repeated_partial_updates_of_one_key_apply_in_event_order() {
+    fn repeated_partial_updates_of_one_key_keep_the_last_values() {
         let schema = toast_replicated_schema();
         let (_lake_dir, conn) = seeded_toast_lake(&[(1, "before", "toasted")]);
-        let table_name = ducklake_table_name();
 
-        let prepared = recover_and_prepare_table_mutations(
+        let prepared = prepare_table_mutations(
             &schema,
             vec![
                 toast_partial_update(1, "first"),
                 toast_partial_update(1, "second"),
                 toast_partial_update(1, "third"),
             ],
-            &StoredRowRecovery::new(&conn, &table_name, &schema),
         )
         .unwrap();
 
-        assert_eq!(prepared.len(), 2);
-        let PreparedTableMutation::Delete { predicates, .. } = &prepared[0] else {
-            panic!("expected delete");
+        assert_eq!(prepared.len(), 1);
+        let PreparedTableMutation::SetUpdate { rows, .. } = &prepared[0] else {
+            panic!("expected one set update");
         };
-        assert_eq!(predicates.len(), 1);
+        assert_eq!(prepared_rows_count(rows), 1);
         assert_eq!(
             apply_and_read_toast_lake(&conn, &schema, &prepared),
             vec![(1, "third".to_owned(), "toasted".to_owned())]
@@ -5780,7 +5283,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_update_of_a_rewritten_key_folds_in_memory_without_reading() {
+    fn partial_update_of_a_rewritten_key_folds_in_memory() {
         let schema = toast_replicated_schema();
         let row = TableRow::new(vec![
             Cell::I32(1),
@@ -5788,21 +5291,20 @@ mod tests {
             Cell::String("fresh".to_owned()),
         ]);
 
-        let prepared = recover_and_prepare_table_mutations(
+        let prepared = prepare_table_mutations(
             &schema,
             vec![
                 TableMutation::Delete(OldTableRow::Key(TableRow::new(vec![Cell::I32(1)]))),
                 TableMutation::Insert(row),
                 toast_partial_update(1, "patched"),
             ],
-            &UnexpectedRecovery,
         )
         .unwrap();
 
+        // Every row left at a deleted identity is in memory, so the lake is
+        // not asked to update anything.
         assert_eq!(prepared.len(), 2);
-        let PreparedTableMutation::Upsert(rows) = &prepared[1] else { panic!("expected insert") };
-        assert_eq!(prepared_rows_count(rows), 1);
-
+        assert_eq!(set_update_count(&prepared), 0);
         let (_lake_dir, conn) = seeded_toast_lake(&[(1, "before", "toasted")]);
         assert_eq!(
             apply_and_read_toast_lake(&conn, &schema, &prepared),
@@ -5810,32 +5312,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn partial_update_of_an_absent_key_keeps_the_ordered_update() {
-        let schema = toast_replicated_schema();
-        let (_lake_dir, conn) = seeded_toast_lake(&[(1, "before", "toasted")]);
-        let table_name = ducklake_table_name();
-
-        let prepared = recover_and_prepare_table_mutations(
-            &schema,
-            vec![toast_partial_update(2, "after")],
-            &StoredRowRecovery::new(&conn, &table_name, &schema),
-        )
-        .unwrap();
-
-        // A key with no stored row must not become an insert, so it keeps the
-        // ordered statement, which matches no row and leaves the table alone.
-        assert_eq!(prepared.len(), 1);
-        let PreparedTableMutation::Update { predicate, .. } = &prepared[0] else {
-            panic!("expected update");
-        };
-        assert_eq!(predicate, "\"id\" = 2");
-        assert_eq!(
-            apply_and_read_toast_lake(&conn, &schema, &prepared),
-            vec![(1, "before".to_owned(), "toasted".to_owned())]
-        );
-    }
-
+    /// Every grouping and flush order, applied to a real DuckLake table, must
+    /// leave the rows that executing each event on its own leaves.
     #[test]
     fn mixed_batch_with_partial_updates_matches_sequential_execution() {
         let schema = toast_replicated_schema();
@@ -5843,6 +5321,7 @@ mod tests {
             (1, "before-1", "toast-1"),
             (2, "before-2", "toast-2"),
             (3, "before-3", "toast-3"),
+            (6, "before-6", "toast-6"),
         ];
         let row = |id: i32, name: &str, payload: &str| {
             TableRow::new(vec![
@@ -5854,6 +5333,7 @@ mod tests {
         let mutations = || {
             vec![
                 TableMutation::Insert(row(4, "inserted", "fresh")),
+                // Partial update, then a full update of the same key.
                 toast_partial_update(1, "patched-1"),
                 TableMutation::Delete(OldTableRow::Key(TableRow::new(vec![Cell::I32(2)]))),
                 TableMutation::Replace(row(3, "replaced-3", "replaced-toast")),
@@ -5863,17 +5343,22 @@ mod tests {
                     delete_row: OldTableRow::Key(TableRow::new(vec![Cell::I32(1)])),
                     new_row: UpdatedTableRow::Full(row(1, "final-1", "final-toast")),
                 },
+                // Insert, partial update, delete.
+                TableMutation::Insert(row(5, "inserted-5", "fresh-5")),
+                toast_partial_update(5, "patched-5"),
+                TableMutation::Delete(OldTableRow::Key(TableRow::new(vec![Cell::I32(5)]))),
+                // Partial updates of one key that leave out different columns.
+                toast_payload_update(6, "new-toast-6"),
+                toast_partial_update(6, "patched-6"),
+                toast_payload_update(6, "newer-toast-6"),
+                // A partial update of a key deleted earlier in the batch.
+                toast_partial_update(2, "patched-2"),
             ]
         };
 
         let (_grouped_dir, grouped_conn) = seeded_toast_lake(&seed);
-        let table_name = ducklake_table_name();
-        let grouped = recover_and_prepare_table_mutations(
-            &schema,
-            mutations(),
-            &StoredRowRecovery::new(&grouped_conn, &table_name, &schema),
-        )
-        .unwrap();
+        let grouped = prepare_table_mutations(&schema, mutations()).unwrap();
+        assert_eq!(set_update_count(&grouped), 3);
         let grouped_rows = apply_and_read_toast_lake(&grouped_conn, &schema, &grouped);
 
         let (_ordered_dir, ordered_conn) = seeded_toast_lake(&seed);
@@ -5884,321 +5369,6 @@ mod tests {
         }
 
         assert_eq!(grouped_rows, ordered_rows);
-    }
-
-    #[test]
-    fn partial_update_of_a_key_inserted_in_the_same_batch_stays_coalesced() {
-        let schema = toast_replicated_schema();
-        let (_lake_dir, conn) = seeded_toast_lake(&[(9, "other", "other-toast")]);
-        let table_name = ducklake_table_name();
-        let row = TableRow::new(vec![
-            Cell::I32(1),
-            Cell::String("inserted".to_owned()),
-            Cell::String("fresh".to_owned()),
-        ]);
-
-        let prepared = recover_and_prepare_table_mutations(
-            &schema,
-            vec![TableMutation::Insert(row), toast_partial_update(1, "patched")],
-            &StoredRowRecovery::new(&conn, &table_name, &schema),
-        )
-        .unwrap();
-
-        // The read proves storage holds no row for the identity, so the only
-        // row the statement could touch is the one staged by this batch and
-        // the insert-then-update shape stays a single staged insert.
-        assert_eq!(prepared.len(), 1);
-        let PreparedTableMutation::Upsert(rows) = &prepared[0] else { panic!("expected insert") };
-        assert_eq!(prepared_rows_count(rows), 1);
-        assert_eq!(
-            apply_and_read_toast_lake(&conn, &schema, &prepared),
-            vec![
-                (1, "patched".to_owned(), "fresh".to_owned()),
-                (9, "other".to_owned(), "other-toast".to_owned()),
-            ]
-        );
-    }
-
-    #[test]
-    fn repeated_partial_updates_of_an_inserted_key_apply_in_event_order() {
-        let schema = toast_replicated_schema();
-        let (_lake_dir, conn) = seeded_toast_lake(&[]);
-        let table_name = ducklake_table_name();
-        let row = TableRow::new(vec![
-            Cell::I32(1),
-            Cell::String("inserted".to_owned()),
-            Cell::String("fresh".to_owned()),
-        ]);
-
-        let prepared = recover_and_prepare_table_mutations(
-            &schema,
-            vec![
-                TableMutation::Insert(row),
-                toast_partial_update(1, "first"),
-                toast_partial_update(1, "second"),
-            ],
-            &StoredRowRecovery::new(&conn, &table_name, &schema),
-        )
-        .unwrap();
-
-        assert_eq!(prepared.len(), 1);
-        assert!(
-            !prepared
-                .iter()
-                .any(|operation| matches!(operation, PreparedTableMutation::Update { .. }))
-        );
-        assert_eq!(
-            apply_and_read_toast_lake(&conn, &schema, &prepared),
-            vec![(1, "second".to_owned(), "fresh".to_owned())]
-        );
-    }
-
-    #[test]
-    fn recovered_rows_respect_the_streaming_byte_bound() {
-        let schema = toast_replicated_schema();
-        let payload = "x".repeat(64 * 1024);
-        let seed: Vec<(i32, &str, &str)> =
-            (0..8).map(|id| (id, "before", payload.as_str())).collect();
-        let (_lake_dir, conn) = seeded_toast_lake(&seed);
-        let table_name = ducklake_table_name();
-        // Room for a couple of recovered rows per batch, so the events have to
-        // be spread over several batches even though they are tiny.
-        let config = DuckLakeStreamingBatchConfig::new(1024, 3 * payload.len()).unwrap();
-        let mut pending: VecDeque<Vec<TrackedTableMutation>> = split_tracked_mutations(
-            config,
-            (0..8)
-                .map(|id| {
-                    TrackedTableMutation::new(
-                        EventSequenceKey::new(PgLsn::from(100), u64::try_from(id).unwrap()),
-                        toast_partial_update(id, "after"),
-                    )
-                })
-                .collect(),
-        )
-        .into();
-        assert_eq!(pending.len(), 1, "the partial events themselves fit one batch");
-
-        let mut batch_count = 0;
-        let mut rows = Vec::new();
-        while let Some(mut chunk) = pending.pop_front() {
-            let (covered, recovered) = recover_chunk_partial_updates(
-                &schema,
-                &chunk,
-                recovery_byte_budget(config, &chunk),
-                &StoredRowRecovery::new(&conn, &table_name, &schema),
-            )
-            .unwrap();
-            if covered < chunk.len() {
-                pending.push_front(chunk.split_off(covered));
-            }
-            let mut prepared_batches = Vec::new();
-            push_prepared_mutation_batch(
-                &mut prepared_batches,
-                &schema,
-                &table_name,
-                LEGACY_REPLAY_EPOCH,
-                chunk,
-                recovered,
-            )
-            .unwrap();
-            let batch = prepared_batches.pop().expect("every chunk prepares one batch");
-            let PreparedDuckLakeTableBatchAction::Mutation(operations) = &batch.action else {
-                panic!("expected row mutations");
-            };
-            let completed_rows = operations
-                .iter()
-                .filter_map(|operation| match operation {
-                    PreparedTableMutation::Upsert(rows) => Some(prepared_rows_count(rows)),
-                    PreparedTableMutation::Delete { .. } | PreparedTableMutation::Update { .. } => {
-                        None
-                    }
-                })
-                .sum::<usize>();
-            // One batch overshoots its budget by at most the row that crossed
-            // it, because the read sizes each statement from observed bytes.
-            assert!(
-                completed_rows * payload.len() <= config.max_bytes + payload.len(),
-                "batch completed {completed_rows} rows of {} bytes",
-                payload.len()
-            );
-            rows = apply_and_read_toast_lake(&conn, &schema, operations);
-            batch_count += 1;
-        }
-
-        assert!(batch_count > 1, "the recovered rows must be split over several batches");
-        assert_eq!(
-            rows,
-            (0..8).map(|id| (id, "after".to_owned(), payload.clone())).collect::<Vec<_>>()
-        );
-    }
-
-    /// Builds a pacer handle for the retry tests.
-    fn test_pacer() -> Arc<StdMutex<RecoveryChunkPacer>> {
-        Arc::new(StdMutex::new(RecoveryChunkPacer::default()))
-    }
-
-    /// Builds one recovery chunk result of `keys` identities.
-    fn test_chunk(keys: usize) -> PartialUpdateRecoveryChunk {
-        PartialUpdateRecoveryChunk {
-            recovered: RecoveredPartialRows::empty(),
-            recovered_bytes: 0,
-            keys,
-            statements: 1,
-        }
-    }
-
-    #[tokio::test]
-    async fn recovery_read_retries_a_transient_failure() {
-        let attempts = std::cell::Cell::new(0usize);
-        let chunk = retry_recovery_read(ducklake_table_name(), 3, test_pacer(), || {
-            let attempt = attempts.get() + 1;
-            attempts.set(attempt);
-            async move {
-                if attempt == 1 {
-                    return Err(etl_error!(
-                        ErrorKind::DestinationQueryFailed,
-                        "DuckLake partial update recovery failed"
-                    ));
-                }
-
-                Ok(test_chunk(3))
-            }
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(attempts.get(), 2);
-        assert_eq!(chunk.keys, 3);
-    }
-
-    #[tokio::test]
-    async fn recovery_read_stops_retrying_on_shutdown() {
-        let attempts = std::cell::Cell::new(0usize);
-        let error = retry_recovery_read(ducklake_table_name(), 1, test_pacer(), || {
-            attempts.set(attempts.get() + 1);
-            async move {
-                Err::<PartialUpdateRecoveryChunk, _>(etl_error!(
-                    ErrorKind::DestinationConnectionFailed,
-                    "DuckLake shutdown requested"
-                ))
-            }
-        })
-        .await
-        .unwrap_err();
-
-        assert_eq!(attempts.get(), 1);
-        assert_eq!(error.kind(), ErrorKind::DestinationConnectionFailed);
-    }
-
-    /// A timed-out read must come back smaller, not identical.
-    ///
-    /// The incident this guards against retried the same 187-identity read ten
-    /// times, each one hitting the same three-minute timeout, so the batch
-    /// spent half an hour without reading a single identity.
-    #[tokio::test]
-    async fn a_timed_out_recovery_read_halves_the_next_statement() {
-        let pacer = test_pacer();
-        let attempts = std::cell::Cell::new(0usize);
-        let limits = Arc::new(StdMutex::new(Vec::new()));
-        let attempt_pacer = Arc::clone(&pacer);
-        let attempt_limits = Arc::clone(&limits);
-        let chunk = retry_recovery_read(ducklake_table_name(), 1024, Arc::clone(&pacer), || {
-            let attempt = attempts.get() + 1;
-            attempts.set(attempt);
-            let attempt_pacer = Arc::clone(&attempt_pacer);
-            let attempt_limits = Arc::clone(&attempt_limits);
-            async move {
-                attempt_limits.lock().unwrap().push(lock_pacer(&attempt_pacer).limit());
-                if attempt <= 3 {
-                    return Err(duckdb_blocking_timeout_error(
-                        Duration::from_secs(180),
-                        "query_execution",
-                    ));
-                }
-
-                Ok(test_chunk(8))
-            }
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(chunk.keys, 8);
-        assert_eq!(
-            limits.lock().unwrap().as_slice(),
-            [1024, 512, 256, 128],
-            "every retry after a timeout must plan a strictly smaller statement"
-        );
-    }
-
-    /// A single identity that still times out cannot be made smaller, so the
-    /// read must fail instead of holding the write path for ten more timeouts.
-    #[tokio::test]
-    async fn a_recovery_read_that_cannot_shrink_further_stops_retrying() {
-        let pacer = Arc::new(StdMutex::new(RecoveryChunkPacer::default()));
-        while lock_pacer(&pacer).shrink() {}
-        assert_eq!(lock_pacer(&pacer).limit(), 1);
-
-        let attempts = std::cell::Cell::new(0usize);
-        let error = retry_recovery_read(ducklake_table_name(), 1, pacer, || {
-            attempts.set(attempts.get() + 1);
-            async move {
-                Err::<PartialUpdateRecoveryChunk, _>(duckdb_blocking_timeout_error(
-                    Duration::from_secs(180),
-                    "query_execution",
-                ))
-            }
-        })
-        .await
-        .unwrap_err();
-
-        assert_eq!(attempts.get(), 1);
-        assert!(is_duckdb_blocking_timeout_error(&error));
-    }
-
-    /// The identities a batch owes a read for are their own cost, so they cap
-    /// the batch independently of its rows and bytes.
-    #[test]
-    fn partial_updates_split_a_batch_by_the_identities_they_read_back() {
-        let schema = toast_replicated_schema();
-        let config = DuckLakeStreamingBatchConfig::new(100_000, 100 * 1024 * 1024).unwrap();
-        let mutations: Vec<TrackedTableMutation> = (0..MAX_PARTIAL_UPDATE_KEYS_PER_BATCH * 2 + 1)
-            .map(|id| {
-                TrackedTableMutation::new(
-                    EventSequenceKey::new(PgLsn::from(100), u64::try_from(id).unwrap()),
-                    toast_partial_update(i32::try_from(id).unwrap(), "after"),
-                )
-            })
-            .collect();
-        let total = mutations.len();
-
-        let chunks = split_tracked_mutations(config, mutations);
-
-        assert_eq!(chunks.len(), 3, "the row and byte caps alone would keep one batch");
-        for chunk in &chunks {
-            assert!(
-                chunk
-                    .iter()
-                    .filter(|tracked| needs_partial_update_recovery(&tracked.mutation))
-                    .count()
-                    <= MAX_PARTIAL_UPDATE_KEYS_PER_BATCH,
-                "a batch may not owe more than {MAX_PARTIAL_UPDATE_KEYS_PER_BATCH} recovery keys"
-            );
-        }
-        assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), total, "no event may be dropped");
-        // Full-row events carry their own values, so they never split a batch.
-        let full_rows: Vec<TrackedTableMutation> = (0..MAX_PARTIAL_UPDATE_KEYS_PER_BATCH * 2)
-            .map(|id| {
-                TrackedTableMutation::new(
-                    EventSequenceKey::new(PgLsn::from(200), u64::try_from(id).unwrap()),
-                    TableMutation::Insert(TableRow::new(vec![
-                        Cell::I32(i32::try_from(id).unwrap()),
-                        Cell::String("state".to_owned()),
-                        Cell::String("payload".to_owned()),
-                    ])),
-                )
-            })
-            .collect();
-        assert_eq!(split_tracked_mutations(config, full_rows).len(), 1);
-        let _ = &schema;
+        assert!(grouped_rows.contains(&(6, "patched-6".to_owned(), "newer-toast-6".to_owned())));
     }
 }

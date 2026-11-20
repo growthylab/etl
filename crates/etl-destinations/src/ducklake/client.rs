@@ -981,20 +981,6 @@ pub(super) async fn build_warm_ducklake_pool(
     })?
 }
 
-/// Builds a consistent timeout error for one blocking DuckDB stage.
-#[inline]
-pub(super) fn duckdb_blocking_timeout_error(timeout: Duration, stage: &'static str) -> EtlError {
-    etl_error!(
-        ErrorKind::DestinationQueryFailed,
-        "DuckLake blocking operation timed out",
-        format!(
-            "Operation kind={}, stage={stage}, timeout_ms={}",
-            DUCKDB_BLOCKING_OPERATION_KIND,
-            timeout.as_millis()
-        )
-    )
-}
-
 /// Builds a timeout error that also reports where the budget went.
 ///
 /// The stage name alone says which step was running when the deadline passed,
@@ -1017,25 +1003,6 @@ fn duckdb_blocking_timeout_error_with_stages(
             stages.detail()
         )
     )
-}
-
-/// Returns whether an error is a timeout of a query that had actually started.
-///
-/// A timeout in `slot_wait`, `pool_checkout` or `query_admission` says the
-/// operation never reached DuckDB, so anything that tries to explain the
-/// statement would only queue behind the same shortage.
-pub(super) fn is_duckdb_query_execution_timeout(error: &EtlError) -> bool {
-    is_duckdb_blocking_timeout_error(error)
-        && error.detail().is_some_and(|detail| detail.contains("stage=query_execution"))
-}
-
-/// Returns whether an error is one of the blocking-operation timeouts above.
-///
-/// A timeout says the work itself did not fit the budget, so a caller that can
-/// make the work smaller should do that instead of repeating it unchanged.
-pub(super) fn is_duckdb_blocking_timeout_error(error: &EtlError) -> bool {
-    error.kind() == ErrorKind::DestinationQueryFailed
-        && error.description() == Some("DuckLake blocking operation timed out")
 }
 
 /// Builds the error returned when shutdown has stopped new DuckDB work.
@@ -1121,35 +1088,6 @@ where
         operation,
     )
     .await
-}
-
-/// Runs one DuckDB operation with an explicit timeout, reporting how long the
-/// query itself took.
-///
-/// The returned duration excludes the wait for a blocking slot and for a
-/// pooled connection, so a caller can tell a slow query apart from a queued
-/// one without re-deriving it from the logs.
-pub(super) async fn run_duckdb_blocking_timed<R, F>(
-    pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
-    blocking_slots: Arc<Semaphore>,
-    timeout: Duration,
-    operation: F,
-) -> EtlResult<(R, Duration)>
-where
-    R: Send + 'static,
-    F: FnOnce(&duckdb::Connection) -> EtlResult<R> + Send + 'static,
-{
-    let stages = Arc::new(BlockingStageTimings::default());
-    let value = run_reported_duckdb_blocking(
-        pool,
-        blocking_slots,
-        timeout,
-        Arc::clone(&stages),
-        move |conn, _| operation(conn),
-    )
-    .await?;
-
-    Ok((value, Duration::from_millis(stages.execute_ms())))
 }
 
 /// Runs one DuckDB operation with an explicit timeout budget.
