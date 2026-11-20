@@ -376,12 +376,18 @@ pub struct DuckLakeTableSortingConfig {
     /// Source tables whose DuckLake counterparts should have a sort order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<DuckLakeTableSortConfig>,
+    /// Sort order for every table not listed in `tables`.
+    ///
+    /// A default primary-key sort leaves tables without a fully replicated
+    /// primary key unsorted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<DuckLakeSortBy>,
 }
 
 impl DuckLakeTableSortingConfig {
     /// Returns whether no table sort orders are configured.
     pub fn is_empty(&self) -> bool {
-        self.tables.is_empty()
+        self.tables.is_empty() && self.default.is_none()
     }
 }
 
@@ -1016,6 +1022,7 @@ mod tests {
                     table: "events".to_owned(),
                     sort_by: DuckLakeSortBy::PrimaryKey,
                 }],
+                default: None,
             },
         };
 
@@ -1059,7 +1066,10 @@ mod tests {
                         "kind": "primary_key"
                     }
                 }
-            ]
+            ],
+            "default": {
+                "kind": "primary_key"
+            }
         }))
         .unwrap();
 
@@ -1072,6 +1082,7 @@ mod tests {
         assert_eq!(columns[1].direction, DuckLakeSortDirection::Desc);
         assert_eq!(columns[1].nulls, Some(DuckLakeSortNulls::First));
         assert_eq!(config.tables[1].sort_by, DuckLakeSortBy::PrimaryKey);
+        assert_eq!(config.default, Some(DuckLakeSortBy::PrimaryKey));
     }
 
     #[test]
@@ -1126,6 +1137,7 @@ mod tests {
                     sort_by: DuckLakeSortBy::Columns { columns: vec![] },
                 },
             ],
+            default: None,
         };
 
         config.validate().unwrap_err();

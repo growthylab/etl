@@ -31,6 +31,10 @@ pub const fn default_ducklake_pool_size() -> u32 {
 }
 
 /// Non-patch API representation of a destination configuration.
+///
+/// Variants mirror the stable serialized shapes, so they remain inline even
+/// though the DuckLake variant is larger than the others.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiDestinationConfig {
@@ -1367,6 +1371,7 @@ impl From<StoredDestinationConfig> for StrippedApiDestinationConfig {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum StoredDestinationConfig {
     BigQuery {
