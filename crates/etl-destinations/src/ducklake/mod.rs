@@ -9,7 +9,6 @@ mod external_maintenance;
 mod inline_size;
 mod key_set;
 mod metrics;
-mod partial_update;
 mod replay_epoch;
 mod schema;
 mod sql;
@@ -135,7 +134,7 @@ pub use core::{
 pub use batches::{
     arm_fail_after_atomic_batch_commit_once_for_tests,
     arm_fail_after_copy_batch_commit_once_for_tests, ducklake_staging_table_creations_for_tests,
-    reset_ducklake_test_hooks, set_slow_recovery_statement_ms_for_tests,
+    reset_ducklake_test_hooks,
 };
 #[cfg(feature = "test-utils")]
 pub use client::set_slow_blocking_operation_ms_for_tests;
@@ -154,11 +153,6 @@ pub use external_maintenance::{
     ExternalMaintenanceRequestOutcome, ExternalMaintenanceRun, ExternalMaintenanceState,
     ExternalMaintenanceStore, ExternalMaintenanceWatcherConfig, PostgresExternalMaintenanceStore,
     run_external_maintenance_watcher,
-};
-#[cfg(feature = "test-utils")]
-pub use partial_update::{
-    arm_partial_update_recovery_timeout_above_keys_for_tests,
-    reset_partial_update_recovery_timeout_for_tests,
 };
 
 /// Bounds one atomic streaming transaction without delaying source delivery.
